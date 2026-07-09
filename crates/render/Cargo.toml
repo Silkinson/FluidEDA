@@ -1,0 +1,12 @@
+[package]
+name = "fluideda-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fluideda-core = { path = "../core" }
+wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+log.workspace = true

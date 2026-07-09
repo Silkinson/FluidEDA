@@ -1,0 +1,52 @@
+# FluidEDA — Phase 0 walking skeleton
+# Rust-everywhere layout viewer + live multiplayer, rendered with wgpu (WebGPU).
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/render",
+    "crates/sync",
+    "crates/app",
+    "server",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FluidEDA/FluidEDA"
+
+[workspace.dependencies]
+# --- shared across crates ---
+glam = "0.28"
+bytemuck = { version = "1.16", features = ["derive"] }
+log = "0.4"
+anyhow = "1"
+thiserror = "1"
+
+# --- rendering ---
+wgpu = "22"
+winit = "0.30"
+egui = "0.28"
+eframe = { version = "0.28", default-features = false, features = ["wgpu"] }
+egui-wgpu = "0.28"
+
+# --- geometry / io ---
+gds21 = "1"
+lyon = "1"
+rstar = "0.12"        # used from Phase 1
+
+# --- collaboration ---
+yrs = "0.19"
+y-sync = "0.4"
+ewebsock = "0.6"
+
+# --- server ---
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["ws"] }
+
+# Small wasm binaries; optimize for size in release.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
