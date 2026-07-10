@@ -12,6 +12,7 @@ use gds21::{GdsElement, GdsLibrary};
 /// file the "top" cell references the others; flattening every boundary is a
 /// deliberate Phase 0 shortcut that renders correctly for small/flat samples.
 pub fn load_gds_bytes(bytes: &[u8]) -> Result<FlatLayout> {
+    // gds21 0.2: `from_bytes` takes an owned `Vec<u8>` and returns a GdsResult.
     let lib = GdsLibrary::from_bytes(bytes.to_vec())
         .map_err(|e| anyhow!("GDS parse failed: {e:?}"))?;
     load_library(&lib)
@@ -24,12 +25,10 @@ fn load_library(lib: &GdsLibrary) -> Result<FlatLayout> {
         for elem in &cell.elems {
             if let GdsElement::GdsBoundary(b) = elem {
                 let layer = Layer::new(b.layer as u16, b.datatype as u16);
-                // gds21 stores xy as a flat Vec<i32> of [x0,y0,x1,y1,...].
-                let pts: Vec<Point> = b
-                    .xy
-                    .chunks_exact(2)
-                    .map(|c| Point::new(c[0], c[1]))
-                    .collect();
+                // gds21 0.2: `xy` is a Vec<GdsPoint> { x: i32, y: i32 }, with the
+                // closing point duplicated per spec (harmless for tessellation).
+                let pts: Vec<Point> =
+                    b.xy.iter().map(|p| Point::new(p.x, p.y)).collect();
                 if pts.len() >= 3 {
                     out.polygons.push(Polygon { layer, points: pts });
                 }

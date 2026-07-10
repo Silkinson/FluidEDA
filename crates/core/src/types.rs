@@ -82,7 +82,7 @@ impl Bbox {
 /// GPU-ready vertex: position in nm (as f32 for upload) — origin rebasing is
 /// applied in the camera, so f32 here is fine for the Phase 0 sample sizes.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 2],
 }

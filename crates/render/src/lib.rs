@@ -185,7 +185,7 @@ impl LayoutRenderer {
     }
 
     /// Record draw calls into an existing render pass.
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.globals_bind, &[]);
         for layer in &self.layers {

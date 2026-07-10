@@ -10,10 +10,8 @@ dist = "dist"
 address = "127.0.0.1"
 port = 8080
 
-[[serve.headers]]
-name = "Cross-Origin-Opener-Policy"
-value = "same-origin"
-
-[[serve.headers]]
-name = "Cross-Origin-Embedder-Policy"
-value = "require-corp"
+# Cross-origin isolation (required for SharedArrayBuffer + wasm threads in Phase 2).
+# Trunk expects `headers` as a single map of name = value, not [[serve.headers]] tables.
+[serve.headers]
+"Cross-Origin-Opener-Policy" = "same-origin"
+"Cross-Origin-Embedder-Policy" = "require-corp"

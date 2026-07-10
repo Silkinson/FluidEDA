@@ -13,7 +13,7 @@ use ewebsock::{WsMessage, WsReceiver, WsSender};
 use glam::Vec2;
 use std::collections::HashMap;
 use yrs::{
-    types::ToJson, Array, ArrayRef, Doc, Map, MapPrelim, ReadTxn, Transact,
+    types::ToJson, updates::decoder::Decode, Array, ArrayRef, Doc, MapPrelim, Transact,
 };
 
 /// A shared rectangle marker as stored in the CRDT.
@@ -88,12 +88,12 @@ impl Session {
     /// Add a shared marker; the update propagates to all peers automatically.
     pub fn add_marker(&mut self, m: Marker) {
         let mut txn = self.doc.transact_mut();
-        let entry = MapPrelim::from(HashMap::from([
+        let entry = MapPrelim::from([
             ("minx".to_string(), m.min.x as f64),
             ("miny".to_string(), m.min.y as f64),
             ("maxx".to_string(), m.max.x as f64),
             ("maxy".to_string(), m.max.y as f64),
-        ]));
+        ]);
         self.markers.push_back(&mut txn, entry);
         let update = txn.encode_update_v1();
         drop(txn);

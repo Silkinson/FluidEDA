@@ -29,22 +29,33 @@ fn main() {
 
     let web_options = eframe::WebOptions::default();
     wasm_bindgen_futures::spawn_local(async {
-        let canvas = web_sys::window()
-            .unwrap()
-            .document()
-            .unwrap()
+        let document = web_sys::window().unwrap().document().unwrap();
+        let canvas = document
             .get_element_by_id("fluid-canvas")
             .unwrap()
             .dyn_into::<web_sys::HtmlCanvasElement>()
             .unwrap();
 
-        eframe::WebRunner::new()
+        let result = eframe::WebRunner::new()
             .start(
                 canvas,
                 web_options,
                 Box::new(|cc| Ok(Box::new(FluidApp::new(cc)))),
             )
-            .await
-            .expect("failed to start eframe");
+            .await;
+
+        // Clear the HTML loading overlay — otherwise it hangs on "Loading…"
+        // forever. On failure, show why instead of silently blanking.
+        if let Some(loading) = document.get_element_by_id("loading") {
+            match &result {
+                Ok(_) => loading.remove(),
+                Err(e) => {
+                    log::error!("failed to start eframe: {e:?}");
+                    loading.set_text_content(Some(&format!(
+                        "Could not start FluidEDA: {e:?}\n(needs a browser with WebGPU or WebGL2)"
+                    )));
+                }
+            }
+        }
     });
 }

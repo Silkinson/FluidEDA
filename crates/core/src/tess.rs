@@ -12,6 +12,7 @@ use lyon::tessellation::{
 use std::collections::BTreeMap;
 
 /// CPU-side mesh for a single layer.
+#[derive(Debug, Clone)]
 pub struct LayerMesh {
     pub layer: Layer,
     pub vertices: Vec<Vertex>,

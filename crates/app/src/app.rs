@@ -3,7 +3,7 @@
 
 use crate::paint::{init_renderer, LayoutPaint};
 use eframe::egui;
-use fluideda_render::Camera;
+use fluideda_render::{Camera, LayoutRenderer};
 use fluideda_sync::{color_from_id, Marker, Presence, Session};
 use glam::Vec2;
 use std::sync::Arc;
@@ -60,7 +60,7 @@ impl FluidApp {
 
     fn connect(&mut self, ctx: &egui::Context) {
         let url = server_url();
-        let id = ctx.viewport_id().value();
+        let id = ctx.viewport_id().0.value();
         let local = Presence {
             cursor: Vec2::ZERO,
             name: self.name.clone(),
@@ -77,7 +77,7 @@ impl FluidApp {
 }
 
 impl eframe::App for FluidApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // fps
         let now = ctx.input(|i| i.time);
         let dt = (now - self.last_frame).max(1e-4);
@@ -91,14 +91,14 @@ impl eframe::App for FluidApp {
             }
         }
 
-        self.side_panel(ctx);
+        self.side_panel(ctx, frame);
         self.canvas(ctx);
         ctx.request_repaint(); // continuous for smooth pan + live cursors
     }
 }
 
 impl FluidApp {
-    fn side_panel(&mut self, ctx: &egui::Context) {
+    fn side_panel(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         egui::SidePanel::left("panel").default_width(220.0).show(ctx, |ui| {
             ui.heading("FluidEDA");
             ui.label(format!("{:.0} fps", self.fps));
@@ -121,8 +121,18 @@ impl FluidApp {
             ui.label("Layers");
             for i in 0..self.layer_count {
                 if ui.checkbox(&mut self.layer_visible[i], format!("layer {i}")).changed() {
-                    // Visibility toggles are applied on the renderer via callback
-                    // resources; wired in the paint path (omitted for brevity).
+                    // Push the new visibility into the renderer, which lives in
+                    // egui's paint-callback resources. `draw` skips hidden layers.
+                    if let Some(rs) = frame.wgpu_render_state() {
+                        if let Some(r) = rs
+                            .renderer
+                            .write()
+                            .callback_resources
+                            .get_mut::<LayoutRenderer>()
+                        {
+                            r.set_layer_visible(i, self.layer_visible[i]);
+                        }
+                    }
                 }
             }
 
