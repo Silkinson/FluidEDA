@@ -210,6 +210,19 @@ impl CellDb {
     pub fn world_bbox(&self) -> Bboxf {
         Transform::IDENTITY.apply_bbox(&self.local_bbox(self.top))
     }
+
+    /// Union of all layers appearing in any cell definition, sorted — drives the
+    /// (global) layer panel and per-layer colors in the hierarchical renderer.
+    pub fn all_layers(&self) -> Vec<Layer> {
+        let mut ls: Vec<Layer> = self
+            .cells
+            .iter()
+            .flat_map(|c| c.shapes.iter().map(|p| p.layer))
+            .collect();
+        ls.sort();
+        ls.dedup();
+        ls
+    }
 }
 
 /// Builder used by `gds.rs` to assemble a `CellDb`, resolving names to ids and

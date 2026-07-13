@@ -1,9 +1,11 @@
 //! 2D camera: maps database-unit (nm) world coordinates to clip space.
 //!
-//! Phase 0 uses a plain f32 view-projection. Phase 1 adds **origin rebasing**
-//! (subtract a near-viewport origin in f64 before casting to f32) so deep zoom
-//! on million-nm chips doesn't jitter. The `world_origin` field is already here
-//! so that upgrade is a one-line change in `view_proj`.
+//! **Origin rebasing (Phase 1):** the app sets `world_origin` to the viewport
+//! centre each frame, and the renderer subtracts it (in f64) from every instance
+//! translation before the f32 cast. The vertices this camera then sees are all
+//! *near the origin*, so `view_proj` — which subtracts `world_origin` from
+//! `center` and works in f32 — never loses precision on million-nm chips. Both
+//! sides must use the same `world_origin`; that is the whole trick.
 
 use glam::{Mat4, Vec2};
 
