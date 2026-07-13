@@ -27,6 +27,24 @@ pub fn query_file() -> Option<String> {
     None
 }
 
+/// Read the `zoom` query parameter (fit|mid|leaf) — lets the browser bench set a
+/// viewport without simulating input.
+#[cfg(target_arch = "wasm32")]
+pub fn query_zoom() -> Option<String> {
+    let search = web_sys::window()?.location().search().ok()?;
+    for kv in search.trim_start_matches('?').split('&') {
+        if let Some(v) = kv.strip_prefix("zoom=") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn query_zoom() -> Option<String> {
+    None
+}
+
 /// Fetch a URL and deposit the bytes into `slot` when done (wasm).
 #[cfg(target_arch = "wasm32")]
 pub fn spawn_fetch(url: String, slot: LoadSlot) {

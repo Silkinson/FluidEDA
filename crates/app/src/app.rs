@@ -37,9 +37,11 @@ pub struct FluidApp {
 
     // runtime loading
     load_slot: LoadSlot,
-    load_start: f64,
+    load_instant: web_time::Instant,
     awaiting_first_frame: bool,
     status: String,
+    /// Optional `?zoom=` viewport override for the browser bench.
+    forced_zoom: Option<String>,
 
     session: Option<Session>,
     name: String,
@@ -82,9 +84,10 @@ impl FluidApp {
             total_shapes: design.total_shapes,
             metrics: design.metrics,
             load_slot,
-            load_start: 0.0,
+            load_instant: web_time::Instant::now(),
             awaiting_first_frame: true, // measure TTFF for the default too
             status: String::new(),
+            forced_zoom: webio::query_zoom(),
             session: None,
             name: "guest".to_string(),
             last_frame: 0.0,
@@ -107,6 +110,7 @@ impl FluidApp {
         self.total_shapes = design.total_shapes;
         self.metrics = design.metrics;
         self.camera.fit(self.bbox_min, self.bbox_max);
+        self.apply_forced_zoom();
 
         if let Some(rs) = frame.wgpu_render_state() {
             init_renderer(rs, Arc::new(design.per_cell));
@@ -138,7 +142,7 @@ impl FluidApp {
         let pending = self.load_slot.borrow_mut().take();
         if let Some((name, bytes)) = pending {
             self.status = format!("loading {name} ({} KB)…", bytes.len() / 1024);
-            self.load_start = ctx.input(|i| i.time);
+            self.load_instant = web_time::Instant::now();
             match design::load_design(&name, &bytes) {
                 Ok(design) => {
                     self.install(design, frame);
@@ -149,14 +153,13 @@ impl FluidApp {
         }
     }
 
-    /// After the first frame of a freshly loaded design, record TTFF, force +
-    /// time the R-tree build, and publish the metrics.
-    fn finish_first_frame(&mut self, ctx: &egui::Context) {
+    /// On the frame *after* a load (so at least one frame has actually rendered),
+    /// record wall-clock TTFF, force + time the R-tree build, and publish metrics.
+    fn finish_first_frame(&mut self) {
         if !self.awaiting_first_frame || !self.renderer_ready {
             return;
         }
-        let now = ctx.input(|i| i.time);
-        self.metrics.ttff_ms = (now - self.load_start).max(0.0) * 1e3;
+        self.metrics.ttff_ms = self.load_instant.elapsed().as_secs_f64() * 1e3;
         let (idx_total, idx_p99, idx_max) = design::measure_indices(&self.db);
         self.metrics.index_ms = idx_total;
         self.metrics.index_p99_ms = idx_p99;
@@ -164,6 +167,22 @@ impl FluidApp {
         self.metrics.wasm_heap_bytes = design::wasm_heap_bytes();
         self.metrics.publish();
         self.awaiting_first_frame = false;
+    }
+
+    /// Apply a `?zoom=` override (fit|mid|leaf) by setting the camera span,
+    /// centered on the design. Used by the browser bench to measure fps at a
+    /// viewport without input simulation.
+    fn apply_forced_zoom(&mut self) {
+        let Some(kw) = self.forced_zoom.clone() else { return };
+        let w = (self.bbox_max.x - self.bbox_min.x).max(1.0) as f64;
+        let h = (self.bbox_max.y - self.bbox_min.y).max(1.0) as f64;
+        let span = match kw.as_str() {
+            "mid" => (w * 0.03).clamp(20_000.0, 300_000.0),
+            "leaf" => 5_000.0,
+            _ => w.max(h) * 1.05, // "fit"
+        };
+        self.camera.center = (self.bbox_min + self.bbox_max) * 0.5;
+        self.camera.scale = (self.camera.viewport.x as f64 / span) as f32;
     }
 
     fn recull(&mut self) {
@@ -203,6 +222,10 @@ impl eframe::App for FluidApp {
         self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt) as f32;
         self.last_frame = now;
 
+        // Finalize TTFF at the top of the frame *after* a load, so a frame has
+        // actually rendered before we stamp the number.
+        self.finish_first_frame();
+
         self.drain_loads(ctx, frame);
 
         if let Some(s) = self.session.as_mut() {
@@ -214,7 +237,6 @@ impl eframe::App for FluidApp {
         self.side_panel(ctx, frame);
         self.canvas(ctx);
         self.recull();
-        self.finish_first_frame(ctx);
 
         ctx.request_repaint();
     }
