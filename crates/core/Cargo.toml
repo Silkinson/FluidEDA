@@ -12,3 +12,4 @@ anyhow.workspace = true
 thiserror.workspace = true
 gds21.workspace = true
 lyon.workspace = true
+rstar.workspace = true

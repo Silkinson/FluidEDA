@@ -3,7 +3,7 @@
 //! Done ONCE at load time (not per frame). Pan/zoom only changes the camera
 //! uniform; these buffers are static until the geometry itself changes.
 
-use crate::types::{FlatLayout, Layer, Vertex};
+use crate::types::{FlatLayout, Layer, Polygon, Vertex};
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{
@@ -27,13 +27,21 @@ impl FillVertexConstructor<Vertex> for VertexCtor {
     }
 }
 
-/// Tessellate the whole layout, one mesh per layer (sorted, = draw order).
+/// Tessellate the whole (flat) layout, one mesh per layer (sorted = draw order).
 pub fn tessellate(layout: &FlatLayout) -> Vec<LayerMesh> {
+    tessellate_shapes(&layout.polygons)
+}
+
+/// Tessellate a slice of polygons (in whatever coordinate frame they carry —
+/// **cell-local** nm for the Phase 1 per-cell meshes, so the same buffer is
+/// reused across every instance and only the per-instance transform differs).
+/// One `LayerMesh` per distinct layer, sorted.
+pub fn tessellate_shapes(polygons: &[Polygon]) -> Vec<LayerMesh> {
     let mut per_layer: BTreeMap<Layer, VertexBuffers<Vertex, u32>> = BTreeMap::new();
     let mut tess = FillTessellator::new();
     let opts = FillOptions::non_zero();
 
-    for poly in &layout.polygons {
+    for poly in polygons {
         if poly.points.len() < 3 {
             continue;
         }
