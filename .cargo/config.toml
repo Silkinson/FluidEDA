@@ -1,0 +1,6 @@
+# Opt into >2 GB wasm linear memory. wasm32 addresses 4 GB and V8 supports it,
+# but the module must declare a maximum for the engine to allow growth past the
+# ~2 GB default. This raises the ceiling toward 4 GB; Phase 2a STEP 1 measures
+# whether it actually works and where memory really breaks.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=--max-memory=4294967296"]
