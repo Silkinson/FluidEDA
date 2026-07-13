@@ -1,0 +1,17 @@
+# Trunk dev server config.
+# The COOP/COEP headers enable cross-origin isolation, which is REQUIRED for
+# SharedArrayBuffer + wasm threads in Phase 2. We set them from day one so the
+# worker split later needs no server changes.
+[build]
+target = "crates/app/index.html"
+dist = "dist"
+
+[serve]
+address = "127.0.0.1"
+port = 8080
+
+# Cross-origin isolation (required for SharedArrayBuffer + wasm threads in Phase 2).
+# Trunk expects `headers` as a single map of name = value, not [[serve.headers]] tables.
+[serve.headers]
+"Cross-Origin-Opener-Policy" = "same-origin"
+"Cross-Origin-Embedder-Policy" = "require-corp"

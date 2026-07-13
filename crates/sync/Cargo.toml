@@ -1,0 +1,13 @@
+[package]
+name = "fluideda-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yrs.workspace = true
+y-sync.workspace = true
+ewebsock.workspace = true
+glam.workspace = true
+log.workspace = true
+anyhow.workspace = true
