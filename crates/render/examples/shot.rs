@@ -22,7 +22,7 @@ const MIN_PIXEL: f64 = 4.0;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 struct View {
-    name: &'static str,
+    name: String,
     center: (f64, f64),
     /// World width (nm) spanned by the viewport.
     span_nm: f64,
@@ -33,16 +33,24 @@ fn main() {
 }
 
 async fn run() {
-    let db = fluideda_core::gds::load_gds_db(HIER).expect("parse hier");
+    // Optional file arg; default to the embedded hier.gds.
+    let arg = std::env::args().nth(1);
+    let (label, bytes) = match &arg {
+        Some(path) => (path.clone(), std::fs::read(path).expect("read file")),
+        None => ("hier.gds".to_string(), HIER.to_vec()),
+    };
+    println!("file: {label} ({} bytes)", bytes.len());
+    let db = fluideda_core::gds::load_gds_db(&bytes).expect("parse");
     let wb = db.world_bbox();
     let (cx, cy) = ((wb.min_x + wb.max_x) * 0.5, (wb.min_y + wb.max_y) * 0.5);
-    // A leaf near the middle of the array (pitch 1000 x 1200 from the 5mm origin).
-    let leaf = (5_000_000.0 + 500.0 * 1000.0 + 180.0, 5_000_000.0 + 500.0 * 1200.0 + 200.0);
 
+    // Viewports scale to the file: whole chip, ~3% window, and a 5um close-up,
+    // all centered on the design so this works for any GDS, not just hier.
+    let mid_span = (wb.width() * 0.03).clamp(20_000.0, 300_000.0);
     let views = [
-        View { name: "fit", center: (cx, cy), span_nm: wb.width() * 1.05 },
-        View { name: "mid_30um", center: leaf, span_nm: 30_000.0 },
-        View { name: "leaf_2um", center: leaf, span_nm: 2_000.0 },
+        View { name: "fit".into(), center: (cx, cy), span_nm: wb.width().max(wb.height()) * 1.05 },
+        View { name: "mid".into(), center: (cx, cy), span_nm: mid_span },
+        View { name: "leaf_5um".into(), center: (cx, cy), span_nm: 5_000.0 },
     ];
 
     // --- headless wgpu device ---

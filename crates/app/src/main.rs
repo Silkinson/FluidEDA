@@ -2,7 +2,9 @@
 //! Both go through eframe with the wgpu backend.
 
 mod app;
+mod design;
 mod paint;
+mod webio;
 
 use app::FluidApp;
 
