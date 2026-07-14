@@ -42,6 +42,10 @@ pub struct FluidApp {
     status: String,
     /// Optional `?zoom=` viewport override for the browser bench.
     forced_zoom: Option<String>,
+    /// Off by default: when on, cull counts visible shapes and TTFF forces all
+    /// R-trees. Both are expensive and only feed the stats readout — kept off the
+    /// hot path (Phase 2a STEP 2).
+    debug_stats: bool,
 
     session: Option<Session>,
     name: String,
@@ -88,6 +92,7 @@ impl FluidApp {
             awaiting_first_frame: true, // measure TTFF for the default too
             status: String::new(),
             forced_zoom: webio::query_zoom(),
+            debug_stats: webio::query_flag("stats"),
             session: None,
             name: "guest".to_string(),
             last_frame: 0.0,
@@ -160,10 +165,15 @@ impl FluidApp {
             return;
         }
         self.metrics.ttff_ms = self.load_instant.elapsed().as_secs_f64() * 1e3;
-        let (idx_total, idx_p99, idx_max) = design::measure_indices(&self.db);
-        self.metrics.index_ms = idx_total;
-        self.metrics.index_p99_ms = idx_p99;
-        self.metrics.index_max_ms = idx_max;
+        // Forcing every R-tree at load (708 ms on caravel) only served the metric.
+        // Indices are lazy and only built when actually queried; measure them here
+        // only under the debug flag, so a normal load never pays for them.
+        if self.debug_stats {
+            let (idx_total, idx_p99, idx_max) = design::measure_indices(&self.db);
+            self.metrics.index_ms = idx_total;
+            self.metrics.index_p99_ms = idx_p99;
+            self.metrics.index_max_ms = idx_max;
+        }
         self.metrics.wasm_heap_bytes = design::wasm_heap_bytes();
         self.metrics.publish();
         self.awaiting_first_frame = false;
@@ -192,7 +202,13 @@ impl FluidApp {
         let cx = self.camera.center.x as f64;
         let cy = self.camera.center.y as f64;
         let view = fluideda_core::Bboxf::new(cx - half_w, cy - half_h, cx + half_w, cy + half_h);
-        let vs = cull(&self.db, &view, self.camera.scale as f64, MIN_PIXEL);
+        // Hot path uses the uncounted cull; only the opt-in debug readout pays for
+        // the per-cell index queries that fill visible_shapes.
+        let vs = if self.debug_stats {
+            fluideda_core::cull_counted(&self.db, &view, self.camera.scale as f64, MIN_PIXEL)
+        } else {
+            cull(&self.db, &view, self.camera.scale as f64, MIN_PIXEL)
+        };
         self.cull_stats = vs.stats;
         self.visible = Arc::new(vs);
     }
@@ -291,9 +307,12 @@ impl FluidApp {
             ui.separator();
             ui.label("Culling");
             ui.small(format!("total shapes: {}", self.total_shapes));
-            ui.small(format!("visible:      {}", self.cull_stats.visible_shapes));
             ui.small(format!("instances:    {}", self.cull_stats.instances_emitted));
             ui.small(format!("proxies:      {}", self.cull_stats.proxy_count));
+            ui.checkbox(&mut self.debug_stats, "count visible (slow)");
+            if self.debug_stats {
+                ui.small(format!("visible:      {}", self.cull_stats.visible_shapes));
+            }
 
             ui.separator();
             ui.label(format!("Layers ({})", self.layers.len()));

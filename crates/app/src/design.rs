@@ -124,11 +124,6 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-/// Bbox helper used by the app's fit-view.
-pub fn bbox_of(min: glam::Vec2, max: glam::Vec2) -> Bboxf {
-    Bboxf::new(min.x as f64, min.y as f64, max.x as f64, max.y as f64)
-}
-
 // --- wasm memory + JS bridge -------------------------------------------------
 
 /// Current wasm linear-memory size in bytes (the number that hits the ~2 GB

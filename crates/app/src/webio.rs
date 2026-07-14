@@ -45,6 +45,24 @@ pub fn query_zoom() -> Option<String> {
     None
 }
 
+/// Is `?<name>` (or `?<name>=1`) present in the URL? Used to enable the debug
+/// stats readout from the browser bench without a UI click.
+#[cfg(target_arch = "wasm32")]
+pub fn query_flag(name: &str) -> bool {
+    let Some(search) = web_sys::window().and_then(|w| w.location().search().ok()) else {
+        return false;
+    };
+    search
+        .trim_start_matches('?')
+        .split('&')
+        .any(|kv| kv == name || kv.strip_prefix(name).is_some_and(|r| r.starts_with('=')))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn query_flag(_name: &str) -> bool {
+    false
+}
+
 /// Fetch a URL and deposit the bytes into `slot` when done (wasm).
 #[cfg(target_arch = "wasm32")]
 pub fn spawn_fetch(url: String, slot: LoadSlot) {

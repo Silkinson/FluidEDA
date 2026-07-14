@@ -52,12 +52,28 @@ pub struct CullStats {
 /// * `px_per_nm` — camera scale (pixels per nm); sets the LOD cutoff.
 /// * `min_pixel` — a cell projecting smaller than this (max dimension) becomes a
 ///   proxy instead of recursing into its geometry.
+///
+/// `stats.visible_shapes` is left at 0 (see [`cull_counted`]); the render path
+/// never needs it, and counting it walks every visible cell's R-tree — ~89% of a
+/// fit-view frame on a real chip.
 pub fn cull(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64) -> VisibleSet {
+    cull_inner(db, view, px_per_nm, min_pixel, false)
+}
+
+/// Like [`cull`] but also fills `stats.visible_shapes` by querying each visible
+/// cell's index. **Off the hot path** — for the bench/shot harnesses and an
+/// opt-in debug readout, never per frame.
+pub fn cull_counted(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64) -> VisibleSet {
+    cull_inner(db, view, px_per_nm, min_pixel, true)
+}
+
+fn cull_inner(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64, count_visible: bool) -> VisibleSet {
     let mut ctx = CullCtx {
         db,
         view: *view,
         px_per_nm,
         min_pixel,
+        count_visible,
         grouped: HashMap::new(),
         set: VisibleSet::default(),
     };
@@ -77,6 +93,8 @@ struct CullCtx<'a> {
     view: Bboxf,
     px_per_nm: f64,
     min_pixel: f64,
+    /// When false, skip the per-cell index query that fills `visible_shapes`.
+    count_visible: bool,
     grouped: HashMap<CellId, Vec<Transform>>,
     set: VisibleSet,
 }
@@ -106,11 +124,15 @@ impl CullCtx<'_> {
 
         let cell = self.db.cell(id);
 
-        // Emit this cell's own shapes as an instanced draw at `world_tf`, and
-        // count the index-confirmed visible subset for the culling proof.
+        // Emit this cell's own shapes as an instanced draw at `world_tf`. Only
+        // when explicitly counting do we query the index for the visible-shape
+        // metric — that query (and the lazy index build it triggers) is the bulk
+        // of a fit-view frame on a real chip, and the renderer never needs it.
         if !cell.shapes.is_empty() {
-            let local_view = world_tf.inverse().apply_bboxf(&self.view);
-            self.set.stats.visible_shapes += cell.index().count(&local_view) as u64;
+            if self.count_visible {
+                let local_view = world_tf.inverse().apply_bboxf(&self.view);
+                self.set.stats.visible_shapes += cell.index().count(&local_view) as u64;
+            }
             self.grouped.entry(id).or_default().push(world_tf);
         }
 

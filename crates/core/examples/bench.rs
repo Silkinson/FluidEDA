@@ -8,7 +8,7 @@
 //! Run:  cargo run --release -p fluideda-core --example bench [-- FILE.gds ...]
 //! With no file arg it uses the embedded hier.gds.
 
-use fluideda_core::{cull, Bboxf};
+use fluideda_core::{cull, cull_counted, Bboxf};
 use std::time::{Duration, Instant};
 
 const HIER: &[u8] = include_bytes!("../../../assets/hier.gds");
@@ -106,10 +106,13 @@ fn measure(name: &str, bytes: Vec<u8>) {
     println!("    peak RSS:      {}", human_bytes(peak_rss()));
 
     // --- cull at three viewports ---
-    println!("\n  CULL (visible-shape count + per-frame time)");
+    // Two timings: the render-path cull (no visible-count, what a frame pays) and
+    // the counted cull (with the visible-shape metric). The gap is the cost we
+    // took off the hot path in Phase 2a STEP 2.
+    println!("\n  CULL (per-frame time: hot path vs counted)");
     println!(
-        "    {:<12} {:>14} {:>10} {:>9} {:>8} {:>12}",
-        "viewport", "visible", "of total", "instances", "proxies", "cull time"
+        "    {:<12} {:>14} {:>10} {:>9} {:>8} {:>12} {:>12}",
+        "viewport", "visible", "of total", "instances", "proxies", "cull(hot)", "cull(counted)"
     );
     let (cx, cy) = ((wb.min_x + wb.max_x) * 0.5, (wb.min_y + wb.max_y) * 0.5);
     let cases = [
@@ -122,21 +125,27 @@ fn measure(name: &str, bytes: Vec<u8>) {
         let win_h = win_w * aspect;
         let view = Bboxf::new(cx - win_w * 0.5, cy - win_h * 0.5, cx + win_w * 0.5, cy + win_h * 0.5);
         let px_per_nm = 1200.0 / win_w;
-        let vs = cull(&db, &view, px_per_nm, 4.0);
+        let vs = cull_counted(&db, &view, px_per_nm, 4.0);
         let iters = 60;
         let t = Instant::now();
         for _ in 0..iters {
             let _ = cull(&db, &view, px_per_nm, 4.0);
         }
-        let per = t.elapsed() / iters;
+        let per_hot = t.elapsed() / iters;
+        let t = Instant::now();
+        for _ in 0..iters {
+            let _ = cull_counted(&db, &view, px_per_nm, 4.0);
+        }
+        let per_counted = t.elapsed() / iters;
         println!(
-            "    {:<12} {:>14} {:>9.4}% {:>9} {:>8} {:>12?}",
+            "    {:<12} {:>14} {:>9.4}% {:>9} {:>8} {:>12?} {:>12?}",
             label,
             vs.stats.visible_shapes,
             vs.stats.visible_shapes as f64 / flat.max(1) as f64 * 100.0,
             vs.stats.instances_emitted,
             vs.stats.proxy_count,
-            per
+            per_hot,
+            per_counted
         );
     }
     println!("\n  FINAL peak RSS: {}", human_bytes(peak_rss()));
