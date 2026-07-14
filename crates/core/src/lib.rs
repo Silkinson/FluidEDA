@@ -16,7 +16,7 @@ pub mod tess;
 pub mod transform;
 pub mod types;
 
-pub use cull::{cull, CellDraw, CullStats, VisibleSet};
+pub use cull::{cull, cull_counted, CellDraw, CullStats, VisibleSet};
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
 pub use index::ShapeIndex;
 pub use tess::{tessellate, tessellate_shapes, LayerMesh};

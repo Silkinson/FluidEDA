@@ -22,6 +22,14 @@ Recommendation (justified below): **build the streaming parser first**, then mov
 parse+tessellation to a Web Worker. Tiling/LOD for fit-view fps is third. The
 memo cache is not yet justified by any measurement.
 
+> **UPDATE — see the [After Phase 2a](#after-phase-2a-cheap-high-leverage-fixes)
+> section below.** Three cheap fixes changed this conclusion: a 4 GB wasm opt-in
+> (+3 bytes) doubled the memory headroom, removing a per-frame cull-stat query
+> took caravel fit from 12 → 78 fps (native), and lazy tessellation cut sky130
+> TTFF 98 → 24 ms. **Fit view is no longer slow (LOD work deleted); the streaming
+> parser is now "important, not urgent"; worker offload of the ~2.4 s TTFF freeze
+> is the new #1 Phase 2b priority.**
+
 ---
 
 ## Method
@@ -188,6 +196,87 @@ parser wins the moment files exceed ~300 MB or multiple files are opened.
 
 ---
 
+# After Phase 2a (cheap high-leverage fixes)
+
+Three cheap changes were applied and re-measured (branch `phase2a-quick-wins`).
+They **reorder** the Phase 2 plan: the fit-view LOD work is deleted, and the
+streaming parser drops from "urgent" to "important."
+
+### STEP 1 — 4 GB wasm memory opt-in (`-C link-arg=--max-memory=4294967296`)
+The "~2 GB ceiling" was V8's default, not a wasm32 limit. Declaring a 4 GB
+maximum lets the engine grow past 2 GB. **It works, for +3 bytes of wasm and no
+perf change:**
+
+| flat probe file | distinct polys | wasm heap | result |
+|---|--:|--:|---|
+| flat_5M.gds (305 MB) | 5.0 M | 2.35 GB | OK (was: crash < 2 GB) |
+| flat_8M.gds (488 MB) | 8.0 M | 2.71 GB | OK |
+| flat_11M.gds (671 MB) | 11.0 M | ~3.7 GB | **trap (OOM at the 4 GB max)** |
+
+New effective ceiling ≈ 8–10 M distinct polys (~2.7–3.4 GB steady; the parse
+transient hits the 4 GB wall). Real chips sit at ~2× headroom: caravel 3.9 M
+polys / 1.68 GB, caravan-signoff 4.8 M / 1.90 GB.
+
+### STEP 2 — take the visible-shape count off the cull hot path
+`cull.rs` queried every visible cell's R-tree every frame purely to fill a stat
+the renderer never reads. Made it opt-in (`cull_counted`, a debug toggle). This
+was the fit-view fix.
+
+### STEP 3 — lazy tessellation
+Tessellate + upload a cell def the first time it's drawn, not all defs at load.
+
+### Before / after (the numbers that matter)
+
+| metric | before 2a | after 2a | note |
+|---|--:|--:|---|
+| **caravel cull @ fit** (native) | 53.6 ms | **6.8 ms** | STEP 2; ~8× |
+| **caravel render @ fit** (native) | 12 fps | **78 fps** | STEP 2 |
+| caravel fit fps (browser WebGL2\*) | 22 | 102 | corroborates |
+| **caravel TTFF** (browser) | 3.8 s | **2.4 s** (mid/leaf) | STEP 2 dropped the 0.7 s forced index build; STEP 3 dropped small-cell tess |
+| caravel GPU geo @ zoom | 210 MB | 141 MB | STEP 3 (only visible defs) |
+| sky130 TTFF (browser) | 98 ms | **24 ms** (mid/leaf) | STEP 3 |
+| sky130 GPU geo @ zoom | 4 MB | ~0 MB | STEP 3 |
+| sky130 render @ fit (native) | 108 fps | 98 fps | unchanged (render-bound) |
+| memory ceiling | ~2 GB | **~3.4 GB** | STEP 1 |
+
+\* browser fps is WebGL2/ANGLE and rAF-capped (~120); native Metal is
+authoritative. The 22→102 jump confirms a real per-frame stall was removed.
+
+### Answers to the STEP 4 questions
+
+**Is fit view still slow? — NO.** The fit-view cost was the cull-path
+instrumentation (STEP 2), not GPU triangle count. caravel fit went 12 → 78 fps
+(native) / 22 → 102 (browser); sky130 fit is 98 fps native (its 38 fps in the
+bench is the headless WebGL2 software rasterizer, not a real GPU). **The planned
+density-proxy / LOD-raster work is not justified and is deleted** for the current
+M5/WebGPU target. Revisit only if a much weaker GPU becomes a target — caravel
+fit does draw ~7.9 M triangles, fine on an M5 (12.8 ms) but a candidate for LOD
+on low-end hardware. It is not a Phase 2 priority.
+
+**Where does memory stand? — comfortable, ~2× headroom.** The 4 GB opt-in moved
+the ceiling from ~2 GB to ~3.4 GB for a 3-byte change; real chips are at
+1.7–1.9 GB. **The streaming parser is no longer the top priority** — it's
+important (it would halve the parse footprint and push the ceiling further, and
+it speeds parse) but not urgent.
+
+### Revised Phase 2b priority
+
+1. **Worker offload of parse + tessellation.** The #1 remaining issue is the
+   **2.4 s main-thread freeze** on caravel (parse 1.2 s + tessellating the few
+   giant flat top-level cells 1.1 s — those cells are visible at every zoom, so
+   lazy tessellation can't skip them). Moving parse+tess into the Web Worker
+   (COOP/COEP already set) unfreezes the tab and pairs with the lazy
+   tessellation already in place.
+2. **Streaming parser.** Important, not urgent (STEP 1 bought the headroom).
+   Fold it into the worker: parse incrementally into the compact `CellDb`,
+   dropping raw records as you go, to cut the 1.4–1.9 GB parse high-water and
+   push the ceiling past 4 GB-equivalent.
+3. ~~Tile pyramid / LOD raster for fit view~~ — **deleted** (STEP 2 fixed fit).
+   Keep only as a contingency for low-end GPU targets.
+4. **Memo cache** — still not justified by any measurement.
+
+---
+
 ## Reproduce
 
 ```bash
@@ -206,5 +295,10 @@ node scripts/browser_bench.mjs         # needs `npm i playwright && npx playwrig
 
 # interactively: trunk serve, then open
 #   http://localhost:8080/?file=/testdata/caravel/gds/caravel.gds
+#   append &zoom=leaf to open zoomed; &stats=1 to enable the slow visible count
 # (or drag a .gds onto the canvas / use the Open button)
+
+# 4. Phase 2a memory-ceiling probe (the 4 GB opt-in is in .cargo/config.toml)
+python3 scripts/gen_flat.py 5     # -> testdata/flat_5M.gds (and 8, 11, ...)
+#   load flat_*.gds in the browser and watch wasm_heap_bytes climb past 2 GB
 ```

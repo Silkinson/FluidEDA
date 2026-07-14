@@ -9,10 +9,9 @@
 //! Run: cargo run --release -p fluideda-render --example shot
 //! Output: target/shots/*.png
 
-use fluideda_core::{cull, Bboxf};
+use fluideda_core::{cull, cull_counted, Bboxf};
 use fluideda_render::{Camera, HierRenderer};
 use glam::Vec2;
-use std::collections::HashMap;
 use std::time::Instant;
 
 const HIER: &[u8] = include_bytes!("../../../assets/hier.gds");
@@ -65,15 +64,8 @@ async fn run() {
         .await
         .expect("request_device");
 
-    // --- per-cell meshes + renderer ---
-    let mut per_cell: HashMap<usize, Vec<fluideda_core::LayerMesh>> = HashMap::new();
-    for (id, cell) in db.cells.iter().enumerate() {
-        let m = fluideda_core::tessellate_shapes(&cell.shapes);
-        if !m.is_empty() {
-            per_cell.insert(id, m);
-        }
-    }
-    let mut renderer = HierRenderer::new(&device, FORMAT, &per_cell);
+    // Renderer starts empty; cells are tessellated + uploaded lazily (STEP 3).
+    let mut renderer = HierRenderer::new(&device, FORMAT);
 
     // --- offscreen target + readback buffer ---
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -114,7 +106,16 @@ async fn run() {
         );
 
         let vs = cull(&db, &vp, cam.scale as f64, MIN_PIXEL);
+        // Lazy tessellation: upload any visible cell not yet on the GPU.
+        for d in &vs.draws {
+            if !renderer.has_cell(d.cell) {
+                let meshes = fluideda_core::tessellate_shapes(&db.cells[d.cell].shapes);
+                renderer.upload_cell(&device, d.cell, &meshes);
+            }
+        }
         renderer.prepare(&device, &queue, &cam, &vs);
+        // Visible-shape count is off the render path now; compute once for display.
+        let counted = cull_counted(&db, &vp, cam.scale as f64, MIN_PIXEL);
 
         // Encode a clear + draw.
         let mut enc = device.create_command_encoder(&Default::default());
@@ -201,16 +202,11 @@ async fn run() {
 
         println!(
             "{:<10} span={:>9.0}nm  visible={:>8}/{:<10} proxies={:>5} instances={:>6}  {:>8.2?}/frame  ~{:>5.0} fps  -> {}",
-            v.name, v.span_nm, vs_stats(&db, &vp, cam.scale).0, total,
-            vs_stats(&db, &vp, cam.scale).2, vs_stats(&db, &vp, cam.scale).1, per, fps, path
+            v.name, v.span_nm, counted.stats.visible_shapes, total,
+            vs.stats.proxy_count, vs.stats.instances_emitted, per, fps, path
         );
     }
     println!("\nwrote PNGs to target/shots/ (compare against KLayout with the same viewports)");
-}
-
-fn vs_stats(db: &fluideda_core::CellDb, vp: &Bboxf, scale: f32) -> (u64, u64, usize) {
-    let vs = cull(db, vp, scale as f64, MIN_PIXEL);
-    (vs.stats.visible_shapes, vs.stats.instances_emitted, vs.stats.proxy_count)
 }
 
 fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) {

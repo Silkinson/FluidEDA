@@ -6,9 +6,8 @@
 //! transforms and `paint` issues the instanced draws inside the egui render pass.
 
 use eframe::egui_wgpu::{self, CallbackTrait};
-use fluideda_core::{CellId, LayerMesh, VisibleSet};
+use fluideda_core::VisibleSet;
 use fluideda_render::{Camera, HierRenderer};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// egui paint callback carrying the per-frame camera and visible set.
@@ -44,14 +43,12 @@ impl CallbackTrait for LayoutPaint {
     }
 }
 
-/// Build the `HierRenderer` once (per-cell meshes) and stash it in egui resources.
-pub fn init_renderer(
-    wgpu_state: &egui_wgpu::RenderState,
-    per_cell: Arc<HashMap<CellId, Vec<LayerMesh>>>,
-) {
+/// Build an empty `HierRenderer` and stash it in egui resources. Cell geometry is
+/// tessellated + uploaded lazily as cells become visible (see `app::ensure_uploaded`).
+pub fn init_renderer(wgpu_state: &egui_wgpu::RenderState) {
     let device = &wgpu_state.device;
     let format = wgpu_state.target_format;
-    let renderer = HierRenderer::new(device, format, &per_cell);
+    let renderer = HierRenderer::new(device, format);
     wgpu_state
         .renderer
         .write()

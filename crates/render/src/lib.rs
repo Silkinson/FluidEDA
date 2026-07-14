@@ -77,8 +77,11 @@ pub struct HierRenderer {
     pipeline: wgpu::RenderPipeline,
     globals_buf: wgpu::Buffer,
     globals_bind: wgpu::BindGroup,
+    layer_bgl: wgpu::BindGroupLayout, // kept for lazy per-cell mesh uploads
 
     cells: HashMap<CellId, CellGpu>,
+    /// Running total of uploaded vertex+index bytes (lazy-tessellation growth).
+    uploaded_bytes: usize,
     proxy: GpuMesh, // unit-square [0,1]^2 mesh, dim color
 
     /// Shared instance buffer, grown as needed and rewritten each frame.
@@ -96,11 +99,9 @@ pub struct HierRenderer {
 const INST_SIZE: u64 = std::mem::size_of::<InstanceRaw>() as u64;
 
 impl HierRenderer {
-    pub fn new(
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-        per_cell: &HashMap<CellId, Vec<LayerMesh>>,
-    ) -> Self {
+    /// Build the pipeline and proxy mesh only. Cell geometry is tessellated and
+    /// uploaded lazily via [`upload_cell`] the first time a cell is drawn.
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("fill"),
             source: wgpu::ShaderSource::Wgsl(include_str!("fill.wgsl").into()),
@@ -175,18 +176,8 @@ impl HierRenderer {
             cache: None,
         });
 
-        // Build per-cell GPU meshes.
-        let mut cells = HashMap::new();
-        for (&id, meshes) in per_cell {
-            let gpu_meshes = meshes
-                .iter()
-                .filter(|m| !m.indices.is_empty())
-                .map(|m| build_mesh(device, &layer_bgl, m.layer, &m.vertices, &m.indices))
-                .collect::<Vec<_>>();
-            if !gpu_meshes.is_empty() {
-                cells.insert(id, CellGpu { meshes: gpu_meshes });
-            }
-        }
+        // Cells start empty and fill in on demand (lazy tessellation).
+        let cells = HashMap::new();
 
         // Unit-square proxy mesh (two triangles), dim neutral color.
         let proxy = build_proxy(device, &layer_bgl);
@@ -204,7 +195,9 @@ impl HierRenderer {
             pipeline,
             globals_buf,
             globals_bind,
+            layer_bgl,
             cells,
+            uploaded_bytes: 0,
             proxy,
             instbuf,
             instcap,
@@ -213,6 +206,35 @@ impl HierRenderer {
             proxy_first: 0,
             proxy_count: 0,
         }
+    }
+
+    /// Is this cell's geometry already tessellated + uploaded?
+    pub fn has_cell(&self, id: CellId) -> bool {
+        self.cells.contains_key(&id)
+    }
+
+    /// Total vertex+index bytes uploaded so far (grows with lazy tessellation).
+    pub fn uploaded_bytes(&self) -> usize {
+        self.uploaded_bytes
+    }
+
+    /// Tessellate-then-upload happens caller-side; this takes the finished
+    /// per-layer meshes and builds this cell's GPU buffers. Idempotent-ish: an
+    /// empty mesh set marks the cell as "seen" so we don't retessellate it.
+    pub fn upload_cell(&mut self, device: &wgpu::Device, id: CellId, meshes: &[LayerMesh]) {
+        if self.cells.contains_key(&id) {
+            return;
+        }
+        let gpu_meshes: Vec<GpuMesh> = meshes
+            .iter()
+            .filter(|m| !m.indices.is_empty())
+            .map(|m| {
+                self.uploaded_bytes += m.vertices.len() * std::mem::size_of::<fluideda_core::Vertex>()
+                    + m.indices.len() * 4;
+                build_mesh(device, &self.layer_bgl, m.layer, &m.vertices, &m.indices)
+            })
+            .collect();
+        self.cells.insert(id, CellGpu { meshes: gpu_meshes });
     }
 
     pub fn set_layer_visible(&mut self, layer: Layer, visible: bool) {
