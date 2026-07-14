@@ -2,7 +2,9 @@
 //! Both go through eframe with the wgpu backend.
 
 mod app;
+mod design;
 mod paint;
+mod webio;
 
 use app::FluidApp;
 
@@ -25,7 +27,10 @@ fn main() {
     use eframe::wasm_bindgen::JsCast as _;
 
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
+    // Warn, not Info: wgpu logs "Device::maintain" every frame at Info, which
+    // floods the console (and starves headless automation over CDP). Our own
+    // load metrics go to window.__fluideda_metrics, not the log.
+    console_log::init_with_level(log::Level::Warn).ok();
 
     let web_options = eframe::WebOptions::default();
     wasm_bindgen_futures::spawn_local(async {
