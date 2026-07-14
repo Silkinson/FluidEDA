@@ -8,11 +8,12 @@ use crate::design::{self, Design, Metrics};
 use crate::paint::{init_renderer, LayoutPaint};
 use crate::webio::{self, LoadSlot};
 use eframe::egui;
-use fluideda_core::{cull, CellDb, CullStats, Layer, VisibleSet};
+use fluideda_core::{cull, CellDb, CellId, CullStats, Layer, VisibleSet};
 use fluideda_render::{Camera, HierRenderer};
 use fluideda_sync::{color_from_id, Marker, Presence, Session};
 use glam::Vec2;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -46,6 +47,12 @@ pub struct FluidApp {
     /// R-trees. Both are expensive and only feed the stats readout — kept off the
     /// hot path (Phase 2a STEP 2).
     debug_stats: bool,
+    /// Cell defs whose geometry has been tessellated + uploaded (lazy, STEP 3).
+    uploaded: HashSet<CellId>,
+    /// Cumulative main-thread tessellation time so far (ms) — the lazy TTFF cost.
+    tess_accum_ms: f64,
+    /// Cumulative uploaded GPU geometry bytes so far.
+    gpu_bytes: usize,
 
     session: Option<Session>,
     name: String,
@@ -61,7 +68,7 @@ impl FluidApp {
             .expect("embedded hier.gds should parse");
 
         if let Some(state) = cc.wgpu_render_state.as_ref() {
-            init_renderer(state, Arc::new(design.per_cell.clone()));
+            init_renderer(state);
         }
 
         let mut camera = Camera::new(Vec2::new(1280.0, 800.0));
@@ -93,6 +100,9 @@ impl FluidApp {
             status: String::new(),
             forced_zoom: webio::query_zoom(),
             debug_stats: webio::query_flag("stats"),
+            uploaded: HashSet::new(),
+            tess_accum_ms: 0.0,
+            gpu_bytes: 0,
             session: None,
             name: "guest".to_string(),
             last_frame: 0.0,
@@ -103,9 +113,9 @@ impl FluidApp {
         app
     }
 
-    /// Install a freshly parsed design: swap the DB, rebuild the GPU renderer,
-    /// reset the camera and layer list. Runs on the main thread (H1: this blocks
-    /// the frame for the full parse+tessellation cost).
+    /// Install a freshly parsed design: swap the DB, reset the (empty) GPU
+    /// renderer, camera and layer list. Tessellation is deferred — cells upload
+    /// lazily as they become visible (STEP 3).
     fn install(&mut self, design: Design, frame: &mut eframe::Frame) {
         self.db = design.db;
         self.layers = design.layers;
@@ -116,12 +126,39 @@ impl FluidApp {
         self.metrics = design.metrics;
         self.camera.fit(self.bbox_min, self.bbox_max);
         self.apply_forced_zoom();
+        self.uploaded.clear();
+        self.tess_accum_ms = 0.0;
+        self.gpu_bytes = 0;
 
         if let Some(rs) = frame.wgpu_render_state() {
-            init_renderer(rs, Arc::new(design.per_cell));
+            init_renderer(rs);
             self.renderer_ready = true;
         }
         self.awaiting_first_frame = true;
+    }
+
+    /// Tessellate + upload any visible cell def not yet on the GPU (lazy). Runs
+    /// after culling, before paint, so the paint callback sees uploaded buffers.
+    /// First-view of a def costs one tessellation on the main thread (the source
+    /// of any pan hitch); thereafter it's cached.
+    fn ensure_uploaded(&mut self, frame: &mut eframe::Frame) {
+        let Some(rs) = frame.wgpu_render_state() else { return };
+        let device = rs.device.clone();
+        let mut guard = rs.renderer.write();
+        let Some(renderer) = guard.callback_resources.get_mut::<HierRenderer>() else { return };
+
+        let visible = self.visible.clone();
+        for d in &visible.draws {
+            if self.uploaded.contains(&d.cell) {
+                continue;
+            }
+            let t = web_time::Instant::now();
+            let meshes = fluideda_core::tessellate_shapes(&self.db.cells[d.cell].shapes);
+            self.tess_accum_ms += t.elapsed().as_secs_f64() * 1e3;
+            renderer.upload_cell(&device, d.cell, &meshes);
+            self.uploaded.insert(d.cell);
+        }
+        self.gpu_bytes = renderer.uploaded_bytes();
     }
 
     /// Consume any pending drag-drop / fetched / picked file.
@@ -165,6 +202,10 @@ impl FluidApp {
             return;
         }
         self.metrics.ttff_ms = self.load_instant.elapsed().as_secs_f64() * 1e3;
+        // Lazy tessellation: report what the initial view actually cost, not all defs.
+        self.metrics.tess_ms = self.tess_accum_ms;
+        self.metrics.vertex_bytes = self.gpu_bytes;
+        self.metrics.index_bytes = 0;
         // Forcing every R-tree at load (708 ms on caravel) only served the metric.
         // Indices are lazy and only built when actually queried; measure them here
         // only under the debug flag, so a normal load never pays for them.
@@ -253,6 +294,7 @@ impl eframe::App for FluidApp {
         self.side_panel(ctx, frame);
         self.canvas(ctx);
         self.recull();
+        self.ensure_uploaded(frame);
 
         ctx.request_repaint();
     }
@@ -279,12 +321,16 @@ impl FluidApp {
                 let m = &self.metrics;
                 ui.small(format!("size:        {} KB", m.file_bytes / 1024));
                 ui.small(format!("parse:       {:.1} ms", m.parse_ms));
-                ui.small(format!("tessellate:  {:.1} ms", m.tess_ms));
-                ui.small(format!("index(all):  {:.1} ms (p99 {:.2})", m.index_ms, m.index_p99_ms));
                 ui.small(format!("TTFF:        {:.0} ms", m.ttff_ms));
                 ui.small(format!("cell defs:   {}", m.cell_defs));
                 ui.small(format!("distinct:    {} polys", m.distinct_polys));
-                ui.small(format!("GPU geo:     {} MB", (m.vertex_bytes + m.index_bytes) / 1_048_576));
+                // Live (grow as cells stream in): lazy tessellation + GPU geometry.
+                ui.small(format!(
+                    "tess (lazy): {:.1} ms, {} defs uploaded",
+                    self.tess_accum_ms,
+                    self.uploaded.len()
+                ));
+                ui.small(format!("GPU geo:     {} MB (visible only)", self.gpu_bytes / 1_048_576));
                 if m.wasm_heap_bytes > 0 {
                     ui.small(format!("wasm heap:   {} MB", m.wasm_heap_bytes / 1_048_576));
                 }

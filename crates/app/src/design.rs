@@ -6,14 +6,12 @@
 //! memory metrics. On wasm the metrics are also pushed to `window` and the
 //! console so the Playwright bench can read them.
 
-use fluideda_core::{Bboxf, CellDb, Layer, LayerMesh};
-use std::collections::HashMap;
+use fluideda_core::{CellDb, Layer};
 use web_time::Instant;
 
 /// Everything the app needs to render one design, plus how expensive it was.
 pub struct Design {
     pub db: CellDb,
-    pub per_cell: HashMap<usize, Vec<LayerMesh>>,
     pub layers: Vec<Layer>,
     pub bbox_min: glam::Vec2,
     pub bbox_max: glam::Vec2,
@@ -42,8 +40,10 @@ pub struct Metrics {
     pub wasm_heap_bytes: usize,
 }
 
-/// Parse + eager-tessellate. This is the main-thread cost the app pays on load
-/// (H1: it blocks until every cell def is tessellated).
+/// Parse only. Tessellation is now **lazy** (Phase 2a STEP 3): the app
+/// tessellates + uploads a cell def the first time it's actually drawn, so the
+/// load path no longer blocks on tessellating every def. `tess_ms` and the GPU-
+/// geometry byte counts are filled in by the app as cells become visible.
 pub fn load_design(name: &str, bytes: &[u8]) -> anyhow::Result<Design> {
     let t = Instant::now();
     let db = fluideda_core::gds::load_gds_db(bytes)?;
@@ -53,44 +53,21 @@ pub fn load_design(name: &str, bytes: &[u8]) -> anyhow::Result<Design> {
     let distinct_polys: usize = db.cells.iter().map(|c| c.shapes.len()).sum();
     let flattened = db.flat_shape_count();
     let wb = db.world_bbox();
-
-    let t = Instant::now();
-    let mut per_cell: HashMap<usize, Vec<LayerMesh>> = HashMap::with_capacity(cell_defs);
-    let mut triangles = 0usize;
-    let mut vertex_bytes = 0usize;
-    let mut index_bytes = 0usize;
-    for (id, cell) in db.cells.iter().enumerate() {
-        let meshes = fluideda_core::tessellate_shapes(&cell.shapes);
-        for m in &meshes {
-            triangles += m.indices.len() / 3;
-            vertex_bytes += m.vertices.len() * std::mem::size_of::<fluideda_core::Vertex>();
-            index_bytes += m.indices.len() * 4;
-        }
-        if !meshes.is_empty() {
-            per_cell.insert(id, meshes);
-        }
-    }
-    let tess_ms = t.elapsed().as_secs_f64() * 1e3;
-
     let layers = db.all_layers();
+
     let metrics = Metrics {
         name: name.to_string(),
         file_bytes: bytes.len(),
         parse_ms,
-        tess_ms,
         cell_defs,
         distinct_polys,
         flattened,
-        triangles,
-        vertex_bytes,
-        index_bytes,
         wasm_heap_bytes: wasm_heap_bytes(),
         ..Default::default()
     };
 
     Ok(Design {
         db,
-        per_cell,
         layers,
         bbox_min: glam::Vec2::new(wb.min_x as f32, wb.min_y as f32),
         bbox_max: glam::Vec2::new(wb.max_x as f32, wb.max_y as f32),
