@@ -1,0 +1,385 @@
+# Phase 2b — Spatial chunking + worker offload: findings
+
+**Status: STEP 1 shipped and measured. STEP 2 (worker) is NOT implemented** — its
+toolchain groundwork is done and proven, and the design below is settled, but no
+parse or tessellation runs off the main thread yet. See
+[STEP 2](#step-2--worker-offload-not-implemented) for exactly where it stands and
+why it stopped there.
+
+**TL;DR.** Chunking did what it was meant to: leaf-zoom tessellation on caravel
+collapsed **2235 ms → 22 ms** (100×) and leaf GPU geometry **141 MB → 1.1 MB**
+(128×), with every test file rendering byte-identical. But it **did not fix
+time-to-first-frame**, because TTFF is no longer tessellation-bound: leaf TTFF
+went 4.55 s → 2.60 s and what remains is **2.4 s of parse — 92% of it**. The
+~2.4 s freeze the Phase 2a findings blamed on "parse + tessellating the giant flat
+cells" is now, after chunking, *almost entirely parse*.
+
+That reorders Phase 2b's remaining work, and the conclusion is the opposite of the
+Phase 2a doc's: **the streaming parser is no longer "important, not urgent" — it
+is the only slow thing left.** A worker would *hide* the 2.4 s; the streaming
+parser would *remove* it, and take the 1.68 GB heap with it. Details in
+[Is the streaming parser still worth doing?](#is-the-streaming-parser-still-worth-doing).
+
+---
+
+## Method
+
+Same harnesses and files as Phase 1.5 (`crates/core/examples/bench.rs`,
+`crates/render/examples/shot.rs`, `scripts/browser_bench.mjs`). Two changes worth
+knowing about before reading any number:
+
+**Every "before" number here was re-measured on this machine, not copied from the
+Phase 1.5/2a doc.** The doc's browser baseline (caravel TTFF 2.4 s, parse 1.23 s)
+does not reproduce here — this machine/Chromium measures the *same pre-chunking
+commit* at TTFF 4.55 s / parse 2.15 s. The old numbers are not wrong so much as
+not comparable; all before/after pairs below come from the same session on the
+same machine, which is the only way the deltas mean anything.
+
+**`shot.rs` now builds a fresh renderer per viewport.** It used to share one
+across `fit → mid → leaf`, so the first view uploaded everything and every later
+view reported ~0 ms tessellation and the whole file's GPU bytes. That made the
+exact metric Phase 2b targets unmeasurable. Each viewport now measures what
+opening the file *at that zoom* actually costs.
+
+---
+
+## STEP 0 (prerequisite) — the golden check didn't work
+
+The invariant is "hier.gds + sky130 must render identically to the Phase 1 golden
+PNGs at every checkpoint". That could not be checked, for two reasons.
+
+**The renders were nondeterministic.** `cull_inner` materialised its `grouped`
+HashMap straight into the draw list, so draw order was per-process random; the
+renderer draws in that order and the pipeline alpha-blends, so overlapping cells
+composited differently run to run. Two runs of *unmodified* code differed by 118
+pixels (0.01%, max channel delta 28) on sky130 at fit. Sorting the groups by cell
+id fixed it. No policy change — cross-cell paint order was already arbitrary; this
+only pins it.
+
+**There were no golden PNGs.** `target/shots/` is generated and gitignored, and
+nothing was committed. So "the Phase 1 golden PNGs" were re-created from the
+now-deterministic pre-chunking code and every checkpoint diffed against those.
+
+Worth fixing properly: the goldens still aren't committed, so this only protects
+within a session. A committed PNG + a `cargo test` that diffs it would make the
+invariant real.
+
+---
+
+## STEP 1 — spatial chunking
+
+### The shape of the problem
+
+Per-cell shape counts on caravel (1014 defs, 3.92 M distinct polygons) — the
+measurement that drove every decision here:
+
+| cell | shapes | % | bbox |
+|---|--:|--:|---|
+| `caravel_core` | 2,504,272 | 63.8% | 3194 × 4819 µm |
+| `housekeeping` | 363,765 | 9.3% | 410 × 551 µm |
+| `RAM128` | 312,019 | 8.0% | 406 × 438 µm |
+| `manual_power_connections` | 112,672 | 2.9% | 3194 × 4819 µm |
+| `sky130_fd_io__*` (5 cells) | 55–77 k each | 8.4% | ~75 × 200 µm |
+
+One cell holds 64% of the file and spans the entire die. That is the whole
+problem: hierarchy culling cannot help a single die-spanning definition, so a 5 µm
+window tessellated all 2.5 M of its shapes.
+
+### Chunk-assignment policy: single-owner + loose bbox
+
+Each shape belongs to **exactly one** chunk — the one containing its bbox centre.
+Each chunk stores the **union bbox of the shapes it owns**, which may extend past
+its nominal grid rect, and selection tests that union (a "loose grid").
+
+**Why not assign a border-spanning shape to every chunk it overlaps:** it
+duplicates geometry. The pipeline alpha-blends, so a shape tessellated into two
+visible chunks blends with itself and renders a different colour than the same
+file renders today — it breaks the golden invariant outright. Single ownership
+also keeps total tessellation work exactly equal to the unchunked path (every
+shape tessellated once) and keeps a chunk a contiguous range rather than a gather.
+
+**What it costs**, measured rather than assumed — `chunk_stats` reports each
+chunk's loose bbox as a multiple of its ideal grid square:
+
+| cell | chunks | mean shapes | worst loose bbox |
+|---|--:|--:|--:|
+| `caravel_core` | 71 | 35,271 | **80.7× grid square** |
+| `housekeeping` | 25 | 14,551 | 25.0× |
+| `RAM128` | 25 | 12,481 | 25.0× |
+| `manual_power_connections` | 8 | 14,084 | 8.8× |
+
+The inflation is real and large: a die-spanning power strap drags its owner
+chunk's bbox across the die, so that chunk is selected from any viewport and its
+shapes always tessellate. It is bounded — one chunk's worth of work (~35 k
+shapes), not the cell's 2.5 M — and the leaf numbers below show it does not
+matter in practice. Two other things this table shows: `caravel_core`'s grid is
+**sparse** (71 non-empty of 169 squares, so its geometry is clustered, and mean
+occupancy runs 2× the target), and a smarter policy (quadtree, or promoting long
+shapes to a coarse level) has measurable headroom if it ever matters.
+
+### Thresholds are measured, not guessed
+
+Chunking is **only ever a cost at fit view** — every chunk of a visible cell is on
+screen, so each is an extra draw call buying no culling — and only a win when a
+viewport sees a fraction of a cell. Both constants were swept on caravel (full
+tables in the doc comments on `CHUNK_MIN_SHAPES` / `CHUNK_TARGET_SHAPES`):
+
+| threshold | cells chunked | fit frame | leaf tess | leaf GPU |
+|---:|--:|--:|--:|--:|
+| (none) | 0 | 18.8 ms | 1469 ms | 141 MB |
+| 50 k | 9 | 22.3 ms | 11.9 ms | 1.1 MB |
+| **100 k** | **4** | **20.0 ms** | **12.0 ms** | **1.1 MB** |
+| 200 k | 3 | 21.9 ms | 72.9 ms | 7.1 MB |
+| 500 k | 1 | 19.1 ms | 73.5 ms | 7.1 MB |
+
+The 50 k → 100 k step is the interesting one, and the reason is structural. It
+excludes the five `sky130_fd_io__*` pad cells, which are shape-*dense* (55–77 k)
+but spatially *tiny* (75 × 200 µm). Hierarchy culling already handles a small
+cell — it is one bbox test — so chunking them bought nothing and cost ~50 draw
+calls at fit. **What defeats hierarchy culling is a cell that spans the die, not
+one with many shapes.** 100 k keeps both of caravel's die-spanning cells and drops
+the pads. Going coarser (200 k+) drops `manual_power_connections` and leaf
+tessellation jumps 6×.
+
+Settled on **`CHUNK_MIN_SHAPES = 100_000`, `CHUNK_TARGET_SHAPES = 16_000`**.
+Accepted cost: a leaf view centred inside a 55–77 k pad cell tessellates it whole
+(~45 ms), a one-off well inside a frame budget.
+
+### Results — caravel, native (M5 / Metal, 1000×1000, fresh renderer per view)
+
+| viewport | tess before | after | GPU before | after | frame before | after |
+|---|--:|--:|--:|--:|--:|--:|
+| fit | 2200 ms | 2292 ms | 207.1 MB | 207.1 MB | 18.8 ms (53 fps) | 20.4 ms (50 fps) |
+| mid | 1472 ms | **12 ms** | 140.8 MB | **1.1 MB** | 5.9 ms | 5.9 ms |
+| leaf | 1469 ms | **12 ms** | 140.8 MB | **1.1 MB** | 5.7 ms | 5.7 ms |
+
+### Results — browser (headless Chromium, WebGL2/ANGLE-Metal, M5)
+
+| caravel | TTFF before | after | parse before | after | tess before | after | heap | fps before | after |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| fit | 5444 ms | 5154 ms | 2148 | 2423 | 3121 ms | 2488 ms | 1680 MB | 52 | 47 |
+| mid | 4563 ms | **2641 ms** | 2164 | 2424 | 2240 ms | **22 ms** | 1680 MB | 98 | 100 |
+| leaf | 4549 ms | **2602 ms** | 2147 | 2387 | 2235 ms | **22 ms** | 1680 MB | 100 | 101 |
+
+sky130 is untouched, as intended — **0 cells chunked**, TTFF 44 → 46 ms at leaf,
+heap 63 → 64 MB. hier is unchanged (~18 ms). Native peak RSS 1.7 → 1.6 GB;
+sky130's native RSS is 32.6 MB (Phase 1.5 recorded 37.6 MB pre-store).
+
+### Honest costs
+
+- **Fit view regressed ~6%**: native 53 → 50 fps, browser 52 → 47. Chunking cannot
+  help at fit (every chunk is on screen) and costs draw calls: 152 → 277 plans.
+  This is inherent, not a bug, and the sweep above already minimises it.
+- **Parse pays +275 ms in wasm** (2148 → 2423 ms) for the chunk sort/reorder.
+  Native pays only +60 ms (1.47 → 1.53 s).
+- **The wasm heap did not move at all** (1680 MB before and after). The columnar
+  store saved ~100 MB of *native* RSS, but the wasm high-water is set by gds21's
+  whole-library parse, which chunking does not touch. See the streaming-parser
+  section — this is the single most important number in this document.
+
+### Two bugs found by measuring rather than assuming
+
+Both were invisible natively and would have shipped:
+
+1. **Chunking ran while the whole gds21 library was still alive.** `build_db(&lib)`
+   finalised the DB — including the reorder's transient coordinate copy — before
+   `lib` was dropped, stacking the copy on the parse high-water. Peak RSS went
+   *up*, 1.56 → 1.8 GB. The library is now dropped before finalisation.
+2. **Chunking re-derived every shape's bbox three times** (grid key, chunk union,
+   then `own_bbox`), walking a 2.5 M-shape cell's coordinates repeatedly. Native
+   cost: +0.2 s, easy to miss. **Wasm cost: +1.3 s — enough to cancel the entire
+   tessellation win.** Caching per-shape bboxes once and folding `own_bbox` from
+   the chunk table fixed it. Without the browser measurement, STEP 1 would have
+   been a wash on the platform that matters.
+
+### Renderer: draw order is load-bearing
+
+Splitting a cell into chunks naturally draws chunk-major (chunk 0's every layer,
+then chunk 1's) where it previously drew layer-major (all of layer 0, then layer
+1). That re-composites every cross-layer overlap and **changed 4.7% of caravel's
+pixels at fit**. The renderer now sorts draws by `(cell, layer, chunk)`, restoring
+the original layer sweep; reordering chunks *within* a layer is safe because a
+layer has one colour and alpha, and `src-over` of identical colours commutes.
+
+**Verified: hier, sky130 and caravel all render byte-identical to pre-chunking at
+fit/mid/leaf.**
+
+---
+
+## STEP 2 — worker offload (NOT implemented)
+
+### What STEP 1 changed about the requirement
+
+The Phase 2a doc justified the worker as "parse 1.2 s + tessellating the few giant
+flat cells 1.1 s". Chunking removed the second half at every zoom except fit. What
+is left:
+
+| caravel, browser | parse | tess | TTFF |
+|---|--:|--:|--:|
+| leaf / mid | 2.4 s | **0.02 s** | 2.6 s |
+| fit | 2.4 s | 2.5 s | 5.2 s |
+
+So the answer to the question the brief asked — *"if STEP 1 alone gets leaf-zoom
+TTFF acceptable and the freeze only matters at fit, say so"* — is: **half of it.**
+Leaf-zoom *tessellation* is solved (22 ms; STEP 2 has nothing to offer it). But
+leaf TTFF is still 2.6 s, and it is **92% parse**. Parse is not a fit-view problem;
+it is on the critical path at every zoom. So STEP 2 narrows to **parse everywhere,
+plus tessellation at fit only** — it does not need chunk-tessellation offload for
+mid/leaf at all, which simplifies the protocol considerably.
+
+### Memory model, and why it forces the design
+
+The brief's trap is real and worth restating with the measured numbers. caravel's
+wasm heap is 1680 MB, of which the columnar store is 196 MB — **gds21's
+intermediate library is ~1.4 GB of it**. Three options:
+
+1. **Worker parses, postMessages the CellDb to main.** Rejected. The store lives
+   inside wasm linear memory, so "transfer" means copying out to an ArrayBuffer
+   and back in. Worse, wasm memory never shrinks: the worker's heap stays ~1.7 GB
+   reserved until terminated, so the pair peaks at ~2.1 GB — **worse than the
+   1.68 GB single-thread baseline**, exactly as the brief warns.
+2. **Two wasm modules sharing one memory.** Unsound: each module has its own
+   allocator state, and two allocators over one heap corrupt it.
+3. **One module, shared memory, two threads.** The only option that holds peak at
+   the baseline. Parse runs on a worker thread, allocates the `CellDb` in the
+   shared heap, and moving it to the main thread is a pointer move — no copy. This
+   is why STEP 1's store had to be `Pod` columns with no per-shape `Vec`.
+
+**The peak-heap proof the brief asks for cannot be given yet** — nothing runs in a
+worker. The claim option 3 *would* hold peak at 1680 MB is a design argument, not
+a measurement, and should be treated as unproven until the worker exists.
+
+### Groundwork done and proven
+
+Option 3 needs `-C target-feature=+atomics` so the module's memory is a
+SharedArrayBuffer. Two blockers found and cleared:
+
+1. **`getrandom` 0.1.16 cannot compile for wasm with atomics** — wasm-bindgen
+   changes `JsStatic` handling under threads, so its `MODULE.require("crypto")`
+   stops resolving. It arrived via an *unused* `y-sync` dependency that also
+   dragged in a duplicate `yrs 0.17`. `fluideda-sync` declared y-sync but never
+   referenced it; removing it deletes the whole chain.
+2. **wgpu 22's wasm handles are `!Send + !Sync` under atomics** — they wrap JS
+   objects, which cannot cross a worker boundary, so wgpu drops its
+   `fragile-send-sync-non-atomic-wasm` shim. egui's `type_map::concurrent::TypeMap`
+   requires `Send + Sync` unconditionally. **That single bound was the only
+   remaining blocker in the entire dependency tree** — 4 errors, all from one
+   `callback_resources.insert` call site. A `MainThreadOnly` marker resolves it,
+   sound because eframe paints only on the main thread and the worker will link
+   `fluideda-core` alone.
+
+With both cleared, the app **links to a shared-memory wasm module** — verified by
+reading the emitted memory section: `flags=0x03` (shared + declared max):
+
+```bash
+RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals \
+  -C link-arg=--max-memory=4294967296 -C link-arg=--shared-memory" \
+  cargo +nightly build --release -p fluideda-app \
+  --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+```
+
+That was STEP 2's largest unknown, and it is now answered: **the geometry pipeline
+(`fluideda-core`) and the whole app both compile and link under atomics.** The
+default stable/trunk build is untouched — no toolchain pin, no `.cargo/config.toml`
+change — so this costs nothing until the worker is turned on.
+
+### What remains
+
+- Trunk integration: nightly + `build-std` + atomics flags, and wasm-bindgen glue
+  emitted with shared memory. Likely a `rust-toolchain.toml` and a
+  `[unstable] build-std` entry (which only engages when `--target` is passed, so
+  native builds stay on precompiled std).
+- Thread spawn. `std::thread::spawn` does not work on wasm; `wasm-bindgen-rayon`'s
+  `init_thread_pool` handles worker creation and module/memory sharing. Then parse
+  is `rayon::spawn(move || parse(bytes))` with the `CellDb` sent back over a
+  channel — a pointer move in the shared heap. `CellDb` looks `Send` already
+  (`OnceCell<ShapeIndex>` is `Send` when `T: Send`); worth confirming.
+- Keep the `CellDb` in an `Arc` so the worker can tessellate chunks while the main
+  thread culls.
+- Non-worker fallback for native and non-crossorigin-isolated contexts.
+- The measurements the brief asks for: longest main-thread frame during load, and
+  **peak heap across the worker+main pair** — the number that proves or refutes
+  the no-double-buffer claim above.
+
+Stopping here rather than landing a half-working worker was deliberate: STEP 1 is
+complete and verified, and the remaining integration is a substantial piece of
+work with its own risk (Trunk + build-std + wasm-bindgen-rayon + eframe init
+order) that deserves its own commit and its own measurements.
+
+---
+
+## WebGL2 vs WebGPU
+
+**Not observed — and this is a gap, not a finding.** The harness still forces
+wgpu's WebGL2 backend because this Chromium's WebGPU rejects wgpu 22's
+`requestDevice` limits (unchanged since Phase 1.5). So every browser number here
+is WebGL2/ANGLE-Metal, and no WebGPU-vs-WebGL2 comparison was possible.
+
+What the data does suggest: chunking's fit-view cost is **draw-call bound**, and
+WebGL2 has higher per-draw overhead than WebGPU. Fit regressed 10% on WebGL2
+(52 → 47 fps) versus 6% natively on Metal (53 → 50). So WebGL2 is the pessimistic
+case for chunking, and the numbers above are a floor. Worth re-checking on WebGPU
+before treating the fit regression as settled — a wgpu upgrade (22 is well behind)
+would likely unblock headless WebGPU and is a prerequisite for that.
+
+---
+
+## Is the streaming parser still worth doing?
+
+**Yes — and its case is now much stronger than Phase 2a concluded.** The Phase 2a
+doc demoted it to "important, not urgent" because the 4 GB opt-in bought headroom.
+Two measurements from this phase change that:
+
+1. **Parse is now the entire remaining freeze.** Chunking took tessellation off the
+   critical path at mid/leaf (2235 → 22 ms), and what it exposed is that parse is
+   **92% of the 2.6 s leaf TTFF**. It is the only slow thing left.
+2. **The heap is parse, and nothing else touches it.** caravel's wasm heap is
+   1680 MB before *and after* the columnar store. The store is 196 MB of that —
+   **~12%**. The other ~1.4 GB is gds21's intermediate `GdsLibrary`. Phase 2a's
+   4 GB opt-in raised the ceiling but the *cause* is untouched, and STEP 1 proved
+   the compact model isn't what costs.
+
+The distinction that matters for build order: **a worker only hides the 2.4 s; the
+streaming parser removes it** — and takes ~1.4 GB with it, which no other planned
+work does. They are not substitutes, and if only one gets built, the parser is
+worth more:
+
+- it attacks the freeze *and* the heap, where the worker attacks only the freeze;
+- it makes the worker cheaper when it lands (less to move, a smaller shared heap);
+- it is plain Rust in `crates/core`, with none of the worker's toolchain risk
+  (nightly, `build-std`, atomics, wasm-bindgen-rayon, Trunk integration).
+
+STEP 1 also did some of its groundwork already: `gds.rs` now collects into the
+columnar store and drops the library before finalising, so an incremental reader
+slots into `collect()` without touching the chunker, the culler, or the renderer.
+
+**Suggested order from here:** streaming parser → worker (parse + fit-view
+tessellation) → revisit the fit regression on WebGPU. The worker's own value is
+mostly the fit case and interactivity-during-load once parse is cheap.
+
+---
+
+## Reproduce
+
+```bash
+# native (add --example cells for the per-cell shape distribution)
+cargo run --release -p fluideda-core   --example bench -- testdata/caravel/gds/caravel.gds
+cargo run --release -p fluideda-render --example shot  -- testdata/caravel/gds/caravel.gds
+
+# browser
+trunk build --release
+python3 scripts/serve_bench.py 8090 &
+npm i playwright && npx playwright install chromium
+node scripts/browser_bench.mjs
+
+# golden check: render hier + sky130 and diff against a pre-change baseline.
+# NOTE: goldens are not committed; capture a baseline from the parent commit first.
+
+# STEP 2 groundwork: prove the shared-memory build still links
+rustup toolchain install nightly --component rust-src
+rustup target add wasm32-unknown-unknown --toolchain nightly
+RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals \
+  -C link-arg=--max-memory=4294967296 -C link-arg=--shared-memory" \
+  cargo +nightly build --release -p fluideda-app \
+  --target wasm32-unknown-unknown -Z build-std=std,panic_abort
+```

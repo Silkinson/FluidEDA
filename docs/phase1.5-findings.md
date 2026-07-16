@@ -261,6 +261,19 @@ it speeds parse) but not urgent.
 
 ### Revised Phase 2b priority
 
+> **SUPERSEDED — see [docs/phase2b-findings.md](phase2b-findings.md).** Phase 2b
+> STEP 1 (chunking) took tessellation off the critical path at mid/leaf
+> (2235 → 22 ms) and showed that what remains is **92% parse**. It also showed the
+> wasm heap is unchanged by a compact geometry model (1680 MB before and after —
+> the columnar store is only ~12% of it; ~1.4 GB is gds21's intermediate
+> library). So the ordering below is wrong on both counts: **the streaming parser
+> is no longer "important, not urgent" — it is the only slow thing left, and the
+> only work that attacks the heap.** A worker merely hides the 2.4 s.
+>
+> Also note the browser numbers in this document do not reproduce on the machine
+> used for Phase 2b (it measures the *same commit* at TTFF 4.55 s / parse 2.15 s,
+> not 2.4 s / 1.23 s). Treat them as within-session deltas, not absolutes.
+
 1. **Worker offload of parse + tessellation.** The #1 remaining issue is the
    **2.4 s main-thread freeze** on caravel (parse 1.2 s + tessellating the few
    giant flat top-level cells 1.1 s — those cells are visible at every zoom, so
