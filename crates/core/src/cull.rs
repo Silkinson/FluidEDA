@@ -79,8 +79,17 @@ fn cull_inner(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64, count_v
     };
     ctx.walk(db.top, Transform::IDENTITY);
 
-    // Materialise the grouped instancing map into the output list.
-    for (cell, transforms) in ctx.grouped {
+    // Materialise the grouped instancing map into the output list, ordered by
+    // cell id. The sort is load-bearing, not cosmetic: `grouped` is a HashMap, so
+    // iterating it yields a per-process-random order, and the renderer draws in
+    // exactly that order. With alpha blending, two cells whose geometry overlaps
+    // blend to different pixels depending on which is drawn first — so an
+    // unsorted walk makes the same scene render differently run to run (measured:
+    // 118 px of sky130 at fit). Sorting makes the frame reproducible, which is
+    // what lets the golden-image check mean anything.
+    let mut grouped: Vec<(CellId, Vec<Transform>)> = ctx.grouped.into_iter().collect();
+    grouped.sort_unstable_by_key(|&(cell, _)| cell);
+    for (cell, transforms) in grouped {
         ctx.set.stats.instances_emitted += transforms.len() as u64;
         ctx.set.draws.push(CellDraw { cell, transforms });
     }
