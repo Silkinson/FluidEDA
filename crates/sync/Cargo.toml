@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 yrs.workspace = true
-y-sync.workspace = true
 ewebsock.workspace = true
 glam.workspace = true
 log.workspace = true

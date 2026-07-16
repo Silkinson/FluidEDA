@@ -5,11 +5,11 @@
 //! load path (parse / tessellation / index / TTFF / wasm heap).
 
 use crate::design::{self, Design, Metrics};
-use crate::paint::{init_renderer, LayoutPaint};
+use crate::paint::{init_renderer, renderer_mut, LayoutPaint};
 use crate::webio::{self, LoadSlot};
 use eframe::egui;
 use fluideda_core::{cull, CellDb, CellId, ChunkId, CullStats, Layer, VisibleSet};
-use fluideda_render::{Camera, HierRenderer};
+use fluideda_render::Camera;
 use fluideda_sync::{color_from_id, Marker, Presence, Session};
 use glam::Vec2;
 use std::cell::RefCell;
@@ -147,7 +147,7 @@ impl FluidApp {
         let Some(rs) = frame.wgpu_render_state() else { return };
         let device = rs.device.clone();
         let mut guard = rs.renderer.write();
-        let Some(renderer) = guard.callback_resources.get_mut::<HierRenderer>() else { return };
+        let Some(renderer) = renderer_mut(&mut guard.callback_resources) else { return };
 
         let visible = self.visible.clone();
         for d in &visible.draws {
@@ -379,7 +379,8 @@ impl FluidApp {
                             .changed()
                         {
                             if let Some(rs) = frame.wgpu_render_state() {
-                                if let Some(r) = rs.renderer.write().callback_resources.get_mut::<HierRenderer>() {
+                                let mut guard = rs.renderer.write();
+                                if let Some(r) = renderer_mut(&mut guard.callback_resources) {
                                     r.set_layer_visible(layer, self.layer_visible[i]);
                                 }
                             }
