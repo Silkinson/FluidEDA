@@ -60,6 +60,17 @@ fn measure(name: &str, bytes: Vec<u8>) {
     println!("    distinct polys:{distinct_polys}  (sum of per-cell shapes)");
     println!("    flattened:     {flat}");
     println!("    world bbox:    {:.0} x {:.0} um", wb.width() / 1000.0, wb.height() / 1000.0);
+    let chunked: Vec<_> = db.cells.iter().filter(|c| c.chunks.len() > 1).collect();
+    let nchunks: usize = db.cells.iter().map(|c| c.chunks.len()).sum();
+    println!("    shape store:   {} (columnar: coords+offsets+layers)", human_bytes(db.store_bytes()));
+    println!("    chunks:        {nchunks} total; {} cells chunked", chunked.len());
+    for c in chunked.iter() {
+        let (n, mean, worst) = fluideda_core::chunk::chunk_stats(&c.chunks, &c.shapes.total_bbox());
+        println!(
+            "      {:<26} {:>4} chunks, mean {:>6.0} shapes, worst loose bbox {:>5.1}x grid sq",
+            c.name, n, mean, worst
+        );
+    }
     println!(
         "    peak RSS:      {} (+{} since start)",
         human_bytes(peak_rss()),
@@ -83,13 +94,17 @@ fn measure(name: &str, bytes: Vec<u8>) {
     println!("    per-cell p99:  {:?}", pct(&durs, 0.99));
     println!("    per-cell max:  {:?}", durs.last().copied().unwrap_or_default());
 
-    // --- tessellation (eager: every cell def, as the app does today) ---
+    // --- tessellation (every chunk of every cell def = the whole-file cost) ---
     let t = Instant::now();
     let mut vbytes = 0usize;
     let mut ibytes = 0usize;
     let mut tris = 0usize;
     for c in &db.cells {
-        let meshes = fluideda_core::tessellate_shapes(&c.shapes);
+        let meshes: Vec<_> = c
+            .chunks
+            .iter()
+            .flat_map(|ch| fluideda_core::tessellate_chunk(&c.shapes, ch))
+            .collect();
         for m in &meshes {
             vbytes += m.vertices.len() * std::mem::size_of::<fluideda_core::Vertex>();
             ibytes += m.indices.len() * 4;
@@ -97,7 +112,7 @@ fn measure(name: &str, bytes: Vec<u8>) {
         }
     }
     let t_tess = t.elapsed();
-    println!("\n  TESSELLATE (eager: all {cell_defs} cell defs, cell-local)");
+    println!("\n  TESSELLATE (eager: every chunk of all {cell_defs} cell defs, cell-local)");
     println!("    time:          {:?}", t_tess);
     println!("    triangles:     {tris}");
     println!("    vertex mem:    {}", human_bytes(vbytes));

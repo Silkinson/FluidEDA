@@ -8,15 +8,32 @@
 
 use crate::db::{CellDb, CellDbBuilder, Instance, InstanceKind};
 use crate::transform::Transform;
-use crate::types::{FlatLayout, Layer, Point, Polygon};
+use crate::types::{FlatLayout, Layer, Point};
 use anyhow::{anyhow, Result};
 use gds21::{GdsElement, GdsLibrary, GdsStrans};
 
 /// Parse GDSII bytes into a hierarchical cell database.
+///
+/// Deliberately sequenced so the two big allocations never coexist at their
+/// peaks: `gds21` materialises the whole library (caravel's high-water, ~1.5 GB)
+/// and we then collect it into our compact columnar cells. Finalisation —
+/// chunking, which transiently copies a cell's coordinate column to reorder it —
+/// runs only **after** the library is dropped. Doing it while `lib` was still
+/// alive stacked the reorder copy on top of the parse high-water and pushed
+/// caravel's peak RSS from 1.56 GB to 1.8 GB.
 pub fn load_gds_db(bytes: &[u8]) -> Result<CellDb> {
     let lib = GdsLibrary::from_bytes(bytes.to_vec())
         .map_err(|e| anyhow!("GDS parse failed: {e:?}"))?;
-    build_db(&lib)
+    let builder = collect(&lib)?;
+    drop(lib); // free the raw library before finalising (see above)
+    let db = builder.build()?;
+    log::info!(
+        "loaded {} cell defs, top='{}', ~{} flattened shapes",
+        db.cells.len(),
+        db.cell(db.top).name,
+        db.flat_shape_count()
+    );
+    Ok(db)
 }
 
 /// Phase 0 compatibility: parse then flatten to a `FlatLayout`. Correct for
@@ -36,7 +53,9 @@ pub fn load_gds_bytes(bytes: &[u8]) -> Result<FlatLayout> {
     Ok(flat)
 }
 
-fn build_db(lib: &GdsLibrary) -> Result<CellDb> {
+/// Collect the parsed library into a `CellDbBuilder` (shapes + instances only).
+/// Finalisation is the caller's job, so it can drop `lib` first.
+fn collect(lib: &GdsLibrary) -> Result<CellDbBuilder> {
     let mut b = CellDbBuilder::new();
 
     // First pass: intern every struct name so references resolve regardless of
@@ -52,9 +71,13 @@ fn build_db(lib: &GdsLibrary) -> Result<CellDb> {
             match elem {
                 GdsElement::GdsBoundary(bd) => {
                     let layer = Layer::new(bd.layer as u16, bd.datatype as u16);
-                    let pts: Vec<Point> = bd.xy.iter().map(|p| Point::new(p.x, p.y)).collect();
-                    if pts.len() >= 3 {
-                        b.cell_mut(id).shapes.push(Polygon { layer, points: pts });
+                    if bd.xy.len() >= 3 {
+                        // Straight into the columnar store — no per-shape Vec is
+                        // ever built, so the 3.9 M `Vec<Point>` headers caravel
+                        // used to allocate simply never exist.
+                        b.cell_mut(id)
+                            .shapes
+                            .push(layer, bd.xy.iter().map(|p| Point::new(p.x, p.y)));
                     }
                 }
                 GdsElement::GdsStructRef(sref) => {
@@ -113,14 +136,7 @@ fn build_db(lib: &GdsLibrary) -> Result<CellDb> {
         }
     }
 
-    let db = b.build()?;
-    log::info!(
-        "loaded {} cell defs, top='{}', ~{} flattened shapes",
-        db.cells.len(),
-        db.cell(db.top).name,
-        db.flat_shape_count()
-    );
-    Ok(db)
+    Ok(b)
 }
 
 /// Extract (angle_deg, reflected, mag) from an optional STRANS, applying spec

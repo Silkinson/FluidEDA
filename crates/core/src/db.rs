@@ -13,7 +13,9 @@
 //!   * a lazily-built [`ShapeIndex`] per cell (see `index()`), materialised on
 //!     first query.
 
+use crate::chunk::{self, Chunk};
 use crate::index::ShapeIndex;
+use crate::store::ShapeStore;
 use crate::transform::{Bboxf, Transform};
 use crate::types::{Bbox, FlatLayout, Layer, Point, Polygon};
 use std::cell::OnceCell;
@@ -78,8 +80,13 @@ impl Instance {
 /// A cell definition: local shapes + child instances, with lazily derived index.
 pub struct Cell {
     pub name: String,
-    pub shapes: Vec<Polygon>,
+    /// This cell's own shapes, in chunk order (see `chunks`).
+    pub shapes: ShapeStore,
     pub instances: Vec<Instance>,
+    /// Spatial partition of `shapes`. Empty iff `shapes` is empty; a small cell
+    /// gets exactly one chunk covering everything, so the draw path never needs
+    /// to distinguish "chunked" from "not chunked".
+    pub chunks: Vec<Chunk>,
     index: OnceCell<ShapeIndex>,
 }
 
@@ -87,8 +94,9 @@ impl Cell {
     fn new(name: String) -> Self {
         Self {
             name,
-            shapes: Vec::new(),
+            shapes: ShapeStore::new(),
             instances: Vec::new(),
+            chunks: Vec::new(),
             index: OnceCell::new(),
         }
     }
@@ -100,19 +108,24 @@ impl Cell {
 
     /// Distinct layers among this cell's own shapes.
     pub fn layers(&self) -> Vec<Layer> {
-        let mut ls: Vec<Layer> = self.shapes.iter().map(|p| p.layer).collect();
-        ls.sort();
-        ls.dedup();
-        ls
+        self.shapes.distinct_layers()
     }
 
     /// Bbox of just this cell's own shapes (cell-local nm).
+    ///
+    /// Folded from the chunk table rather than rescanned from the coordinate
+    /// column: chunking already computed every shape's bbox, and the chunks'
+    /// union is exactly this cell's own bbox. Cells have a handful of chunks, so
+    /// this turns a walk over millions of points into a walk over tens of boxes.
+    /// Requires `chunks` to be built first — `CellDbBuilder::build` guarantees it.
     fn own_bbox(&self) -> Bbox {
         let mut b = Bbox::empty();
-        for poly in &self.shapes {
-            for &p in &poly.points {
-                b.expand(p);
+        for c in &self.chunks {
+            if c.bbox.min.x > c.bbox.max.x {
+                continue; // chunk of only degenerate shapes
             }
+            b.expand(c.bbox.min);
+            b.expand(c.bbox.max);
         }
         b
     }
@@ -176,9 +189,10 @@ impl CellDb {
 
     fn flatten_rec(&self, id: CellId, t: Transform, out: &mut FlatLayout) {
         let cell = &self.cells[id];
-        for poly in &cell.shapes {
-            let points = poly
-                .points
+        for i in 0..cell.shapes.len() {
+            let points = cell
+                .shapes
+                .points(i)
                 .iter()
                 .map(|&p| {
                     let (x, y) = t.apply_point(p);
@@ -186,7 +200,7 @@ impl CellDb {
                 })
                 .collect();
             out.polygons.push(Polygon {
-                layer: poly.layer,
+                layer: cell.shapes.layer(i),
                 points,
             });
         }
@@ -217,11 +231,17 @@ impl CellDb {
         let mut ls: Vec<Layer> = self
             .cells
             .iter()
-            .flat_map(|c| c.shapes.iter().map(|p| p.layer))
+            .flat_map(|c| c.shapes.layer_column().iter().copied())
             .collect();
         ls.sort();
         ls.dedup();
         ls
+    }
+
+    /// Heap bytes held by every cell's shape columns — the parsed-geometry
+    /// footprint, reported by the benches.
+    pub fn store_bytes(&self) -> usize {
+        self.cells.iter().map(|c| c.shapes.heap_bytes()).sum()
     }
 }
 
@@ -255,12 +275,19 @@ impl CellDbBuilder {
         &mut self.cells[id]
     }
 
-    /// Finalise: pick the top cell (referenced by nobody), then precompute each
-    /// cell's local bbox in topological (children-first) order.
+    /// Finalise: chunk the large cells, pick the top cell (referenced by
+    /// nobody), then precompute each cell's local bbox in topological
+    /// (children-first) order.
     pub fn build(self) -> anyhow::Result<CellDb> {
-        let CellDbBuilder { cells, by_name } = self;
+        let CellDbBuilder { mut cells, by_name } = self;
         if cells.is_empty() {
             anyhow::bail!("GDS contains no cells");
+        }
+
+        // Partition each cell's shapes spatially. This reorders the shape store,
+        // so it must happen before anything derives an index or a bbox from it.
+        for cell in &mut cells {
+            cell.chunks = chunk::chunk_store(&mut cell.shapes);
         }
 
         // Referenced-by-someone set → top candidates are the complement.

@@ -1,9 +1,12 @@
 //! Tessellation: polygons -> GPU-ready triangle buffers, grouped by layer.
 //!
-//! Done ONCE at load time (not per frame). Pan/zoom only changes the camera
-//! uniform; these buffers are static until the geometry itself changes.
+//! Done lazily, once per **(cell, chunk)** the viewport actually touches — never
+//! per frame. Pan/zoom only changes the camera uniform; these buffers are static
+//! until the geometry itself changes.
 
-use crate::types::{FlatLayout, Layer, Polygon, Vertex};
+use crate::chunk::Chunk;
+use crate::store::ShapeStore;
+use crate::types::{FlatLayout, Layer, Point, Polygon, Vertex};
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{
@@ -32,32 +35,46 @@ pub fn tessellate(layout: &FlatLayout) -> Vec<LayerMesh> {
     tessellate_shapes(&layout.polygons)
 }
 
-/// Tessellate a slice of polygons (in whatever coordinate frame they carry —
-/// **cell-local** nm for the Phase 1 per-cell meshes, so the same buffer is
-/// reused across every instance and only the per-instance transform differs).
-/// One `LayerMesh` per distinct layer, sorted.
+/// Tessellate a slice of polygons (the Phase 0 flat path).
 pub fn tessellate_shapes(polygons: &[Polygon]) -> Vec<LayerMesh> {
+    tessellate_iter(polygons.iter().map(|p| (p.layer, p.points.as_slice())))
+}
+
+/// Tessellate one chunk of a cell definition — the Phase 2b unit of work.
+///
+/// Shapes stay in **cell-local** nm, so the resulting buffer is reused across
+/// every instance of the cell and only the per-instance transform differs.
+/// Because chunking reorders the store so a chunk is a contiguous range, this is
+/// a slice of the cell's shapes, not a gather.
+pub fn tessellate_chunk(store: &ShapeStore, chunk: &Chunk) -> Vec<LayerMesh> {
+    tessellate_iter(
+        (chunk.start as usize..chunk.end as usize).map(|i| (store.layer(i), store.points(i))),
+    )
+}
+
+/// One `LayerMesh` per distinct layer, sorted (= draw order).
+fn tessellate_iter<'a>(shapes: impl Iterator<Item = (Layer, &'a [Point])>) -> Vec<LayerMesh> {
     let mut per_layer: BTreeMap<Layer, VertexBuffers<Vertex, u32>> = BTreeMap::new();
     let mut tess = FillTessellator::new();
     let opts = FillOptions::non_zero();
 
-    for poly in polygons {
-        if poly.points.len() < 3 {
+    for (layer, points) in shapes {
+        if points.len() < 3 {
             continue;
         }
         let mut builder = Path::builder();
-        let first = poly.points[0];
+        let first = points[0];
         builder.begin(point(first.x as f32, first.y as f32));
-        for p in &poly.points[1..] {
+        for p in &points[1..] {
             builder.line_to(point(p.x as f32, p.y as f32));
         }
         builder.close();
         let path = builder.build();
 
-        let buffers = per_layer.entry(poly.layer).or_default();
+        let buffers = per_layer.entry(layer).or_default();
         let mut bb = BuffersBuilder::new(buffers, VertexCtor);
         if let Err(e) = tess.tessellate_path(&path, &opts, &mut bb) {
-            log::warn!("tessellation error on layer {:?}: {e:?}", poly.layer);
+            log::warn!("tessellation error on layer {layer:?}: {e:?}");
         }
     }
 

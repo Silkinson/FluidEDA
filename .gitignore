@@ -7,3 +7,8 @@ Cargo.lock
 
 # Phase 1.5 real-chip test data (fetched via scripts/fetch_testdata.sh)
 /testdata/
+
+# npm (browser bench harness: playwright)
+node_modules/
+package-lock.json
+package.json

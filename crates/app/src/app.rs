@@ -8,7 +8,7 @@ use crate::design::{self, Design, Metrics};
 use crate::paint::{init_renderer, LayoutPaint};
 use crate::webio::{self, LoadSlot};
 use eframe::egui;
-use fluideda_core::{cull, CellDb, CellId, CullStats, Layer, VisibleSet};
+use fluideda_core::{cull, CellDb, CellId, ChunkId, CullStats, Layer, VisibleSet};
 use fluideda_render::{Camera, HierRenderer};
 use fluideda_sync::{color_from_id, Marker, Presence, Session};
 use glam::Vec2;
@@ -47,8 +47,10 @@ pub struct FluidApp {
     /// R-trees. Both are expensive and only feed the stats readout — kept off the
     /// hot path (Phase 2a STEP 2).
     debug_stats: bool,
-    /// Cell defs whose geometry has been tessellated + uploaded (lazy, STEP 3).
-    uploaded: HashSet<CellId>,
+    /// Cell chunks whose geometry has been tessellated + uploaded (lazy). Keyed
+    /// by (cell, chunk) since Phase 2b — a die-spanning cell uploads only the
+    /// chunks the viewport has actually touched.
+    uploaded: HashSet<(CellId, ChunkId)>,
     /// Cumulative main-thread tessellation time so far (ms) — the lazy TTFF cost.
     tess_accum_ms: f64,
     /// Cumulative uploaded GPU geometry bytes so far.
@@ -137,10 +139,10 @@ impl FluidApp {
         self.awaiting_first_frame = true;
     }
 
-    /// Tessellate + upload any visible cell def not yet on the GPU (lazy). Runs
-    /// after culling, before paint, so the paint callback sees uploaded buffers.
-    /// First-view of a def costs one tessellation on the main thread (the source
-    /// of any pan hitch); thereafter it's cached.
+    /// Tessellate + upload any visible cell **chunk** not yet on the GPU (lazy).
+    /// Runs after culling, before paint, so the paint callback sees uploaded
+    /// buffers. First view of a chunk costs one tessellation on the main thread
+    /// (the source of any pan hitch); thereafter it's cached.
     fn ensure_uploaded(&mut self, frame: &mut eframe::Frame) {
         let Some(rs) = frame.wgpu_render_state() else { return };
         let device = rs.device.clone();
@@ -149,14 +151,16 @@ impl FluidApp {
 
         let visible = self.visible.clone();
         for d in &visible.draws {
-            if self.uploaded.contains(&d.cell) {
+            let key = (d.cell, d.chunk);
+            if self.uploaded.contains(&key) {
                 continue;
             }
+            let cell = &self.db.cells[d.cell];
             let t = web_time::Instant::now();
-            let meshes = fluideda_core::tessellate_shapes(&self.db.cells[d.cell].shapes);
+            let meshes = fluideda_core::tessellate_chunk(&cell.shapes, &cell.chunks[d.chunk as usize]);
             self.tess_accum_ms += t.elapsed().as_secs_f64() * 1e3;
-            renderer.upload_cell(&device, d.cell, &meshes);
-            self.uploaded.insert(d.cell);
+            renderer.upload_chunk(&device, key, &meshes);
+            self.uploaded.insert(key);
         }
         self.gpu_bytes = renderer.uploaded_bytes();
     }
@@ -326,7 +330,7 @@ impl FluidApp {
                 ui.small(format!("distinct:    {} polys", m.distinct_polys));
                 // Live (grow as cells stream in): lazy tessellation + GPU geometry.
                 ui.small(format!(
-                    "tess (lazy): {:.1} ms, {} defs uploaded",
+                    "tess (lazy): {:.1} ms, {} chunks uploaded",
                     self.tess_accum_ms,
                     self.uploaded.len()
                 ));

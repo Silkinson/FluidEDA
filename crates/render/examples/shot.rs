@@ -64,8 +64,12 @@ async fn run() {
         .await
         .expect("request_device");
 
-    // Renderer starts empty; cells are tessellated + uploaded lazily (STEP 3).
-    let mut renderer = HierRenderer::new(&device, FORMAT);
+    // NOTE: the renderer is rebuilt per viewport (inside the loop), not shared.
+    // Sharing it would let the first viewport's uploads satisfy the later ones,
+    // so every view after `fit` would report ~0 ms tessellation and the whole
+    // file's GPU bytes — exactly the numbers Phase 2b needs to be honest about.
+    // A fresh renderer per view measures what opening the file *at that zoom*
+    // actually costs.
 
     // --- offscreen target + readback buffer ---
     let target = device.create_texture(&wgpu::TextureDescriptor {
@@ -91,6 +95,7 @@ async fn run() {
     let total = db.flat_shape_count();
 
     for v in &views {
+        let mut renderer = HierRenderer::new(&device, FORMAT);
         let mut cam = Camera::new(Vec2::new(W as f32, H as f32));
         cam.center = Vec2::new(v.center.0 as f32, v.center.1 as f32);
         cam.scale = W as f32 / v.span_nm as f32; // px per nm
@@ -106,13 +111,18 @@ async fn run() {
         );
 
         let vs = cull(&db, &vp, cam.scale as f64, MIN_PIXEL);
-        // Lazy tessellation: upload any visible cell not yet on the GPU.
+        // Lazy tessellation: upload any visible cell chunk not yet on the GPU.
+        let t_tess = Instant::now();
         for d in &vs.draws {
-            if !renderer.has_cell(d.cell) {
-                let meshes = fluideda_core::tessellate_shapes(&db.cells[d.cell].shapes);
-                renderer.upload_cell(&device, d.cell, &meshes);
+            let key = (d.cell, d.chunk);
+            if !renderer.has_chunk(key) {
+                let cell = &db.cells[d.cell];
+                let meshes =
+                    fluideda_core::tessellate_chunk(&cell.shapes, &cell.chunks[d.chunk as usize]);
+                renderer.upload_chunk(&device, key, &meshes);
             }
         }
+        let tess_ms = t_tess.elapsed().as_secs_f64() * 1e3;
         renderer.prepare(&device, &queue, &cam, &vs);
         // Visible-shape count is off the render path now; compute once for display.
         let counted = cull_counted(&db, &vp, cam.scale as f64, MIN_PIXEL);
@@ -201,9 +211,10 @@ async fn run() {
         let fps = 1.0 / per.as_secs_f64();
 
         println!(
-            "{:<10} span={:>9.0}nm  visible={:>8}/{:<10} proxies={:>5} instances={:>6}  {:>8.2?}/frame  ~{:>5.0} fps  -> {}",
+            "{:<10} span={:>9.0}nm  visible={:>8}/{:<10} proxies={:>5} instances={:>6} draws={:>5}  tess={:>8.1}ms gpu={:>6.1}MB  {:>8.2?}/frame  ~{:>5.0} fps  -> {}",
             v.name, v.span_nm, counted.stats.visible_shapes, total,
-            vs.stats.proxy_count, vs.stats.instances_emitted, per, fps, path
+            vs.stats.proxy_count, vs.stats.instances_emitted, vs.draws.len(),
+            tess_ms, renderer.uploaded_bytes() as f64 / 1_048_576.0, per, fps, path
         );
     }
     println!("\nwrote PNGs to target/shots/ (compare against KLayout with the same viewports)");

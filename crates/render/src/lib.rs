@@ -1,9 +1,10 @@
 //! fluideda-render — wgpu pipelines for drawing **hierarchical** layout geometry.
 //!
-//! Each cell definition is tessellated once (cell-local nm) and uploaded as a
-//! static per-layer mesh. Every frame the culler ([`fluideda_core::cull`]) hands
-//! us, per visible cell def, the world transforms at which to draw it; we pack
-//! those into one instance buffer and issue **one instanced draw per cell/layer**
+//! Each **chunk** of a cell definition is tessellated once (cell-local nm) and
+//! uploaded as a static per-layer mesh. Every frame the culler
+//! ([`fluideda_core::cull`]) hands us, per visible (cell, chunk), the world
+//! transforms at which to draw it; we pack those into one instance buffer and
+//! issue **one instanced draw per cell-chunk/layer**
 //! — an AREF of a million leaves is one leaf buffer drawn N times, never N copies
 //! of the geometry. Cells too small to resolve arrive as LOD proxy boxes, drawn
 //! as a unit quad instanced to each box.
@@ -27,7 +28,7 @@ pub fn layer_color(layer: fluideda_core::Layer) -> [f32; 4] {
 }
 
 use bytemuck::{Pod, Zeroable};
-use fluideda_core::{CellId, LayerMesh, Layer, VisibleSet};
+use fluideda_core::{CellId, ChunkId, LayerMesh, Layer, VisibleSet};
 use std::collections::{HashMap, HashSet};
 use wgpu::util::DeviceExt;
 
@@ -64,12 +65,38 @@ struct CellGpu {
     meshes: Vec<GpuMesh>,
 }
 
-/// A recorded instanced draw for this frame: a cell def and its slice of the
+/// Key for one uploaded geometry buffer set: a chunk of a cell definition.
+/// Chunking (Phase 2b) made this a pair — a die-spanning cell now uploads only
+/// the chunks a viewport touched, not all of its geometry.
+type ChunkKey = (CellId, ChunkId);
+
+/// A recorded instanced draw for this frame: a cell chunk and its slice of the
 /// shared instance buffer.
 struct CellPlan {
-    cell: CellId,
+    key: ChunkKey,
     first: u32,
     count: u32,
+}
+
+/// One mesh to issue this frame, carrying its `(cell, layer, chunk)` sort key.
+///
+/// Draw order is not cosmetic — the pipeline alpha-blends, so which mesh goes
+/// first decides the pixel wherever two layers overlap. Before chunking, a cell
+/// was one mesh set and drew **layer-major**: all of layer 0, then all of layer
+/// 1. Splitting a cell into chunks would naturally draw chunk-major (chunk 0's
+/// every layer, then chunk 1's), which re-composites every cross-layer overlap
+/// and visibly changes the image — 4.7% of caravel's pixels at fit when this was
+/// measured.
+///
+/// Sorting by `(cell, layer, chunk)` restores the original layer sweep exactly.
+/// Reordering chunks *within* one layer is safe: a layer has a single colour and
+/// alpha, and `src-over` of identical colours is order-independent.
+struct DrawItem {
+    cell: CellId,
+    layer: Layer,
+    chunk: ChunkId,
+    plan: u32,
+    mesh: u32,
 }
 
 /// Draws a hierarchical layout by instancing per-cell meshes.
@@ -79,7 +106,7 @@ pub struct HierRenderer {
     globals_bind: wgpu::BindGroup,
     layer_bgl: wgpu::BindGroupLayout, // kept for lazy per-cell mesh uploads
 
-    cells: HashMap<CellId, CellGpu>,
+    cells: HashMap<ChunkKey, CellGpu>,
     /// Running total of uploaded vertex+index bytes (lazy-tessellation growth).
     uploaded_bytes: usize,
     proxy: GpuMesh, // unit-square [0,1]^2 mesh, dim color
@@ -92,6 +119,8 @@ pub struct HierRenderer {
 
     // Per-frame plan (set in `prepare`, consumed in `paint`).
     cell_plan: Vec<CellPlan>,
+    /// Meshes to draw, in `(cell, layer, chunk)` order. See [`DrawItem`].
+    draw_seq: Vec<DrawItem>,
     proxy_first: u32,
     proxy_count: u32,
 }
@@ -203,14 +232,15 @@ impl HierRenderer {
             instcap,
             hidden: HashSet::new(),
             cell_plan: Vec::new(),
+            draw_seq: Vec::new(),
             proxy_first: 0,
             proxy_count: 0,
         }
     }
 
-    /// Is this cell's geometry already tessellated + uploaded?
-    pub fn has_cell(&self, id: CellId) -> bool {
-        self.cells.contains_key(&id)
+    /// Is this cell chunk's geometry already tessellated + uploaded?
+    pub fn has_chunk(&self, key: ChunkKey) -> bool {
+        self.cells.contains_key(&key)
     }
 
     /// Total vertex+index bytes uploaded so far (grows with lazy tessellation).
@@ -219,10 +249,10 @@ impl HierRenderer {
     }
 
     /// Tessellate-then-upload happens caller-side; this takes the finished
-    /// per-layer meshes and builds this cell's GPU buffers. Idempotent-ish: an
-    /// empty mesh set marks the cell as "seen" so we don't retessellate it.
-    pub fn upload_cell(&mut self, device: &wgpu::Device, id: CellId, meshes: &[LayerMesh]) {
-        if self.cells.contains_key(&id) {
+    /// per-layer meshes and builds this chunk's GPU buffers. Idempotent-ish: an
+    /// empty mesh set marks the chunk as "seen" so we don't retessellate it.
+    pub fn upload_chunk(&mut self, device: &wgpu::Device, key: ChunkKey, meshes: &[LayerMesh]) {
+        if self.cells.contains_key(&key) {
             return;
         }
         let gpu_meshes: Vec<GpuMesh> = meshes
@@ -234,7 +264,7 @@ impl HierRenderer {
                 build_mesh(device, &self.layer_bgl, m.layer, &m.vertices, &m.indices)
             })
             .collect();
-        self.cells.insert(id, CellGpu { meshes: gpu_meshes });
+        self.cells.insert(key, CellGpu { meshes: gpu_meshes });
     }
 
     pub fn set_layer_visible(&mut self, layer: Layer, visible: bool) {
@@ -265,8 +295,9 @@ impl HierRenderer {
 
         self.cell_plan.clear();
         for d in &visible.draws {
-            if !self.cells.contains_key(&d.cell) {
-                continue; // cell has no drawable geometry
+            let key = (d.cell, d.chunk);
+            if !self.cells.contains_key(&key) {
+                continue; // chunk has no drawable geometry (or isn't uploaded yet)
             }
             let first = raw.len() as u32;
             for t in &d.transforms {
@@ -276,7 +307,7 @@ impl HierRenderer {
                 });
             }
             self.cell_plan.push(CellPlan {
-                cell: d.cell,
+                key,
                 first,
                 count: d.transforms.len() as u32,
             });
@@ -292,6 +323,25 @@ impl HierRenderer {
                 row1: [0.0, h, (b.min_y - oy) as f32, 0.0],
             });
         }
+
+        // Expand the per-chunk plans into per-mesh draws and put them back into
+        // layer-major order within each cell (see `DrawItem`).
+        let mut seq = std::mem::take(&mut self.draw_seq);
+        seq.clear();
+        for (pi, plan) in self.cell_plan.iter().enumerate() {
+            let Some(gpu) = self.cells.get(&plan.key) else { continue };
+            for (mi, mesh) in gpu.meshes.iter().enumerate() {
+                seq.push(DrawItem {
+                    cell: plan.key.0,
+                    layer: mesh.layer,
+                    chunk: plan.key.1,
+                    plan: pi as u32,
+                    mesh: mi as u32,
+                });
+            }
+        }
+        seq.sort_unstable_by_key(|d| (d.cell, d.layer, d.chunk));
+        self.draw_seq = seq;
 
         if raw.is_empty() {
             return;
@@ -324,23 +374,23 @@ impl HierRenderer {
             pass.draw_indexed(0..self.proxy.index_count, 0, 0..self.proxy_count);
         }
 
-        // Instanced cell geometry. Slicing the instance buffer per cell keeps
-        // first_instance = 0, which the WebGL2 fallback requires.
-        for plan in &self.cell_plan {
-            let Some(cell) = self.cells.get(&plan.cell) else {
+        // Instanced cell geometry, in (cell, layer, chunk) order. Slicing the
+        // instance buffer per chunk keeps first_instance = 0, which the WebGL2
+        // fallback requires.
+        for item in &self.draw_seq {
+            if self.hidden.contains(&item.layer) {
+                continue;
+            }
+            let plan = &self.cell_plan[item.plan as usize];
+            let Some(cell) = self.cells.get(&plan.key) else {
                 continue;
             };
-            let off = plan.first as u64 * INST_SIZE;
-            pass.set_vertex_buffer(1, self.instbuf.slice(off..));
-            for mesh in &cell.meshes {
-                if self.hidden.contains(&mesh.layer) {
-                    continue;
-                }
-                pass.set_bind_group(1, &mesh.color_bind, &[]);
-                pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..plan.count);
-            }
+            let mesh = &cell.meshes[item.mesh as usize];
+            pass.set_vertex_buffer(1, self.instbuf.slice(plan.first as u64 * INST_SIZE..));
+            pass.set_bind_group(1, &mesh.color_bind, &[]);
+            pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
+            pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..plan.count);
         }
     }
 }

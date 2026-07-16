@@ -12,15 +12,20 @@
 //! Output is grouped by cell definition: one `CellDraw { cell, transforms }` per
 //! visible def, feeding a single instanced draw of that cell's mesh.
 
+use crate::chunk::ChunkId;
 use crate::db::{CellDb, CellId, InstanceKind};
 use crate::transform::{Bboxf, Transform};
 use std::collections::HashMap;
 
-/// One instanced draw: a cell def and every world transform at which its own
-/// geometry is visible this frame.
+/// One instanced draw: a **chunk** of a cell def, and every world transform at
+/// which that chunk's geometry is visible this frame.
+///
+/// Phase 2b made the chunk — not the whole cell — the unit here, so a viewport
+/// over a die-spanning cell selects only the chunks it touches.
 #[derive(Debug, Clone)]
 pub struct CellDraw {
     pub cell: CellId,
+    pub chunk: ChunkId,
     pub transforms: Vec<Transform>,
 }
 
@@ -44,6 +49,9 @@ pub struct CullStats {
     pub proxy_count: usize,
     /// Nodes visited in the instance-tree walk (a rough work measure).
     pub nodes_visited: u64,
+    /// Chunk selections emitted from *chunked* (large) cells only — the measure
+    /// of how much of a die-spanning cell a viewport actually pulled in.
+    pub chunks_emitted: u64,
 }
 
 /// Cull the design against a world-space viewport.
@@ -80,18 +88,18 @@ fn cull_inner(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64, count_v
     ctx.walk(db.top, Transform::IDENTITY);
 
     // Materialise the grouped instancing map into the output list, ordered by
-    // cell id. The sort is load-bearing, not cosmetic: `grouped` is a HashMap, so
-    // iterating it yields a per-process-random order, and the renderer draws in
-    // exactly that order. With alpha blending, two cells whose geometry overlaps
-    // blend to different pixels depending on which is drawn first — so an
-    // unsorted walk makes the same scene render differently run to run (measured:
-    // 118 px of sky130 at fit). Sorting makes the frame reproducible, which is
-    // what lets the golden-image check mean anything.
-    let mut grouped: Vec<(CellId, Vec<Transform>)> = ctx.grouped.into_iter().collect();
-    grouped.sort_unstable_by_key(|&(cell, _)| cell);
-    for (cell, transforms) in grouped {
+    // (cell, chunk). The sort is load-bearing, not cosmetic: `grouped` is a
+    // HashMap, so iterating it yields a per-process-random order, and the
+    // renderer draws in exactly that order. With alpha blending, two cells whose
+    // geometry overlaps blend to different pixels depending on which is drawn
+    // first — so an unsorted walk makes the same scene render differently run to
+    // run (measured: 118 px of sky130 at fit). Sorting makes the frame
+    // reproducible, which is what lets the golden-image check mean anything.
+    let mut grouped: Vec<((CellId, ChunkId), Vec<Transform>)> = ctx.grouped.into_iter().collect();
+    grouped.sort_unstable_by_key(|&(key, _)| key);
+    for ((cell, chunk), transforms) in grouped {
         ctx.set.stats.instances_emitted += transforms.len() as u64;
-        ctx.set.draws.push(CellDraw { cell, transforms });
+        ctx.set.draws.push(CellDraw { cell, chunk, transforms });
     }
     ctx.set.stats.proxy_count = ctx.set.proxies.len();
     ctx.set
@@ -104,7 +112,7 @@ struct CullCtx<'a> {
     min_pixel: f64,
     /// When false, skip the per-cell index query that fills `visible_shapes`.
     count_visible: bool,
-    grouped: HashMap<CellId, Vec<Transform>>,
+    grouped: HashMap<(CellId, ChunkId), Vec<Transform>>,
     set: VisibleSet,
 }
 
@@ -133,16 +141,32 @@ impl CullCtx<'_> {
 
         let cell = self.db.cell(id);
 
-        // Emit this cell's own shapes as an instanced draw at `world_tf`. Only
+        // Emit this cell's visible chunks as instanced draws at `world_tf`. Only
         // when explicitly counting do we query the index for the visible-shape
         // metric — that query (and the lazy index build it triggers) is the bulk
         // of a fit-view frame on a real chip, and the renderer never needs it.
-        if !cell.shapes.is_empty() {
+        if !cell.chunks.is_empty() {
             if self.count_visible {
                 let local_view = world_tf.inverse().apply_bboxf(&self.view);
                 self.set.stats.visible_shapes += cell.index().count(&local_view) as u64;
             }
-            self.grouped.entry(id).or_default().push(world_tf);
+            if cell.chunks.len() == 1 {
+                // The overwhelmingly common case (every small cell). Emit without
+                // inverting the transform: Phase 2a took that inverse off the hot
+                // path and chunking must not put it back for cells it can't help.
+                self.grouped.entry((id, 0)).or_default().push(world_tf);
+            } else {
+                // Chunked cell: test each chunk's loose bbox in the cell's own
+                // frame. Only large defs reach here, and they are placed few
+                // times, so the inverse is paid rarely.
+                let local_view = world_tf.inverse().apply_bboxf(&self.view);
+                for (ci, chunk) in cell.chunks.iter().enumerate() {
+                    if bbox_intersects(&chunk.bbox, &local_view) {
+                        self.grouped.entry((id, ci as ChunkId)).or_default().push(world_tf);
+                        self.set.stats.chunks_emitted += 1;
+                    }
+                }
+            }
         }
 
         // Descend into child instances.
@@ -293,6 +317,18 @@ fn visible_range(
         return full;
     }
     (c0, c1, r0, r1)
+}
+
+/// Does an integer (cell-local) chunk bbox overlap a float query rect? An empty
+/// bbox (`min > max`, i.e. a chunk of only degenerate shapes) never hits.
+fn bbox_intersects(b: &crate::types::Bbox, q: &Bboxf) -> bool {
+    if b.min.x > b.max.x {
+        return false;
+    }
+    (b.min.x as f64) <= q.max_x
+        && (b.max.x as f64) >= q.min_x
+        && (b.min.y as f64) <= q.max_y
+        && (b.max.y as f64) >= q.min_y
 }
 
 /// Intersect two boxes (for clipping a proxy to the viewport).

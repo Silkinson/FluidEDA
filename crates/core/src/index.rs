@@ -9,8 +9,8 @@
 //! Built lazily on first query (see `CellDb::index`), so opening a file with
 //! thousands of cell defs doesn't pay for indexes never looked at.
 
+use crate::store::ShapeStore;
 use crate::transform::Bboxf;
-use crate::types::Polygon;
 use rstar::primitives::{GeomWithData, Rectangle};
 use rstar::{RTree, AABB};
 
@@ -23,18 +23,17 @@ pub struct ShapeIndex {
 }
 
 impl ShapeIndex {
-    /// Bulk-load from a cell's shapes. Each shape contributes its axis-aligned
-    /// bbox (cell-local nm, cast to f64 — exact for i32 inputs).
-    pub fn build(shapes: &[Polygon]) -> Self {
-        let entries: Vec<Entry> = shapes
-            .iter()
-            .enumerate()
-            .filter_map(|(i, poly)| {
-                if poly.points.len() < 3 {
+    /// Bulk-load from a cell's shape store. Each shape contributes its
+    /// axis-aligned bbox (cell-local nm, cast to f64 — exact for i32 inputs).
+    pub fn build(store: &ShapeStore) -> Self {
+        let entries: Vec<Entry> = (0..store.len())
+            .filter_map(|i| {
+                let pts = store.points(i);
+                if pts.len() < 3 {
                     return None;
                 }
                 let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-                for p in &poly.points {
+                for p in pts {
                     lo[0] = lo[0].min(p.x as f64);
                     lo[1] = lo[1].min(p.y as f64);
                     hi[0] = hi[0].max(p.x as f64);
@@ -81,25 +80,24 @@ mod tests {
     use super::*;
     use crate::types::{Layer, Point};
 
-    fn rect(x: i32, y: i32, w: i32, h: i32) -> Polygon {
-        Polygon {
-            layer: Layer::new(0, 0),
-            points: vec![
+    fn rect(store: &mut ShapeStore, x: i32, y: i32, w: i32, h: i32) {
+        store.push(
+            Layer::new(0, 0),
+            [
                 Point::new(x, y),
                 Point::new(x + w, y),
                 Point::new(x + w, y + h),
                 Point::new(x, y + h),
             ],
-        }
+        );
     }
 
     #[test]
     fn queries_hit_only_overlapping() {
-        let shapes = vec![
-            rect(0, 0, 10, 10),
-            rect(100, 100, 10, 10),
-            rect(1000, 1000, 10, 10),
-        ];
+        let mut shapes = ShapeStore::new();
+        rect(&mut shapes, 0, 0, 10, 10);
+        rect(&mut shapes, 100, 100, 10, 10);
+        rect(&mut shapes, 1000, 1000, 10, 10);
         let idx = ShapeIndex::build(&shapes);
         assert_eq!(idx.len(), 3);
         // A window around the origin sees only the first rect.

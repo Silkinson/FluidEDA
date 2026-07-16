@@ -8,7 +8,11 @@
 use bytemuck::{Pod, Zeroable};
 
 /// A layer/datatype pair — the GDSII addressing of a drawing layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// `repr(C)` + `Pod` so a column of these is plain bytes: it lets the shape
+/// store be transferred to a worker without serialisation (Phase 2b).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Pod, Zeroable)]
 pub struct Layer {
     pub layer: u16,
     pub datatype: u16,
@@ -21,7 +25,11 @@ impl Layer {
 }
 
 /// A point in database units (nm).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `repr(C)` + `Pod` so `&[Point]` can be cast straight out of the shape store's
+/// flat `Vec<i32>` coordinate column with no copy (see `store.rs`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct Point {
     pub x: i32,
     pub y: i32,
