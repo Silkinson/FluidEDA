@@ -335,6 +335,9 @@ impl FluidApp {
                     self.uploaded.len()
                 ));
                 ui.small(format!("GPU geo:     {} MB (visible only)", self.gpu_bytes / 1_048_576));
+                if m.parse_heap_bytes > 0 {
+                    ui.small(format!("parse heap:  {} MB (high-water)", m.parse_heap_bytes / 1_048_576));
+                }
                 if m.wasm_heap_bytes > 0 {
                     ui.small(format!("wasm heap:   {} MB", m.wasm_heap_bytes / 1_048_576));
                 }

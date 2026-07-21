@@ -5,6 +5,12 @@
 //! its local shapes, and `SREF`/`AREF` become `Instance`s pointing at other
 //! cells. This is what lets a 10M-shape design stay a few-KB file and render by
 //! culling. Paths/boxes/text are still skipped (Phase 3+); OASIS is Phase 4.
+//!
+//! **Parsing is streaming** (Phase 2b step 3, [`crate::gds_stream`]): a
+//! hand-rolled record reader emits directly into the columnar store, so the
+//! ~1.4 GB gds21 intermediate is gone. gds21 is retained only as a *test oracle*
+//! (see [`load_gds_db_gds21`] + the `oracle` tests): the two paths must build
+//! identical `CellDb`s.
 
 use crate::db::{CellDb, CellDbBuilder, Instance, InstanceKind};
 use crate::transform::Transform;
@@ -12,21 +18,9 @@ use crate::types::{FlatLayout, Layer, Point};
 use anyhow::{anyhow, Result};
 use gds21::{GdsElement, GdsLibrary, GdsStrans};
 
-/// Parse GDSII bytes into a hierarchical cell database.
-///
-/// Deliberately sequenced so the two big allocations never coexist at their
-/// peaks: `gds21` materialises the whole library (caravel's high-water, ~1.5 GB)
-/// and we then collect it into our compact columnar cells. Finalisation —
-/// chunking, which transiently copies a cell's coordinate column to reorder it —
-/// runs only **after** the library is dropped. Doing it while `lib` was still
-/// alive stacked the reorder copy on top of the parse high-water and pushed
-/// caravel's peak RSS from 1.56 GB to 1.8 GB.
+/// Parse GDSII bytes into a hierarchical cell database (streaming).
 pub fn load_gds_db(bytes: &[u8]) -> Result<CellDb> {
-    let lib = GdsLibrary::from_bytes(bytes.to_vec())
-        .map_err(|e| anyhow!("GDS parse failed: {e:?}"))?;
-    let builder = collect(&lib)?;
-    drop(lib); // free the raw library before finalising (see above)
-    let db = builder.build()?;
+    let db = crate::gds_stream::stream_gds_db(bytes)?;
     log::info!(
         "loaded {} cell defs, top='{}', ~{} flattened shapes",
         db.cells.len(),
@@ -34,6 +28,18 @@ pub fn load_gds_db(bytes: &[u8]) -> Result<CellDb> {
         db.flat_shape_count()
     );
     Ok(db)
+}
+
+/// Parse via gds21 (the whole-library path). **Kept only as a correctness
+/// oracle** for the streaming reader — it materialises the entire `GdsLibrary`
+/// before converting, which is exactly the ~1.4 GB high-water Phase 2b step 3
+/// removed. Not on any app path.
+pub fn load_gds_db_gds21(bytes: &[u8]) -> Result<CellDb> {
+    let lib = GdsLibrary::from_bytes(bytes.to_vec())
+        .map_err(|e| anyhow!("GDS parse failed: {e:?}"))?;
+    let builder = collect(&lib)?;
+    drop(lib);
+    builder.build()
 }
 
 /// Phase 0 compatibility: parse then flatten to a `FlatLayout`. Correct for
@@ -149,5 +155,71 @@ fn strans_params(strans: &Option<GdsStrans>) -> (f64, bool, f64) {
             s.mag.unwrap_or(1.0),
         ),
         None => (0.0, false, 1.0),
+    }
+}
+
+/// Oracle tests: the streaming reader ([`crate::gds_stream`]) must build a
+/// `CellDb` byte-for-byte identical to the gds21 path. This is the cheapest
+/// possible correctness proof for the rewrite — a dropped or mis-parsed record
+/// shows up as a diverging cell, shape, or instance here rather than as silently
+/// missing geometry in the app.
+#[cfg(test)]
+mod oracle {
+    use crate::db::{CellDb, InstanceKind};
+
+    const HIER: &[u8] = include_bytes!("../../../assets/hier.gds");
+    const SKY130: &str = "../../testdata/sky130_fd_sc_hd_merged.gds";
+
+    /// Assert two `CellDb`s are identical in everything the renderer sees:
+    /// cell count, top, and per cell the name, every shape (layer + points), and
+    /// every instance (child + transform + array params). Both DBs are already
+    /// chunked; chunking is deterministic in the shape order, so a divergence
+    /// here is a real parse difference, not chunk noise.
+    fn assert_same(stream: &CellDb, oracle: &CellDb, label: &str) {
+        assert_eq!(stream.cells.len(), oracle.cells.len(), "{label}: cell count");
+        assert_eq!(stream.top, oracle.top, "{label}: top cell id");
+        for id in 0..stream.cells.len() {
+            let (cs, co) = (&stream.cells[id], &oracle.cells[id]);
+            assert_eq!(cs.name, co.name, "{label}: cell {id} name");
+            assert_eq!(cs.shapes.len(), co.shapes.len(), "{label}: cell '{}' shape count", cs.name);
+            for i in 0..cs.shapes.len() {
+                assert_eq!(cs.shapes.layer(i), co.shapes.layer(i), "{label}: '{}' shape {i} layer", cs.name);
+                assert_eq!(cs.shapes.points(i), co.shapes.points(i), "{label}: '{}' shape {i} points", cs.name);
+            }
+            assert_eq!(cs.instances.len(), co.instances.len(), "{label}: cell '{}' instance count", cs.name);
+            for (j, (a, b)) in cs.instances.iter().zip(&co.instances).enumerate() {
+                assert_eq!(a.child, b.child, "{label}: '{}' inst {j} child", cs.name);
+                assert_eq!(a.transform, b.transform, "{label}: '{}' inst {j} transform", cs.name);
+                match (a.kind, b.kind) {
+                    (InstanceKind::Single, InstanceKind::Single) => {}
+                    (
+                        InstanceKind::Array { cols: c1, rows: r1, col_step: cs1, row_step: rs1 },
+                        InstanceKind::Array { cols: c2, rows: r2, col_step: cs2, row_step: rs2 },
+                    ) => {
+                        assert_eq!((c1, r1), (c2, r2), "{label}: '{}' inst {j} array dims", cs.name);
+                        assert_eq!((cs1, rs1), (cs2, rs2), "{label}: '{}' inst {j} array steps", cs.name);
+                    }
+                    _ => panic!("{label}: '{}' inst {j} kind mismatch (SREF vs AREF)", cs.name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_matches_gds21_on_hier() {
+        let stream = super::load_gds_db(HIER).unwrap();
+        let oracle = super::load_gds_db_gds21(HIER).unwrap();
+        assert_same(&stream, &oracle, "hier");
+    }
+
+    #[test]
+    fn streaming_matches_gds21_on_sky130() {
+        let Ok(bytes) = std::fs::read(SKY130) else {
+            eprintln!("SKIP: {SKY130} not present (fetch testdata to enable)");
+            return;
+        };
+        let stream = super::load_gds_db(&bytes).unwrap();
+        let oracle = super::load_gds_db_gds21(&bytes).unwrap();
+        assert_same(&stream, &oracle, "sky130");
     }
 }

@@ -38,6 +38,11 @@ pub struct Metrics {
     pub vertex_bytes: usize,
     pub index_bytes: usize,
     pub wasm_heap_bytes: usize,
+    /// Wasm linear-memory size sampled **immediately after parse**, before any
+    /// tessellation/index work. Because wasm memory only ever grows, this equals
+    /// the parse transient high-water — the number Phase 2b step 3 targets
+    /// (1.68 GB with gds21's whole-library intermediate). 0 on native.
+    pub parse_heap_bytes: usize,
 }
 
 /// Parse only. Tessellation is now **lazy** (Phase 2a STEP 3): the app
@@ -48,6 +53,9 @@ pub fn load_design(name: &str, bytes: &[u8]) -> anyhow::Result<Design> {
     let t = Instant::now();
     let db = fluideda_core::gds::load_gds_db(bytes)?;
     let parse_ms = t.elapsed().as_secs_f64() * 1e3;
+    // Sampled here, before tessellation/index — wasm memory never shrinks, so
+    // this is the parse high-water (the streaming-parser headline).
+    let parse_heap_bytes = wasm_heap_bytes();
 
     let cell_defs = db.cells.len();
     let distinct_polys: usize = db.cells.iter().map(|c| c.shapes.len()).sum();
@@ -63,6 +71,7 @@ pub fn load_design(name: &str, bytes: &[u8]) -> anyhow::Result<Design> {
         distinct_polys,
         flattened,
         wasm_heap_bytes: wasm_heap_bytes(),
+        parse_heap_bytes,
         ..Default::default()
     };
 
@@ -128,7 +137,8 @@ impl Metrics {
             "{{\"name\":\"{}\",\"file_bytes\":{},\"parse_ms\":{:.1},\"tess_ms\":{:.1},\
              \"index_ms\":{:.1},\"index_p99_ms\":{:.3},\"index_max_ms\":{:.1},\"ttff_ms\":{:.1},\
              \"cell_defs\":{},\"distinct_polys\":{},\"flattened\":{},\"triangles\":{},\
-             \"vertex_bytes\":{},\"index_bytes\":{},\"wasm_heap_bytes\":{}}}",
+             \"vertex_bytes\":{},\"index_bytes\":{},\"wasm_heap_bytes\":{},\
+             \"parse_heap_bytes\":{}}}",
             self.name.replace('"', "'"),
             self.file_bytes,
             self.parse_ms,
@@ -144,6 +154,7 @@ impl Metrics {
             self.vertex_bytes,
             self.index_bytes,
             self.wasm_heap_bytes,
+            self.parse_heap_bytes,
         )
     }
 

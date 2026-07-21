@@ -17,6 +17,7 @@ pub mod chunk;
 pub mod cull;
 pub mod db;
 pub mod gds;
+pub mod gds_stream;
 pub mod index;
 pub mod store;
 pub mod tess;
