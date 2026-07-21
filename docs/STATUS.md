@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-07-13 · current branch: `phase2b-chunk-worker` @ `b14dacf`_
+_Last updated: 2026-07-20 · current branch: `phase2b-streaming-parser`_
 
 Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 (WebGPU, WebGL2 fallback), compiled to wasm. Full design in
@@ -8,10 +8,11 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 
 ## Where we are
 
-Phase 2b **STEP 1 shipped** (spatial chunking + columnar store). Phase 2b STEP 2
-(worker offload) is **scoped and de-risked but not built** — and measurement in
-STEP 1 **reordered the remaining work**: the streaming parser now comes before the
-worker.
+Phase 2b **STEP 1 (chunking) and STEP 3 (streaming parser) shipped.** Phase 2b
+STEP 2 (worker offload) is **scoped and de-risked but not built** — and STEP 3
+changed its shape: the worker no longer needs a shared heap / atomics / nightly
+(peak parse heap dropped to ~0.8 GB, so a plain transferable-buffer worker on
+stable fits under 4 GB). A committed golden-image test now guards the pipeline.
 
 ## Phase ledger
 
@@ -22,8 +23,8 @@ worker.
 | 1.5 — real-chip reality check | `phase1.5-real-chip` | ✅ done | Ran sky130 + caravel. Found the real bottlenecks (not what the plan assumed) |
 | 2a — quick wins | `phase2a-quick-wins` | ✅ done | Fit view 12→78 fps (cull-stat off hot path); 4 GB wasm opt-in; lazy tessellation. Deleted planned LOD work |
 | 2b — chunking + worker | `phase2b-chunk-worker` | ◑ STEP 1 done, STEP 2 scoped | Leaf tess 2235→22 ms, leaf GPU 141→1.1 MB, byte-identical. Exposed parse as the last slow thing |
-| 2b — streaming parser | — | ⏭ next | The only work that removes the 2.4 s freeze AND the 1.4 GB heap |
-| 2b — worker offload | — | ⏸ after parser | Hides remaining freeze; needs nightly + build-std + atomics (groundwork proven) |
+| 2b — streaming parser | `phase2b-streaming-parser` | ✅ done | Parse heap 1.68 GB→777 MB, parse 2.4→1.2 s, leaf TTFF 2.6→1.4 s. Byte-identical to gds21 (oracle). Committed golden test |
+| 2b — worker offload | — | ⏸ after parser | Now a plain transferable-buffer worker on **stable** (STEP 3 killed the shared-heap requirement). Hides remaining ~1.2 s parse |
 | 3 — editing + incremental | — | ⏳ planned | Select/move/draw, CRDT shapes, undo. Hit-test will revive lazy R-tree builds |
 | 4 — backend/OASIS/DRC | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS |
 
@@ -33,15 +34,17 @@ worker.
 |---|--:|---|
 | leaf-zoom tessellation | 22 ms | was 2235 ms (chunking) |
 | leaf GPU geometry | 1.1 MB | was 141 MB |
-| leaf TTFF (browser) | 2.6 s | **92% is parse** — the target of the streaming parser |
+| leaf TTFF (browser) | **1.4 s** | was 2.6 s; streaming parser (STEP 3) |
+| parse wall (browser) | **1.2 s** | was 2.4 s; streaming parser, 2× |
 | fit fps | 47–78 | browser WebGL2 / native Metal; chunking cost ~6% at fit |
-| wasm heap | 1.68 GB | ~1.4 GB is gds21's intermediate library; columnar store is only 196 MB |
+| wasm parse heap | **777 MB** | was 1.68 GB; streaming parser dropped gds21's ~1.4 GB intermediate. caravan-signoff 1.90 GB→892 MB |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 
 ## Decisions locked (do not relitigate without a measurement)
 
-- **Streaming parser before worker.** Parser removes the 2.4 s freeze *and* the
-  1.4 GB heap; worker only hides the freeze. (phase2b-findings)
+- **Worker (STEP 2) can be plain stable Rust.** STEP 3 dropped peak parse heap to
+  ~0.8 GB, so a worker that parses + copies the CellDb fits under 4 GB — no shared
+  memory / atomics / nightly. (phase2b-findings, "Does STEP 2 still need a shared heap?")
 - **LOD-raster / tile pyramid deleted** for the M5/WebGPU target — fit view was a
   cull-stat instrumentation cost, not GPU. Contingency only for weak GPUs.
 - **Memo cache: not built.** No measurement justifies it yet.
@@ -65,10 +68,12 @@ worker.
 - **wgpu 22 is behind** and its `requestDevice` limits make headless Chromium
   reject WebGPU, so all browser numbers are WebGL2/ANGLE (pessimistic for fps). A
   wgpu upgrade would unblock real WebGPU measurement.
-- **Golden PNGs are not committed** (gitignored) — the invariant only holds within
-  a session. Needs a committed baseline + `cargo test` diff.
-- **Worker peak-heap claim is unproven** — the "shared heap holds peak at 1.68 GB"
-  argument is design, not measurement, until the worker exists.
+- ~~Golden PNGs are not committed~~ **RESOLVED** — `crates/render/tests/golden.rs`
+  + 6 committed 512² reference PNGs, diffed with a documented tolerance in
+  `cargo test`. Regenerate with `UPDATE_GOLDEN=1`.
+- **Worker combined-peak claim is now measurement-backed but not yet demonstrated
+  end-to-end.** STEP 3 measured the parse peak (~0.8 GB) that makes a copy-back
+  worker fit; the actual two-thread peak is only proven once the worker exists.
 - **Scale ceiling:** caravel is hobby-class (half the ~10 M-poly ceiling).
   Production SoCs need out-of-core / server-side tiling — a different memory story
   to decide before committing to that market.
@@ -83,9 +88,16 @@ worker.
 
 ## Next step
 
-Streaming GDS parser in `crates/core`: incremental reader that emits the columnar
-store element-by-element and drops each raw record, collapsing the ~1.4 GB parse
-high-water and removing parse from the TTFF critical path. Groundwork already in
-place: `gds.rs` collects into the columnar store and drops the library before
-finalizing, so an incremental reader slots into `collect()` without touching the
-chunker, culler, or renderer.
+**Worker offload (STEP 2), now as a plain stable-Rust transferable-buffer worker.**
+STEP 3 removed the shared-heap requirement: peak parse heap is ~0.8 GB, so a worker
+that parses in its own heap and `postMessage`s the `Pod` columnar store back to the
+main thread peaks at ~1.2 GB across both threads — under the 4 GB ceiling with
+margin. Move parse (and fit-view tessellation) into the worker to take the
+remaining ~1.2 s freeze off the main thread. No nightly / `build-std` / atomics /
+`wasm-bindgen-rayon` needed; the store is already `bytemuck`-transferable. The
+step-2-groundwork shared-memory machinery still links but is no longer required.
+
+Possible follow-ups, deferred: progressive render (draw cells as they stream —
+feasible, but a UX nicety once parse is off the critical path; watch for GDSII
+forward references), and revisiting the ~6% fit-view chunking cost on real WebGPU
+after a wgpu upgrade.

@@ -1,24 +1,26 @@
-# Phase 2b — Spatial chunking + worker offload: findings
+# Phase 2b — Spatial chunking + worker offload + streaming parser: findings
 
-**Status: STEP 1 shipped and measured. STEP 2 (worker) is NOT implemented** — its
-toolchain groundwork is done and proven, and the design below is settled, but no
-parse or tessellation runs off the main thread yet. See
-[STEP 2](#step-2--worker-offload-not-implemented) for exactly where it stands and
-why it stopped there.
+**Status: STEP 1 (chunking) and STEP 3 (streaming parser) shipped and measured.
+STEP 2 (worker) is NOT implemented** — its toolchain groundwork is done and
+proven, but the STEP 3 result (below) means it no longer needs that groundwork.
+See [STEP 2](#step-2--worker-offload-not-implemented) and
+[STEP 3](#step-3--streaming-gdsii-parser).
 
-**TL;DR.** Chunking did what it was meant to: leaf-zoom tessellation on caravel
-collapsed **2235 ms → 22 ms** (100×) and leaf GPU geometry **141 MB → 1.1 MB**
-(128×), with every test file rendering byte-identical. But it **did not fix
-time-to-first-frame**, because TTFF is no longer tessellation-bound: leaf TTFF
-went 4.55 s → 2.60 s and what remains is **2.4 s of parse — 92% of it**. The
-~2.4 s freeze the Phase 2a findings blamed on "parse + tessellating the giant flat
-cells" is now, after chunking, *almost entirely parse*.
+**TL;DR.** Two levers, measured end to end:
 
-That reorders Phase 2b's remaining work, and the conclusion is the opposite of the
-Phase 2a doc's: **the streaming parser is no longer "important, not urgent" — it
-is the only slow thing left.** A worker would *hide* the 2.4 s; the streaming
-parser would *remove* it, and take the 1.68 GB heap with it. Details in
-[Is the streaming parser still worth doing?](#is-the-streaming-parser-still-worth-doing).
+- **Chunking** collapsed leaf-zoom tessellation on caravel **2235 ms → 22 ms**
+  (100×) and leaf GPU geometry **141 MB → 1.1 MB**, byte-identical output. It did
+  *not* fix time-to-first-frame, because after it, TTFF was **92% parse**.
+- **The streaming parser** then took the parse itself: caravel's wasm parse heap
+  **1.68 GB → 777 MB**, parse wall **2.4 s → 1.2 s**, leaf TTFF **2.60 s → 1.38 s**
+  (caravan-signoff: **1.90 GB → 892 MB**, TTFF ~4.5 s → 1.75 s). Byte-identical to
+  gds21, proven cell-for-cell on hier/sky130/caravel.
+
+The headline consequence is architectural: peak parse heap is now ~0.8–0.9 GB, so
+**a worker that parses and copies the CellDb back fits under 4 GB with margin — the
+worker (STEP 2) no longer needs shared memory / atomics / nightly at all** and can
+ship as a plain transferable-buffer worker on stable. See
+[the STEP 2 answer](#does-step-2-still-need-a-shared-heap).
 
 ---
 
@@ -229,6 +231,15 @@ mid/leaf at all, which simplifies the protocol considerably.
 
 ### Memory model, and why it forces the design
 
+> **Superseded by STEP 3 — read [Does STEP 2 still need a shared
+> heap?](#does-step-2-still-need-a-shared-heap).** This subsection reasoned from a
+> 1.68 GB parse heap and concluded option 1 (worker parses + copies) was worse than
+> the baseline, forcing the shared-heap design. The streaming parser dropped the
+> parse heap to ~777 MB, which makes option 1 fit under 4 GB with ~2.8 GB to spare.
+> **Option 1 is now the recommended design and needs no shared memory.** The
+> analysis below is kept for the record of why the shared heap looked necessary
+> before parse was fixed.
+
 The brief's trap is real and worth restating with the measured numbers. caravel's
 wasm heap is 1680 MB, of which the columnar store is 196 MB — **gds21's
 intermediate library is ~1.4 GB of it**. Three options:
@@ -306,6 +317,33 @@ complete and verified, and the remaining integration is a substantial piece of
 work with its own risk (Trunk + build-std + wasm-bindgen-rayon + eframe init
 order) that deserves its own commit and its own measurements.
 
+### Does STEP 2 still need a shared heap?
+
+**No — STEP 3 removed the reason.** The whole shared-heap / atomics / build-std
+design existed to avoid doubling a 1.68 GB heap when a worker parses and the main
+thread reads. With the streaming parser, peak parse heap is **~777 MB (caravel) /
+~892 MB (caravan-signoff)**. A worker that parses and then *copies* the CellDb
+back over `postMessage` now peaks at roughly:
+
+```
+  worker heap during parse            ~800 MB
+  + serialised store in a transfer buf ~200 MB   (transient, in the worker)
+  + main-thread copy of the store      ~200 MB
+  ------------------------------------------------
+  ~1.2 GB combined across both threads — vs a 4 GB ceiling
+```
+
+That fits with ~2.8 GB of headroom. So STEP 2 can be a **plain transferable-buffer
+worker on stable Rust**: no `+atomics`, no `build-std`, no nightly, no
+`SharedArrayBuffer`, no `wasm-bindgen-rayon`. The columnar store is already `Pod`
+bytes (Phase 2b STEP 1), so "serialise" is `bytemuck::cast_slice` into an
+`ArrayBuffer` and "deserialise" is a borrow — the copy is a memcpy, not a
+traversal. The step-2-groundwork commit's shared-memory machinery (the
+`MainThreadOnly` marker, the atomics build) is no longer on the critical path; it
+still links and costs nothing, so it stays for now, but the worker doesn't need
+it. This is the single most useful thing STEP 3 did for STEP 2, and it was the
+explicit reason the brief sequenced the parser first.
+
 ---
 
 ## WebGL2 vs WebGPU
@@ -324,38 +362,90 @@ would likely unblock headless WebGPU and is a prerequisite for that.
 
 ---
 
-## Is the streaming parser still worth doing?
+## STEP 3 — streaming GDSII parser
 
-**Yes — and its case is now much stronger than Phase 2a concluded.** The Phase 2a
-doc demoted it to "important, not urgent" because the 4 GB opt-in bought headroom.
-Two measurements from this phase change that:
+Replaces "gds21 parses the whole `GdsLibrary`, then we convert" with a hand-rolled
+record reader (`crates/core/src/gds_stream.rs`) that emits directly into the
+columnar `CellDb` and drops each raw record as it goes. GDSII framing is trivial
+(a flat sequence of length-prefixed records), so this is a small, plain-stable-Rust
+module in `crates/core`, no new deps.
 
-1. **Parse is now the entire remaining freeze.** Chunking took tessellation off the
-   critical path at mid/leaf (2235 → 22 ms), and what it exposed is that parse is
-   **92% of the 2.6 s leaf TTFF**. It is the only slow thing left.
-2. **The heap is parse, and nothing else touches it.** caravel's wasm heap is
-   1680 MB before *and after* the columnar store. The store is 196 MB of that —
-   **~12%**. The other ~1.4 GB is gds21's intermediate `GdsLibrary`. Phase 2a's
-   4 GB opt-in raised the ceiling but the *cause* is untouched, and STEP 1 proved
-   the compact model isn't what costs.
+### Cell-id parity, and why it's load-bearing
 
-The distinction that matters for build order: **a worker only hides the 2.4 s; the
-streaming parser removes it** — and takes ~1.4 GB with it, which no other planned
-work does. They are not substitutes, and if only one gets built, the parser is
-worth more:
+The reader makes two passes over the bytes: pass 1 interns every struct name in
+file order, pass 2 builds shapes + instances. The split is not for convenience —
+it reproduces gds21's exact cell-id assignment. The renderer draws **cell-major**
+and the pipeline alpha-blends, so the id given to each cell decides the image
+wherever cells on different layers overlap. Matching gds21's "intern all struct
+names first, in file order, then fill" is what keeps the golden image
+byte-identical across the parser swap. (Measured: caravel has 0 forward
+references, so even single-pass would match it — but two-pass matches *any* file,
+and the oracle test holds it to that.)
 
-- it attacks the freeze *and* the heap, where the worker attacks only the freeze;
-- it makes the worker cheaper when it lands (less to move, a smaller shared heap);
-- it is plain Rust in `crates/core`, with none of the worker's toolchain risk
-  (nightly, `build-std`, atomics, wasm-bindgen-rayon, Trunk integration).
+### Correctness proof — gds21 kept as an oracle
 
-STEP 1 also did some of its groundwork already: `gds.rs` now collects into the
-columnar store and drops the library before finalising, so an incremental reader
-slots into `collect()` without touching the chunker, the culler, or the renderer.
+gds21 is not deleted; it's retained as `load_gds_db_gds21` and an oracle test
+parses a file both ways and asserts identical cells / shapes (layer + every point)
+/ instances (child + transform + array params). hier and sky130 run in
+`cargo test`; caravel was checked once by hand:
 
-**Suggested order from here:** streaming parser → worker (parse + fit-view
-tessellation) → revisit the fit regression on WebGPU. The worker's own value is
-mostly the fit case and interactivity-during-load once parse is cheap.
+| file | cells | shapes | instances | result |
+|---|--:|--:|--:|---|
+| hier | 3 | 30 | — | identical |
+| sky130 | 440 | 48,784 | — | identical |
+| caravel | 1014 | 3,924,533 | 462,523 | **identical** |
+
+The golden-image test (GATE 0) stays green at 0 px — the swap is invisible.
+
+Quirks handled (the set gds21 handled): AREF 3-point XY + COLROW, STRANS
+reflect/rotate/mag decoded from 8-byte GDS reals, the repeated boundary closing
+point kept verbatim, negative i32 coords. Read: BOUNDARY/SREF/AREF. Consumed but
+skipped (as before): PATH/TEXT/NODE/BOX. Malformed/truncated records return an
+error rather than panic.
+
+### Results
+
+Headline is **peak wasm heap during parse** — the transient high-water. wasm
+linear memory never shrinks, so a sample taken immediately after parse (the new
+`parse_heap_bytes` metric, before any tessellation) *is* the high-water.
+
+Browser (headless Chromium, WebGL2/ANGLE-Metal, M5):
+
+| file | size | parse wall | wasm parse heap | leaf TTFF |
+|---|--:|--:|--:|--:|
+| caravel | 278 MB | 2387 → **1180 ms** | 1.68 GB → **777 MB** | 2.60 → **1.38 s** |
+| caravan-signoff | 345 MB | ~2100 → **1400 ms** | 1.90 GB → **892 MB** | ~4.5 → **1.75 s** |
+| sky130 | 4.2 MB | 40 → 16 ms | tiny (27 MB total) | ~unchanged |
+| hier | 980 B | ~0 | tiny | ~unchanged |
+
+Native (M5), caravel: parse **1.53 s → 549 ms** (530 MB/s), peak RSS **1.6 GB →
+765 MB**; caravan-signoff parse 675 ms, parse-peak RSS 878 MB.
+
+### Did wall-clock improve, or only memory?
+
+**Both — and the speedup is measured, not assumed.** caravel parse dropped 2× in
+the browser (2387 → 1180 ms) and 2.8× native (1.53 s → 549 ms). The cause is the
+same as the memory win: gds21 allocated an enum + a `Vec<GdsPoint>` + optional
+fields per boundary (3.9 M of them), and the streaming reader allocates none of
+that — each boundary's points go straight from the byte slice into the columnar
+store. Fewer allocations is fewer cycles as well as fewer bytes.
+
+### Is progressive render (draw completed cells during parse) worth a follow-up?
+
+**Feasible, with one real obstacle; not built here (out of scope).** Cells finalise
+in file order (on ENDSTR), so the reader could hand each completed cell to the
+renderer as it lands and paint the design as it streams in. The obstacle the brief
+flagged is real: **GDSII permits forward references** — an SREF/AREF can name a
+child whose BGNSTR comes later — so an instance may point at a not-yet-parsed
+(empty) cell, and drawing its parent early would show a hole. It is safe to draw a
+cell only once every cell in its instance subtree is finalised. Most tools
+(including all of caravel) write children-first, so in practice the top cell is
+last and everything it references already exists by the time it's drawn — meaning
+the *useful* case (show the chip filling in) works for the common file, and the
+guard is "defer a cell whose descendants aren't all done yet." Whether it's worth
+it now is questionable given parse is already ~1.2 s and off the critical path once
+STEP 2 lands; it's a UX nicety, not a bottleneck fix. Recommend deferring until
+after the worker.
 
 ---
 
@@ -366,14 +456,19 @@ mostly the fit case and interactivity-during-load once parse is cheap.
 cargo run --release -p fluideda-core   --example bench -- testdata/caravel/gds/caravel.gds
 cargo run --release -p fluideda-render --example shot  -- testdata/caravel/gds/caravel.gds
 
-# browser
+# browser (parse_heap_bytes in the metrics is the parse high-water)
 trunk build --release
 python3 scripts/serve_bench.py 8090 &
 npm i playwright && npx playwright install chromium
 node scripts/browser_bench.mjs
 
-# golden check: render hier + sky130 and diff against a pre-change baseline.
-# NOTE: goldens are not committed; capture a baseline from the parent commit first.
+# golden image test (committed references; 0 px on the capture machine)
+cargo test -p fluideda-render --test golden
+#   regenerate after an intended visual change:
+#   UPDATE_GOLDEN=1 cargo test -p fluideda-render --test golden
+
+# streaming parser == gds21 oracle (byte-identical CellDb)
+cargo test -p fluideda-core oracle
 
 # STEP 2 groundwork: prove the shared-memory build still links
 rustup toolchain install nightly --component rust-src
