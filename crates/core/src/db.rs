@@ -111,6 +111,19 @@ impl Cell {
         self.shapes.distinct_layers()
     }
 
+    /// Which chunk owns shape `idx`. Chunks are contiguous, sorted, and cover
+    /// every shape (Phase 2b invariant), so this is a binary search. Used by the
+    /// editor to invalidate exactly the chunk an edit touches (Phase 3), not the
+    /// whole cell — the incremental-retessellation property.
+    pub fn chunk_of(&self, idx: u32) -> Option<crate::chunk::ChunkId> {
+        self.chunks
+            .partition_point(|c| c.end <= idx)
+            .try_into()
+            .ok()
+            .filter(|&ci: &usize| ci < self.chunks.len() && self.chunks[ci].start <= idx)
+            .map(|ci| ci as crate::chunk::ChunkId)
+    }
+
     /// Bbox of just this cell's own shapes (cell-local nm).
     ///
     /// Folded from the chunk table rather than rescanned from the coordinate

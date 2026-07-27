@@ -68,10 +68,24 @@ pub struct FluidApp {
     edit_mode: bool,
     /// The currently selected base shape (TOP cell only, this skeleton).
     selected: Option<BaseShapeId>,
+    /// Current translation (nm) applied to the selection, measured from its base
+    /// position. Accumulated by nudges/drag; the moved copy is always base+this.
+    move_delta: (i32, i32),
+    /// World point where a move-drag began (`None` when not dragging a shape).
+    drag_move_from: Option<Vec2>,
+    /// `move_delta` at the moment a move-drag began.
+    drag_move_base: (i32, i32),
+    /// Base chunks whose geometry an edit invalidated — re-tessellated (with
+    /// suppressions) on the next `ensure_uploaded`. Only these rebuild, not the
+    /// whole cell: the incremental-edit property.
+    dirty_keys: HashSet<(CellId, ChunkId)>,
     /// Overlay geometry needs re-upload (set when the overlay changed).
     overlay_dirty: bool,
     /// Last hit-test latency, shown in the panel (the lazy-index-build cost).
     last_pick_us: f64,
+    /// Instrumentation for the last edit: chunks re-tessellated + wall time.
+    last_edit_chunks: usize,
+    last_edit_ms: f64,
 
     session: Option<Session>,
     name: String,
@@ -125,8 +139,14 @@ impl FluidApp {
             overlay: EditOverlay::new(),
             edit_mode: false,
             selected: None,
+            move_delta: (0, 0),
+            drag_move_from: None,
+            drag_move_base: (0, 0),
+            dirty_keys: HashSet::new(),
             overlay_dirty: false,
             last_pick_us: 0.0,
+            last_edit_chunks: 0,
+            last_edit_ms: 0.0,
             session: None,
             name: "guest".to_string(),
             last_frame: 0.0,
@@ -156,6 +176,9 @@ impl FluidApp {
         // A fresh design has its own shape ids — drop any edits/selection.
         self.overlay = EditOverlay::new();
         self.selected = None;
+        self.move_delta = (0, 0);
+        self.drag_move_from = None;
+        self.dirty_keys.clear();
         self.overlay_dirty = false;
 
         if let Some(rs) = frame.wgpu_render_state() {
@@ -174,6 +197,82 @@ impl FluidApp {
         let hit = pick_in_cell(self.db.cell(top), p);
         self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
         self.selected = hit.map(|idx| (top, idx));
+        // Seed the move delta from any existing move of the newly selected shape,
+        // so a nudge/drag continues from where it sits rather than snapping back.
+        self.move_delta = self.selected.map_or((0, 0), |id| self.existing_delta(id));
+    }
+
+    /// Does world point `w` land inside the selection's *current* geometry (the
+    /// moved copy if moved, else the base)? Used to decide drag = move vs pan.
+    fn point_hits(&self, id: BaseShapeId, w: Vec2) -> bool {
+        let p = Point::new(w.x.round() as i32, w.y.round() as i32);
+        match self.overlay.edited.get(&id) {
+            Some(moved) => fluideda_core::point_in_polygon(&moved.points, p),
+            None => fluideda_core::point_in_polygon(self.db.cell(id.0).shapes.points(id.1 as usize), p),
+        }
+    }
+
+    /// The translation already applied to `id` by the overlay, or (0,0). Recovered
+    /// by diffing the moved copy's first point against the base's.
+    fn existing_delta(&self, id: BaseShapeId) -> (i32, i32) {
+        match self.overlay.edited.get(&id) {
+            Some(moved) => {
+                let base = self.db.cell(id.0).shapes.points(id.1 as usize);
+                match (base.first(), moved.points.first()) {
+                    (Some(b), Some(m)) => (m.x - b.x, m.y - b.y),
+                    _ => (0, 0),
+                }
+            }
+            None => (0, 0),
+        }
+    }
+
+    /// Set the selection's translation to `(dx, dy)` from its base — the single
+    /// move entry point (nudge and drag both call it). Copy-on-write: reads the
+    /// base geometry, translates, and records it in the overlay; the base column
+    /// is never touched. Invalidates only the chunk holding the shape.
+    fn set_move(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
+        let cell = self.db.cell(id.0);
+        let layer = cell.shapes.layer(id.1 as usize);
+        let pts = cell.shapes.points(id.1 as usize);
+        let moved = fluideda_core::edit::translate(layer, pts, dx, dy);
+        self.overlay.move_shape(id, moved);
+        self.move_delta = (dx, dy);
+        self.invalidate(id);
+    }
+
+    /// Nudge step (nm): a visible fraction of the design, so panel nudges are
+    /// obvious at any zoom. Kept modest so repeated nudges stay on-screen.
+    fn nudge_step(&self) -> i32 {
+        let w = (self.bbox_max.x - self.bbox_min.x).max(1.0);
+        ((w * 0.02) as i32).max(1)
+    }
+
+    /// Nudge the selection by `(dx, dy)` on top of its current move delta.
+    fn nudge(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
+        let (cx, cy) = self.move_delta;
+        self.set_move(id, cx + dx, cy + dy);
+    }
+
+    /// Delete the selection (tombstone). Copy-on-write path: no base mutation, the
+    /// containing chunk just re-tessellates without the shape.
+    fn delete_shape(&mut self, id: BaseShapeId) {
+        self.overlay.delete(id);
+        self.invalidate(id);
+        if self.selected == Some(id) {
+            self.selected = None;
+            self.move_delta = (0, 0);
+        }
+    }
+
+    /// Mark the chunk that owns `id`'s base shape for re-tessellation, and flag
+    /// the overlay geometry for re-upload. This is the whole of "incremental":
+    /// one chunk (of possibly dozens in the cell) rebuilds, not the cell.
+    fn invalidate(&mut self, id: BaseShapeId) {
+        if let Some(chunk) = self.db.cell(id.0).chunk_of(id.1) {
+            self.dirty_keys.insert((id.0, chunk));
+        }
+        self.overlay_dirty = true;
     }
 
     /// Tessellate + upload any visible cell **chunk** not yet on the GPU (lazy).
@@ -186,6 +285,17 @@ impl FluidApp {
         let mut guard = rs.renderer.write();
         let Some(renderer) = renderer_mut(&mut guard.callback_resources) else { return };
 
+        // Phase 3 invalidation: drop the chunks an edit dirtied so the loop below
+        // re-tessellates just those (with suppressions), not the whole cell.
+        let editing = !self.dirty_keys.is_empty() || self.overlay_dirty;
+        let edit_t = web_time::Instant::now();
+        let mut rebuilt = 0usize;
+        for key in self.dirty_keys.drain() {
+            renderer.drop_chunk(key);
+            self.uploaded.remove(&key);
+        }
+
+        let empty = std::collections::HashSet::new();
         let visible = self.visible.clone();
         for d in &visible.draws {
             let key = (d.cell, d.chunk);
@@ -193,11 +303,32 @@ impl FluidApp {
                 continue;
             }
             let cell = &self.db.cells[d.cell];
+            let chunk = &cell.chunks[d.chunk as usize];
             let t = web_time::Instant::now();
-            let meshes = fluideda_core::tessellate_chunk(&cell.shapes, &cell.chunks[d.chunk as usize]);
+            // A dirty chunk (its cell has overlay edits) tessellates with the
+            // suppressed base shapes removed; every other chunk is untouched.
+            let meshes = if d.dirty {
+                let suppressed = self.overlay.suppressed_in(d.cell).unwrap_or(&empty);
+                fluideda_core::tessellate_chunk_filtered(&cell.shapes, chunk, suppressed)
+            } else {
+                fluideda_core::tessellate_chunk(&cell.shapes, chunk)
+            };
             self.tess_accum_ms += t.elapsed().as_secs_f64() * 1e3;
             renderer.upload_chunk(&device, key, &meshes);
             self.uploaded.insert(key);
+            rebuilt += 1;
+        }
+
+        // Re-upload the (tiny) overlay geometry when it changed.
+        if self.overlay_dirty {
+            let meshes = fluideda_core::tessellate_shapes(&visible.overlay);
+            renderer.upload_overlay(&device, &meshes);
+            self.overlay_dirty = false;
+        }
+
+        if editing {
+            self.last_edit_chunks = rebuilt;
+            self.last_edit_ms = edit_t.elapsed().as_secs_f64() * 1e3;
         }
         self.gpu_bytes = renderer.uploaded_bytes();
     }
@@ -440,11 +571,31 @@ impl FluidApp {
                 Some((cell, idx)) => ui.small(format!("selected: cell {cell}, shape {idx}")),
                 None => ui.small("selected: (none)"),
             };
+            if let Some(id) = self.selected {
+                // Nudge = a fixed translation step, the deterministic move path.
+                let step = self.nudge_step();
+                ui.horizontal(|ui| {
+                    if ui.button("←").clicked() { self.nudge(id, -step, 0); }
+                    if ui.button("→").clicked() { self.nudge(id, step, 0); }
+                    if ui.button("↑").clicked() { self.nudge(id, 0, step); }
+                    if ui.button("↓").clicked() { self.nudge(id, 0, -step); }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() { self.delete_shape(id); }
+                    if ui.button("Deselect").clicked() { self.selected = None; }
+                });
+                ui.small(format!("move Δ: ({}, {}) nm", self.move_delta.0, self.move_delta.1));
+            }
             if self.last_pick_us > 0.0 {
                 ui.small(format!("last hit-test: {:.0} µs", self.last_pick_us));
             }
             let edits = self.overlay.deleted.len() + self.overlay.edited.len();
-            ui.small(format!("edits: {edits}"));
+            ui.small(format!("edits: {edits} (moved {}, deleted {})",
+                self.overlay.edited.len(), self.overlay.deleted.len()));
+            if self.last_edit_ms > 0.0 {
+                ui.small(format!("last edit: {} chunk(s) re-tess, {:.2} ms",
+                    self.last_edit_chunks, self.last_edit_ms));
+            }
 
             ui.separator();
             if ui.button("Fit view").clicked() {
@@ -459,12 +610,49 @@ impl FluidApp {
             let size = ui.available_size();
             self.camera.viewport = Vec2::new(size.x, size.y);
             let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+            let shift = ui.input(|i| i.modifiers.shift);
+            let world_at = |p: egui::Pos2, cam: &Camera| {
+                cam.screen_to_world(Vec2::new(p.x - rect.min.x, p.y - rect.min.y))
+            };
 
-            if resp.dragged() && !ui.input(|i| i.modifiers.shift) {
-                let d = resp.drag_delta();
-                self.camera.pan_pixels(d.x, d.y);
-                self.dragging = true;
+            // Edit mode: a drag that begins on the selected shape moves it (from
+            // the base, via copy-on-write); any other drag pans as usual.
+            if resp.drag_started() && self.edit_mode && !shift {
+                if let (Some(id), Some(p)) = (self.selected, resp.interact_pointer_pos()) {
+                    if self.point_hits(id, world_at(p, &self.camera)) {
+                        self.drag_move_from = Some(world_at(p, &self.camera));
+                        self.drag_move_base = self.move_delta;
+                    }
+                }
             }
+            if resp.dragged() {
+                if let (Some(from), Some(id), Some(p)) =
+                    (self.drag_move_from, self.selected, resp.interact_pointer_pos())
+                {
+                    let d = world_at(p, &self.camera) - from;
+                    self.set_move(
+                        id,
+                        self.drag_move_base.0 + d.x.round() as i32,
+                        self.drag_move_base.1 + d.y.round() as i32,
+                    );
+                } else if !shift {
+                    let d = resp.drag_delta();
+                    self.camera.pan_pixels(d.x, d.y);
+                    self.dragging = true;
+                }
+            }
+            if resp.drag_stopped() {
+                self.drag_move_from = None;
+            }
+
+            // Delete key removes the selection.
+            if self.edit_mode
+                && self.selected.is_some()
+                && ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+            {
+                self.delete_shape(self.selected.unwrap());
+            }
+
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll.abs() > 0.0 {
                 if let Some(p) = resp.hover_pos() {
@@ -527,7 +715,7 @@ impl FluidApp {
                     .map(|p| self.world_to_screen(Vec2::new(p.x as f32, p.y as f32), rect))
                     .collect();
                 if screen.len() >= 2 {
-                    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 230, 0));
+                    let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 230, 0));
                     painter.add(egui::Shape::closed_line(screen, stroke));
                 }
             }
