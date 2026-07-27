@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fluideda-core = { path = "../core" }
 yrs.workspace = true
 ewebsock.workspace = true
 glam.workspace = true

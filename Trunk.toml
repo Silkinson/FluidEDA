@@ -15,3 +15,9 @@ port = 8080
 [serve.headers]
 "Cross-Origin-Opener-Policy" = "same-origin"
 "Cross-Origin-Embedder-Policy" = "require-corp"
+
+# Proxy the collaboration WebSocket to the relay (Phase 0 server on :9000), so the
+# page and its socket share one origin. The app connects to ws://<host>/ws.
+[[proxy]]
+ws = true
+backend = "ws://127.0.0.1:9000/ws"

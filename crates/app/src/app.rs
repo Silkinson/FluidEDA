@@ -13,7 +13,7 @@ use fluideda_core::{
     EditOverlay, Layer, Point, VisibleSet,
 };
 use fluideda_render::Camera;
-use fluideda_sync::{color_from_id, Marker, Presence, Session};
+use fluideda_sync::{color_from_id, EditKind, Marker, Presence, Session};
 use glam::Vec2;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -87,7 +87,10 @@ pub struct FluidApp {
     last_edit_chunks: usize,
     last_edit_ms: f64,
 
-    session: Option<Session>,
+    /// Always present: an offline edit session (shared doc + per-user undo) that
+    /// `join` upgrades to a live connection. Editing and undo work before any
+    /// connection; joining a room then syncs.
+    session: Session,
     name: String,
     last_frame: f64,
     fps: f32,
@@ -147,7 +150,11 @@ impl FluidApp {
             last_pick_us: 0.0,
             last_edit_chunks: 0,
             last_edit_ms: 0.0,
-            session: None,
+            session: Session::new(Presence {
+                cursor: Vec2::ZERO,
+                name: "guest".to_string(),
+                color: color_from_id(0),
+            }),
             name: "guest".to_string(),
             last_frame: 0.0,
             fps: 0.0,
@@ -173,13 +180,20 @@ impl FluidApp {
         self.uploaded.clear();
         self.tess_accum_ms = 0.0;
         self.gpu_bytes = 0;
-        // A fresh design has its own shape ids — drop any edits/selection.
+        // A fresh design has its own shape ids, so old edits are meaningless —
+        // reset to a fresh offline session (rejoin to collaborate on the new
+        // design). Editing/undo keep working immediately.
         self.overlay = EditOverlay::new();
         self.selected = None;
         self.move_delta = (0, 0);
         self.drag_move_from = None;
         self.dirty_keys.clear();
         self.overlay_dirty = false;
+        self.session = Session::new(Presence {
+            cursor: Vec2::ZERO,
+            name: self.name.clone(),
+            color: color_from_id(0),
+        });
 
         if let Some(rs) = frame.wgpu_render_state() {
             init_renderer(rs);
@@ -227,11 +241,12 @@ impl FluidApp {
         }
     }
 
-    /// Set the selection's translation to `(dx, dy)` from its base — the single
-    /// move entry point (nudge and drag both call it). Copy-on-write: reads the
-    /// base geometry, translates, and records it in the overlay; the base column
-    /// is never touched. Invalidates only the chunk holding the shape.
-    fn set_move(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
+    /// Live move **preview** during a drag: mutate the local overlay directly for
+    /// responsiveness, without a CRDT write per frame. Copy-on-write — reads the
+    /// base geometry, translates, records the moved copy; the base is never
+    /// touched. The authoritative CRDT write happens once, on drag release
+    /// ([`commit_move`](Self::commit_move)).
+    fn preview_move(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
         let cell = self.db.cell(id.0);
         let layer = cell.shapes.layer(id.1 as usize);
         let pts = cell.shapes.points(id.1 as usize);
@@ -241,6 +256,13 @@ impl FluidApp {
         self.invalidate(id);
     }
 
+    /// Commit a move to the CRDT (broadcast to peers + pushed on the undo stack),
+    /// then reconcile the overlay from the CRDT truth.
+    fn commit_move(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
+        self.session.set_edit(id, EditKind::Move { dx, dy });
+        self.reconcile_edits();
+    }
+
     /// Nudge step (nm): a visible fraction of the design, so panel nudges are
     /// obvious at any zoom. Kept modest so repeated nudges stay on-screen.
     fn nudge_step(&self) -> i32 {
@@ -248,20 +270,38 @@ impl FluidApp {
         ((w * 0.02) as i32).max(1)
     }
 
-    /// Nudge the selection by `(dx, dy)` on top of its current move delta.
+    /// Nudge the selection by `(dx, dy)` on top of its current move delta (a
+    /// discrete, immediately-committed edit).
     fn nudge(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
         let (cx, cy) = self.move_delta;
-        self.set_move(id, cx + dx, cy + dy);
+        self.commit_move(id, cx + dx, cy + dy);
     }
 
-    /// Delete the selection (tombstone). Copy-on-write path: no base mutation, the
-    /// containing chunk just re-tessellates without the shape.
+    /// Delete the selection: a CRDT tombstone, then reconcile. No base mutation —
+    /// the containing chunk re-tessellates without the shape.
     fn delete_shape(&mut self, id: BaseShapeId) {
-        self.overlay.delete(id);
-        self.invalidate(id);
+        self.session.set_edit(id, EditKind::Delete);
+        self.reconcile_edits();
         if self.selected == Some(id) {
             self.selected = None;
             self.move_delta = (0, 0);
+        }
+    }
+
+    /// Undo the last local edit (per-user; a peer's edits are never on our undo
+    /// stack) and reconcile the overlay from the reverted CRDT state.
+    fn do_undo(&mut self) {
+        if self.session.undo() {
+            self.selected = None;
+            self.reconcile_edits();
+        }
+    }
+
+    /// Redo the last undone local edit and reconcile.
+    fn do_redo(&mut self) {
+        if self.session.redo() {
+            self.selected = None;
+            self.reconcile_edits();
         }
     }
 
@@ -430,22 +470,75 @@ impl FluidApp {
         self.visible = Arc::new(vs);
     }
 
-    fn connect(&mut self, ctx: &egui::Context) {
+    fn connect(&mut self) {
         let url = server_url();
-        let id = ctx.viewport_id().0.value();
-        let local = Presence {
-            cursor: Vec2::ZERO,
-            name: self.name.clone(),
-            color: color_from_id(id),
-        };
-        match Session::connect(&url, local) {
-            Ok(s) => {
-                log::info!("connected to {url}");
-                self.session = Some(s);
-            }
-            Err(e) => log::error!("connect failed: {e}"),
+        self.session.local.name = self.name.clone();
+        match self.session.join(&url) {
+            Ok(()) => log::info!("joined {url}"),
+            Err(e) => log::error!("join failed: {e}"),
         }
     }
+
+    /// Rebuild the overlay from the CRDT (the source of truth) after any edit —
+    /// local, remote, or undo — and invalidate the chunks whose edit-state
+    /// changed. Skipped mid-drag so a live move preview isn't clobbered.
+    fn reconcile_edits(&mut self) {
+        let new = self.overlay_from_crdt();
+        if new.deleted == self.overlay.deleted && new.edited == self.overlay.edited {
+            return; // nothing edit-related changed (e.g. a marker-only update)
+        }
+        for id in changed_ids(&self.overlay, &new) {
+            if let Some(chunk) = self.db.cell(id.0).chunk_of(id.1) {
+                self.dirty_keys.insert((id.0, chunk));
+            }
+        }
+        self.overlay = new;
+        self.overlay_dirty = true;
+        // Keep the nudge accumulator + highlight in step with the authoritative state.
+        if let Some(id) = self.selected {
+            self.move_delta = self.existing_delta(id);
+        }
+    }
+
+    /// Build an `EditOverlay` from the CRDT's edit records, translating each move
+    /// against this client's base geometry. Out-of-range ids (a peer on a
+    /// different file) are ignored rather than panicking.
+    fn overlay_from_crdt(&self) -> EditOverlay {
+        let mut o = EditOverlay::new();
+        for (id, kind) in self.session.edits() {
+            let (cell, idx) = id;
+            if cell >= self.db.cells.len() || idx as usize >= self.db.cell(cell).shapes.len() {
+                continue;
+            }
+            match kind {
+                fluideda_sync::EditKind::Delete => o.delete(id),
+                fluideda_sync::EditKind::Move { dx, dy } => {
+                    let c = self.db.cell(cell);
+                    let moved =
+                        fluideda_core::edit::translate(c.shapes.layer(idx as usize), c.shapes.points(idx as usize), dx, dy);
+                    o.move_shape(id, moved);
+                }
+            }
+        }
+        o
+    }
+}
+
+/// Ids whose edit-state differs between two overlays (added, removed, or moved to
+/// a new position) — the exact set of chunks an edit reconcile must invalidate.
+fn changed_ids(old: &EditOverlay, new: &EditOverlay) -> std::collections::HashSet<BaseShapeId> {
+    let mut ids = std::collections::HashSet::new();
+    for id in old.deleted.iter().chain(new.deleted.iter()) {
+        if old.deleted.contains(id) != new.deleted.contains(id) {
+            ids.insert(*id);
+        }
+    }
+    for id in old.edited.keys().chain(new.edited.keys()) {
+        if old.edited.get(id) != new.edited.get(id) {
+            ids.insert(*id);
+        }
+    }
+    ids
 }
 
 impl eframe::App for FluidApp {
@@ -461,11 +554,17 @@ impl eframe::App for FluidApp {
 
         self.drain_loads(ctx, frame);
 
-        if let Some(s) = self.session.as_mut() {
-            if s.poll() {
-                ctx.request_repaint();
+        self.session.local.name = self.name.clone();
+        if self.session.poll() {
+            // A remote edit (or marker) arrived. Don't rebuild the overlay mid-drag
+            // or it would clobber the live move preview; reconcile on drag release.
+            if self.drag_move_from.is_none() {
+                self.reconcile_edits();
             }
+            ctx.request_repaint();
         }
+
+        self.drive_test_hook();
 
         self.side_panel(ctx, frame);
         self.canvas(ctx);
@@ -473,6 +572,84 @@ impl eframe::App for FluidApp {
         self.ensure_uploaded(frame);
 
         ctx.request_repaint();
+    }
+}
+
+impl FluidApp {
+    /// Headless test surface (wasm only). Reads a one-shot command string from
+    /// `window.__fluideda_cmd` and publishes edit state to `window.__fluideda_state`
+    /// as JSON, so the two-browser sync test (scripts/edit_sync_test.mjs) can drive
+    /// edits and assert convergence without pixel-accurate canvas clicks. No effect
+    /// on real use; not compiled natively.
+    #[cfg(target_arch = "wasm32")]
+    fn drive_test_hook(&mut self) {
+        let Some(w) = web_sys::window() else { return };
+        // Consume a pending command, then clear it.
+        if let Ok(v) = js_sys::Reflect::get(&w, &"__fluideda_cmd".into()) {
+            if let Some(cmd) = v.as_string() {
+                if !cmd.is_empty() {
+                    self.run_test_command(&cmd);
+                    let _ = js_sys::Reflect::set(&w, &"__fluideda_cmd".into(), &"".into());
+                }
+            }
+        }
+        let top = self.db.top;
+        let sel = self.selected.map_or(-1i64, |(_, i)| i as i64);
+        // Every edit tombstones its base (move records a copy too), so
+        // `deleted` holds ALL edited shapes and `edited` is the moved subset:
+        //   edited shapes = deleted.len(); moves = edited.len();
+        //   pure deletes  = deleted.len() - edited.len().
+        let moves = self.overlay.edited.len();
+        let edited = self.overlay.deleted.len();
+        let state = format!(
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"selected\":{},\"top_shapes\":{}}}",
+            self.session.is_connected(),
+            self.session.remote.len(),
+            edited,
+            moves,
+            edited - moves,
+            sel,
+            self.db.cell(top).shapes.len(),
+        );
+        let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drive_test_hook(&mut self) {}
+
+    /// Execute a scripted test command (see [`drive_test_hook`]).
+    #[cfg(target_arch = "wasm32")]
+    fn run_test_command(&mut self, cmd: &str) {
+        let top = self.db.top;
+        let mut parts = cmd.split_whitespace();
+        match parts.next() {
+            Some("join") => self.connect(),
+            Some("edit_mode") => self.edit_mode = true,
+            Some("select") => {
+                // `select <idx>` — select a TOP-cell shape by index (dodges needing
+                // pixel-accurate clicks in the harness).
+                if let Some(idx) = parts.next().and_then(|s| s.parse::<u32>().ok()) {
+                    if (idx as usize) < self.db.cell(top).shapes.len() {
+                        self.selected = Some((top, idx));
+                        self.move_delta = self.existing_delta((top, idx));
+                    }
+                }
+            }
+            Some("nudge") => {
+                if let Some(id) = self.selected {
+                    let step = self.nudge_step();
+                    self.nudge(id, step, 0);
+                }
+            }
+            Some("delete") => {
+                if let Some(id) = self.selected {
+                    self.delete_shape(id);
+                }
+            }
+            Some("undo") => self.do_undo(),
+            Some("redo") => self.do_redo(),
+            _ => {}
+        }
     }
 }
 
@@ -520,13 +697,13 @@ impl FluidApp {
                 ui.label("name");
                 ui.text_edit_singleline(&mut self.name);
             });
-            if self.session.is_none() {
+            if !self.session.is_connected() {
                 if ui.button("Join room").clicked() {
-                    self.connect(ctx);
+                    self.connect();
                 }
             } else {
                 ui.colored_label(egui::Color32::GREEN, "● connected");
-                ui.label(format!("{} peers", self.session.as_ref().unwrap().remote.len()));
+                ui.label(format!("{} peers", self.session.remote.len()));
             }
 
             ui.separator();
@@ -596,6 +773,14 @@ impl FluidApp {
                 ui.small(format!("last edit: {} chunk(s) re-tess, {:.2} ms",
                     self.last_edit_chunks, self.last_edit_ms));
             }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.session.can_undo(), egui::Button::new("Undo")).clicked() {
+                    self.do_undo();
+                }
+                if ui.add_enabled(self.session.can_redo(), egui::Button::new("Redo")).clicked() {
+                    self.do_redo();
+                }
+            });
 
             ui.separator();
             if ui.button("Fit view").clicked() {
@@ -630,7 +815,7 @@ impl FluidApp {
                     (self.drag_move_from, self.selected, resp.interact_pointer_pos())
                 {
                     let d = world_at(p, &self.camera) - from;
-                    self.set_move(
+                    self.preview_move(
                         id,
                         self.drag_move_base.0 + d.x.round() as i32,
                         self.drag_move_base.1 + d.y.round() as i32,
@@ -642,6 +827,12 @@ impl FluidApp {
                 }
             }
             if resp.drag_stopped() {
+                // Commit the previewed move to the CRDT once (broadcast + undoable).
+                if self.drag_move_from.is_some() {
+                    if let Some(id) = self.selected {
+                        self.commit_move(id, self.move_delta.0, self.move_delta.1);
+                    }
+                }
                 self.drag_move_from = None;
             }
 
@@ -664,18 +855,14 @@ impl FluidApp {
             if let Some(p) = resp.hover_pos() {
                 let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
                 let world = self.camera.screen_to_world(local);
-                if let Some(s) = self.session.as_mut() {
-                    s.set_cursor(world);
-                }
+                self.session.set_cursor(world);
                 if resp.drag_started() && ui.input(|i| i.modifiers.shift) {
-                    if let Some(s) = self.session.as_mut() {
-                        let half = 2000.0;
-                        s.add_marker(Marker {
-                            min: world - Vec2::splat(half),
-                            max: world + Vec2::splat(half),
-                            color: [1.0, 1.0, 1.0, 0.6],
-                        });
-                    }
+                    let half = 2000.0;
+                    self.session.add_marker(Marker {
+                        min: world - Vec2::splat(half),
+                        max: world + Vec2::splat(half),
+                        color: [1.0, 1.0, 1.0, 0.6],
+                    });
                 }
             }
 
@@ -720,23 +907,21 @@ impl FluidApp {
                 }
             }
 
-            if let Some(s) = self.session.as_ref() {
-                for (_, pres) in s.remote.iter() {
-                    let sp = self.world_to_screen(pres.cursor, rect);
-                    let col = egui::Color32::from_rgb(
-                        (pres.color[0] * 255.0) as u8,
-                        (pres.color[1] * 255.0) as u8,
-                        (pres.color[2] * 255.0) as u8,
-                    );
-                    painter.circle_filled(sp, 4.0, col);
-                    painter.text(
-                        sp + egui::vec2(6.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        &pres.name,
-                        egui::FontId::proportional(12.0),
-                        col,
-                    );
-                }
+            for (_, pres) in self.session.remote.iter() {
+                let sp = self.world_to_screen(pres.cursor, rect);
+                let col = egui::Color32::from_rgb(
+                    (pres.color[0] * 255.0) as u8,
+                    (pres.color[1] * 255.0) as u8,
+                    (pres.color[2] * 255.0) as u8,
+                );
+                painter.circle_filled(sp, 4.0, col);
+                painter.text(
+                    sp + egui::vec2(6.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    &pres.name,
+                    egui::FontId::proportional(12.0),
+                    col,
+                );
             }
         });
     }
