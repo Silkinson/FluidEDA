@@ -111,6 +111,11 @@ pub struct HierRenderer {
     uploaded_bytes: usize,
     proxy: GpuMesh, // unit-square [0,1]^2 mesh, dim color
 
+    /// Phase 3 edit overlay: moved/added shapes in **world nm**, drawn on top of
+    /// the base with a single identity (origin-rebased) instance. Rebuilt whenever
+    /// the overlay changes; tiny, so a full re-upload per edit is fine.
+    overlay: Vec<GpuMesh>,
+
     /// Shared instance buffer, grown as needed and rewritten each frame.
     instbuf: wgpu::Buffer,
     instcap: usize,
@@ -123,6 +128,8 @@ pub struct HierRenderer {
     draw_seq: Vec<DrawItem>,
     proxy_first: u32,
     proxy_count: u32,
+    /// Instance-buffer slot of the overlay's identity transform (set in `prepare`).
+    overlay_first: u32,
 }
 
 const INST_SIZE: u64 = std::mem::size_of::<InstanceRaw>() as u64;
@@ -230,11 +237,13 @@ impl HierRenderer {
             proxy,
             instbuf,
             instcap,
+            overlay: Vec::new(),
             hidden: HashSet::new(),
             cell_plan: Vec::new(),
             draw_seq: Vec::new(),
             proxy_first: 0,
             proxy_count: 0,
+            overlay_first: 0,
         }
     }
 
@@ -265,6 +274,35 @@ impl HierRenderer {
             })
             .collect();
         self.cells.insert(key, CellGpu { meshes: gpu_meshes });
+    }
+
+    /// Forget a chunk's uploaded geometry so the next [`upload_chunk`] rebuilds
+    /// it (Phase 3 incremental invalidation). Called when an edit dirties a
+    /// chunk; the app then re-tessellates just that chunk with suppressions.
+    pub fn drop_chunk(&mut self, key: ChunkKey) {
+        if let Some(gpu) = self.cells.remove(&key) {
+            for m in &gpu.meshes {
+                let bytes = (m.vbuf.size() + m.ibuf.size()) as usize;
+                self.uploaded_bytes = self.uploaded_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    /// Replace the edit-overlay geometry (Phase 3). `meshes` are per-layer meshes
+    /// in **world nm**; the renderer draws them on top of the base with one
+    /// identity, origin-rebased instance. Tiny by construction (a handful of
+    /// moved/added shapes), so a full rebuild per edit is cheap.
+    pub fn upload_overlay(&mut self, device: &wgpu::Device, meshes: &[LayerMesh]) {
+        self.overlay = meshes
+            .iter()
+            .filter(|m| !m.indices.is_empty())
+            .map(|m| build_mesh(device, &self.layer_bgl, m.layer, &m.vertices, &m.indices))
+            .collect();
+    }
+
+    /// Drop all overlay geometry (e.g. on load of a new design).
+    pub fn clear_overlay(&mut self) {
+        self.overlay.clear();
     }
 
     pub fn set_layer_visible(&mut self, layer: Layer, visible: bool) {
@@ -321,6 +359,16 @@ impl HierRenderer {
             raw.push(InstanceRaw {
                 row0: [w, 0.0, (b.min_x - ox) as f32, 0.0],
                 row1: [0.0, h, (b.min_y - oy) as f32, 0.0],
+            });
+        }
+
+        // Phase 3: one identity, origin-rebased instance for the overlay. Its
+        // meshes are already in world nm, so the only transform is the rebase.
+        self.overlay_first = raw.len() as u32;
+        if !self.overlay.is_empty() {
+            raw.push(InstanceRaw {
+                row0: [1.0, 0.0, -ox as f32, 0.0],
+                row1: [0.0, 1.0, -oy as f32, 0.0],
             });
         }
 
@@ -391,6 +439,23 @@ impl HierRenderer {
             pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
             pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..mesh.index_count, 0, 0..plan.count);
+        }
+
+        // Phase 3 overlay geometry, on top of the base, one identity instance.
+        // `upload_overlay` already built the meshes in layer order (per-layer
+        // meshes come out of the tessellator sorted), so the draw is deterministic.
+        if !self.overlay.is_empty() {
+            let off = self.overlay_first as u64 * INST_SIZE;
+            pass.set_vertex_buffer(1, self.instbuf.slice(off..));
+            for mesh in &self.overlay {
+                if self.hidden.contains(&mesh.layer) {
+                    continue;
+                }
+                pass.set_bind_group(1, &mesh.color_bind, &[]);
+                pass.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                pass.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
         }
     }
 }

@@ -12,10 +12,16 @@
 //! cell's shapes live in a columnar [`store::ShapeStore`] (plain `Pod` columns,
 //! no per-shape `Vec`), partitioned by [`chunk`] into contiguous ranges, so
 //! culling emits `(cell, chunk)` and only on-screen chunks are ever tessellated.
+//!
+//! Phase 3 adds **editing** as a copy-on-write [`edit::EditOverlay`] over the
+//! immutable base: cull composites base ∪ overlay, untouched cells stay on the
+//! Phase 2b path. Still no rendering or networking deps here — the overlay is
+//! plain data the app mirrors into the CRDT.
 
 pub mod chunk;
 pub mod cull;
 pub mod db;
+pub mod edit;
 pub mod gds;
 pub mod gds_stream;
 pub mod index;
@@ -25,11 +31,12 @@ pub mod transform;
 pub mod types;
 
 pub use chunk::{Chunk, ChunkId};
-pub use cull::{cull, cull_counted, CellDraw, CullStats, VisibleSet};
+pub use cull::{cull, cull_counted, cull_with_overlay, CellDraw, CullStats, VisibleSet};
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
+pub use edit::{BaseShapeId, EditOverlay, Shape};
 pub use index::ShapeIndex;
 pub use store::ShapeStore;
-pub use tess::{tessellate, tessellate_chunk, tessellate_shapes, LayerMesh};
+pub use tess::{tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_shapes, LayerMesh};
 pub use transform::{Bboxf, Transform};
 pub use types::{Bbox, FlatLayout, Layer, Point, Polygon, Vertex};
 

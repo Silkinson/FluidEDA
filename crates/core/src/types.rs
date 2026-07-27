@@ -43,7 +43,10 @@ impl Point {
 
 /// A simple polygon: a closed ring of points, no holes (Phase 0).
 /// Holes / paths / references come in Phase 1.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` so the edit overlay (Phase 3) can compare a moved copy against its
+/// base and so golden tests can assert overlay geometry exactly.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Polygon {
     pub layer: Layer,
     pub points: Vec<Point>,

@@ -52,6 +52,23 @@ pub fn tessellate_chunk(store: &ShapeStore, chunk: &Chunk) -> Vec<LayerMesh> {
     )
 }
 
+/// Like [`tessellate_chunk`] but **skips** the shape indices in `suppressed`
+/// (Phase 3). This is how the overlay's `deleted` set removes a base shape
+/// without mutating the base column: the chunk containing it is simply
+/// re-tessellated without it. Only chunks of edited cells ever take this path;
+/// everything else uses the plain [`tessellate_chunk`].
+pub fn tessellate_chunk_filtered(
+    store: &ShapeStore,
+    chunk: &Chunk,
+    suppressed: &std::collections::HashSet<u32>,
+) -> Vec<LayerMesh> {
+    tessellate_iter(
+        (chunk.start as usize..chunk.end as usize)
+            .filter(|i| !suppressed.contains(&(*i as u32)))
+            .map(|i| (store.layer(i), store.points(i))),
+    )
+}
+
 /// One `LayerMesh` per distinct layer, sorted (= draw order).
 fn tessellate_iter<'a>(shapes: impl Iterator<Item = (Layer, &'a [Point])>) -> Vec<LayerMesh> {
     let mut per_layer: BTreeMap<Layer, VertexBuffers<Vertex, u32>> = BTreeMap::new();

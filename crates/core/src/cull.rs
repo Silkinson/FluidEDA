@@ -14,6 +14,7 @@
 
 use crate::chunk::ChunkId;
 use crate::db::{CellDb, CellId, InstanceKind};
+use crate::edit::{EditOverlay, Shape};
 use crate::transform::{Bboxf, Transform};
 use std::collections::HashMap;
 
@@ -27,6 +28,11 @@ pub struct CellDraw {
     pub cell: CellId,
     pub chunk: ChunkId,
     pub transforms: Vec<Transform>,
+    /// Phase 3: this chunk belongs to a cell with overlay edits, so its base
+    /// geometry must be tessellated with the cell's suppressed indices removed
+    /// (see [`crate::tess::tessellate_chunk_filtered`]). Always `false` when
+    /// there is no overlay — the hot path is untouched.
+    pub dirty: bool,
 }
 
 /// Result of a viewport query.
@@ -35,6 +41,11 @@ pub struct VisibleSet {
     pub draws: Vec<CellDraw>,
     /// World-space boxes for cells too small to draw as geometry (LOD proxies).
     pub proxies: Vec<Bboxf>,
+    /// Phase 3: overlay geometry (moved copies + added shapes) visible this
+    /// frame, in world nm. Empty unless an overlay was passed. Drawn on top of
+    /// the base by the renderer; the base half of every move is suppressed via
+    /// [`CellDraw::dirty`], so nothing double-draws.
+    pub overlay: Vec<Shape>,
     pub stats: CullStats,
 }
 
@@ -65,24 +76,48 @@ pub struct CullStats {
 /// never needs it, and counting it walks every visible cell's R-tree — ~89% of a
 /// fit-view frame on a real chip.
 pub fn cull(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64) -> VisibleSet {
-    cull_inner(db, view, px_per_nm, min_pixel, false)
+    cull_inner(db, view, px_per_nm, min_pixel, false, None)
 }
 
 /// Like [`cull`] but also fills `stats.visible_shapes` by querying each visible
 /// cell's index. **Off the hot path** — for the bench/shot harnesses and an
 /// opt-in debug readout, never per frame.
 pub fn cull_counted(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64) -> VisibleSet {
-    cull_inner(db, view, px_per_nm, min_pixel, true)
+    cull_inner(db, view, px_per_nm, min_pixel, true, None)
 }
 
-fn cull_inner(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64, count_visible: bool) -> VisibleSet {
+/// Cull with an editing overlay composited in (Phase 3). Identical to [`cull`]
+/// for cells the overlay does not touch — the per-draw cost is one `HashSet`
+/// lookup, and only for the dozens of cells actually emitted — so a viewport over
+/// unedited geometry pays effectively nothing. An **empty** overlay produces a
+/// byte-identical result to [`cull`] (the golden invariant).
+pub fn cull_with_overlay(
+    db: &CellDb,
+    view: &Bboxf,
+    px_per_nm: f64,
+    min_pixel: f64,
+    overlay: &EditOverlay,
+) -> VisibleSet {
+    cull_inner(db, view, px_per_nm, min_pixel, false, Some(overlay))
+}
+
+fn cull_inner(
+    db: &CellDb,
+    view: &Bboxf,
+    px_per_nm: f64,
+    min_pixel: f64,
+    count_visible: bool,
+    overlay: Option<&EditOverlay>,
+) -> VisibleSet {
     let mut ctx = CullCtx {
         db,
         view: *view,
         px_per_nm,
         min_pixel,
         count_visible,
+        overlay,
         grouped: HashMap::new(),
+        dirty_cells: std::collections::HashSet::new(),
         set: VisibleSet::default(),
     };
     ctx.walk(db.top, Transform::IDENTITY);
@@ -95,14 +130,61 @@ fn cull_inner(db: &CellDb, view: &Bboxf, px_per_nm: f64, min_pixel: f64, count_v
     // first — so an unsorted walk makes the same scene render differently run to
     // run (measured: 118 px of sky130 at fit). Sorting makes the frame
     // reproducible, which is what lets the golden-image check mean anything.
+    let dirty_cells = std::mem::take(&mut ctx.dirty_cells);
     let mut grouped: Vec<((CellId, ChunkId), Vec<Transform>)> = ctx.grouped.into_iter().collect();
     grouped.sort_unstable_by_key(|&(key, _)| key);
     for ((cell, chunk), transforms) in grouped {
         ctx.set.stats.instances_emitted += transforms.len() as u64;
-        ctx.set.draws.push(CellDraw { cell, chunk, transforms });
+        let dirty = dirty_cells.contains(&cell);
+        ctx.set.draws.push(CellDraw { cell, chunk, transforms, dirty });
     }
     ctx.set.stats.proxy_count = ctx.set.proxies.len();
+
+    // Emit overlay geometry (moved copies + added). Skeleton scope: TOP cell only,
+    // drawn at identity — so world nm == the shapes' stored (TOP-local) nm. A
+    // viewport bbox test keeps this cheap even as edits accumulate.
+    if let Some(o) = overlay {
+        emit_overlay(o, db.top, view, &mut ctx.set.overlay);
+    }
+
     ctx.set
+}
+
+/// Collect the overlay's moved/added shapes for the top cell that fall in `view`.
+fn emit_overlay(overlay: &EditOverlay, top: CellId, view: &Bboxf, out: &mut Vec<Shape>) {
+    let mut push_if_visible = |s: &Shape| {
+        if shape_in_view(s, view) {
+            out.push(s.clone());
+        }
+    };
+    for (&(cell, _), shape) in &overlay.edited {
+        if cell == top {
+            push_if_visible(shape);
+        }
+    }
+    for (cell, shape) in &overlay.added {
+        if *cell == top {
+            push_if_visible(shape);
+        }
+    }
+}
+
+/// Cheap axis-aligned overlap of a polygon's bbox against the viewport.
+fn shape_in_view(s: &Shape, view: &Bboxf) -> bool {
+    let (mut lo_x, mut lo_y, mut hi_x, mut hi_y) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for p in &s.points {
+        lo_x = lo_x.min(p.x);
+        lo_y = lo_y.min(p.y);
+        hi_x = hi_x.max(p.x);
+        hi_y = hi_y.max(p.y);
+    }
+    if lo_x > hi_x {
+        return false;
+    }
+    (lo_x as f64) <= view.max_x
+        && (hi_x as f64) >= view.min_x
+        && (lo_y as f64) <= view.max_y
+        && (hi_y as f64) >= view.min_y
 }
 
 struct CullCtx<'a> {
@@ -112,7 +194,12 @@ struct CullCtx<'a> {
     min_pixel: f64,
     /// When false, skip the per-cell index query that fills `visible_shapes`.
     count_visible: bool,
+    /// Phase 3 overlay, or `None` for the pristine Phase 2b path.
+    overlay: Option<&'a EditOverlay>,
     grouped: HashMap<(CellId, ChunkId), Vec<Transform>>,
+    /// Cells emitted this frame that the overlay edits — their base chunks are
+    /// marked `dirty` so tessellation drops the suppressed shapes.
+    dirty_cells: std::collections::HashSet<CellId>,
     set: VisibleSet,
 }
 
@@ -146,6 +233,13 @@ impl CullCtx<'_> {
         // metric — that query (and the lazy index build it triggers) is the bulk
         // of a fit-view frame on a real chip, and the renderer never needs it.
         if !cell.chunks.is_empty() {
+            // Phase 3: flag cells the overlay edits so their base chunks are
+            // re-tessellated with suppressed shapes removed. One hash lookup, only
+            // for emitted cells and only when an overlay is present — the pristine
+            // path (overlay = None) never runs this.
+            if self.overlay.map_or(false, |o| o.edits_cell(id)) {
+                self.dirty_cells.insert(id);
+            }
             if self.count_visible {
                 let local_view = world_tf.inverse().apply_bboxf(&self.view);
                 self.set.stats.visible_shapes += cell.index().count(&local_view) as u64;

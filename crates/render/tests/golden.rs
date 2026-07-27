@@ -33,12 +33,14 @@
 //! fluideda-render --test golden` after an *intended* visual change, and eyeball
 //! the diff before committing.
 
-use fluideda_core::{cull, Bboxf};
+use fluideda_core::{cull, cull_with_overlay, Bboxf, EditOverlay, Polygon};
 use fluideda_render::{Camera, HierRenderer};
 use glam::Vec2;
 
 const HIER: &[u8] = include_bytes!("../../../assets/hier.gds");
 const SKY130: &str = "../../testdata/sky130_fd_sc_hd_merged.gds";
+/// Tiny fixture whose TOP cell has direct editable shapes (see gen_edit_fixture.py).
+const EDIT_FIXTURE: &[u8] = include_bytes!("../../../assets/edit_fixture.gds");
 
 /// Reference resolution. Smaller than shot.rs's 1000² so the committed PNGs stay
 /// a few KB each; still ample to catch a dropped record (a missing cell is
@@ -204,6 +206,242 @@ async fn render_file_async(_label: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)>
         out.push((name.to_string(), pixels));
     }
     out
+}
+
+/// Phase 3 edit-overlay goldens. Renders the fixture (whose TOP cell has direct
+/// shapes) at fit under four overlays and checks:
+///   * the empty overlay renders **byte-identical** to the no-overlay path
+///     (the composite must be a true no-op when nothing is edited);
+///   * a known move and a known delete match committed reference PNGs;
+///   * the move and delete actually changed the picture (guards against a
+///     silent no-op edit passing by rendering the base).
+#[test]
+fn edit_overlay_goldens() {
+    let frames = pollster::block_on(render_edit_frames());
+    let get = |name: &str| -> &Vec<u8> { &frames.iter().find(|(n, _)| *n == name).unwrap().1 };
+
+    // Empty overlay must be a true no-op: exact byte match to the base (cull),
+    // not merely within tolerance.
+    assert_eq!(
+        get("base"),
+        get("empty"),
+        "empty overlay must render byte-identical to the no-overlay path"
+    );
+
+    check_one("edit_base", get("base"));
+    check_one("edit_moved", get("moved"));
+    check_one("edit_deleted", get("deleted"));
+
+    // Sanity: the edits must actually move pixels, or the goldens prove nothing.
+    let (moved_changed, _) = diff(get("moved"), get("base"));
+    let (deleted_changed, _) = diff(get("deleted"), get("base"));
+    assert!(
+        moved_changed as f64 / (W * H) as f64 > 0.01,
+        "move changed only {moved_changed} px — suspiciously close to a no-op"
+    );
+    assert!(
+        deleted_changed as f64 / (W * H) as f64 > 0.005,
+        "delete changed only {deleted_changed} px — suspiciously close to a no-op"
+    );
+}
+
+/// Render the edit fixture at fit under: no overlay ("base"), an empty overlay
+/// ("empty"), a moved shape 0 ("moved"), a deleted shape 2 ("deleted").
+async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
+    let db = fluideda_core::gds::load_gds_db(EDIT_FIXTURE).expect("parse fixture");
+    let top = db.top;
+    let wb = db.world_bbox();
+    let (cx, cy) = ((wb.min_x + wb.max_x) * 0.5, (wb.min_y + wb.max_y) * 0.5);
+    let span = wb.width().max(wb.height()) * 1.05;
+
+    // Move shape 0 by a large, obvious delta; delete shape 2.
+    let s0 = base_shape(&db, top, 0);
+    let mut moved = EditOverlay::new();
+    moved.move_shape((top, 0), fluideda_core::edit::translate(s0.layer, &s0.points, 1200, 700));
+    let mut deleted = EditOverlay::new();
+    deleted.delete((top, 2));
+    let empty = EditOverlay::new();
+
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions::default())
+        .await
+        .expect("no wgpu adapter");
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor::default(), None)
+        .await
+        .expect("request_device");
+
+    let overlays: [(&'static str, Option<&EditOverlay>); 4] = [
+        ("base", None),
+        ("empty", Some(&empty)),
+        ("moved", Some(&moved)),
+        ("deleted", Some(&deleted)),
+    ];
+    let mut out = Vec::new();
+    for (name, overlay) in overlays {
+        let px = render_frame(&device, &queue, &db, cx, cy, span, overlay);
+        out.push((name, px));
+    }
+    out
+}
+
+/// An owned copy of base shape `idx` in `cell` (for building a moved copy).
+fn base_shape(db: &fluideda_core::CellDb, cell: usize, idx: usize) -> Polygon {
+    let s = &db.cell(cell).shapes;
+    Polygon { layer: s.layer(idx), points: s.points(idx).to_vec() }
+}
+
+/// Render one fit frame of `db` with an optional overlay, mirroring the app's
+/// compositing exactly: cull (with overlay), tessellate dirty base chunks with
+/// suppressions, tessellate the overlay geometry, draw. Returns RGBA pixels.
+fn render_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    db: &fluideda_core::CellDb,
+    cx: f64,
+    cy: f64,
+    span: f64,
+    overlay: Option<&EditOverlay>,
+) -> Vec<u8> {
+    let mut renderer = HierRenderer::new(device, FORMAT);
+    let mut cam = Camera::new(Vec2::new(W as f32, H as f32));
+    cam.center = Vec2::new(cx as f32, cy as f32);
+    cam.scale = W as f32 / span as f32;
+    cam.world_origin = cam.center;
+
+    let half_w = span * 0.5;
+    let half_h = half_w * (H as f64 / W as f64);
+    let vp = Bboxf::new(cx - half_w, cy - half_h, cx + half_w, cy + half_h);
+
+    let vs = match overlay {
+        Some(o) => cull_with_overlay(db, &vp, cam.scale as f64, MIN_PIXEL, o),
+        None => cull(db, &vp, cam.scale as f64, MIN_PIXEL),
+    };
+    for d in &vs.draws {
+        let key = (d.cell, d.chunk);
+        if renderer.has_chunk(key) {
+            continue;
+        }
+        let cell = &db.cells[d.cell];
+        let chunk = &cell.chunks[d.chunk as usize];
+        let meshes = if d.dirty {
+            // Dirty chunk: re-tessellate without the overlay's suppressed shapes.
+            let empty = std::collections::HashSet::new();
+            let suppressed = overlay.and_then(|o| o.suppressed_in(d.cell)).unwrap_or(&empty);
+            fluideda_core::tessellate_chunk_filtered(&cell.shapes, chunk, suppressed)
+        } else {
+            fluideda_core::tessellate_chunk(&cell.shapes, chunk)
+        };
+        renderer.upload_chunk(device, key, &meshes);
+    }
+    // Overlay geometry (moved copies + adds), tessellated and uploaded on top.
+    if !vs.overlay.is_empty() {
+        let meshes = fluideda_core::tessellate_shapes(&vs.overlay);
+        renderer.upload_overlay(device, &meshes);
+    }
+    renderer.prepare(device, queue, &cam, &vs);
+
+    read_frame(device, queue, &renderer)
+}
+
+/// Draw a prepared renderer to an offscreen target and read back RGBA pixels.
+fn read_frame(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &HierRenderer) -> Vec<u8> {
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("edit-target"),
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let tview = target.create_view(&Default::default());
+    let bytes_per_row = (W * 4).div_ceil(256) * 256;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("edit-readback"),
+        size: (bytes_per_row * H) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("edit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &tview,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.06, b: 0.08, a: 1.0 }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        renderer.draw(&mut pass);
+    }
+    enc.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &readback,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(H),
+            },
+        },
+        wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+    );
+    queue.submit([enc.finish()]);
+
+    let slice = readback.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv().unwrap().unwrap();
+    let data = slice.get_mapped_range();
+    let mut pixels = Vec::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        let row = (y * bytes_per_row) as usize;
+        pixels.extend_from_slice(&data[row..row + (W * 4) as usize]);
+    }
+    drop(data);
+    readback.unmap();
+    pixels
+}
+
+/// Golden-check a single named image (same tolerance as [`check_all`]).
+fn check_one(name: &str, pixels: &[u8]) {
+    let path = golden_path(name, "fit");
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        write_png(&path, pixels);
+        eprintln!("wrote golden {}", path.display());
+        return;
+    }
+    let reference = read_png(&path).unwrap_or_else(|e| {
+        panic!(
+            "missing golden {} ({e}). Capture with UPDATE_GOLDEN=1 cargo test \
+             -p fluideda-render --test golden",
+            path.display()
+        )
+    });
+    let (changed, worst) = diff(pixels, &reference);
+    let frac = changed as f64 / (W * H) as f64;
+    eprintln!("{name}: {changed} px changed ({:.4}%), worst channel Δ {worst}", frac * 100.0);
+    assert!(
+        frac <= FRAC_TOL,
+        "{name}: {:.4}% pixels changed (> {:.4}% tol), worst Δ {worst}",
+        frac * 100.0,
+        FRAC_TOL * 100.0
+    );
 }
 
 fn golden_path(file: &str, view: &str) -> std::path::PathBuf {
