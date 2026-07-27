@@ -8,7 +8,10 @@ use crate::design::{self, Design, Metrics};
 use crate::paint::{init_renderer, renderer_mut, LayoutPaint};
 use crate::webio::{self, LoadSlot};
 use eframe::egui;
-use fluideda_core::{cull, CellDb, CellId, ChunkId, CullStats, Layer, VisibleSet};
+use fluideda_core::{
+    cull, cull_with_overlay, pick_in_cell, BaseShapeId, CellDb, CellId, ChunkId, CullStats,
+    EditOverlay, Layer, Point, VisibleSet,
+};
 use fluideda_render::Camera;
 use fluideda_sync::{color_from_id, Marker, Presence, Session};
 use glam::Vec2;
@@ -55,6 +58,20 @@ pub struct FluidApp {
     tess_accum_ms: f64,
     /// Cumulative uploaded GPU geometry bytes so far.
     gpu_bytes: usize,
+
+    // --- Phase 3 editing ---
+    /// Copy-on-write edits over the immutable base. Empty ⇒ pristine Phase 2b
+    /// render path (the cull hot path is unchanged; see `recull`).
+    overlay: EditOverlay,
+    /// When on, a left-click selects a TOP-cell shape instead of doing nothing;
+    /// pan/zoom still work. Move/delete of the selection arrive in step 3.
+    edit_mode: bool,
+    /// The currently selected base shape (TOP cell only, this skeleton).
+    selected: Option<BaseShapeId>,
+    /// Overlay geometry needs re-upload (set when the overlay changed).
+    overlay_dirty: bool,
+    /// Last hit-test latency, shown in the panel (the lazy-index-build cost).
+    last_pick_us: f64,
 
     session: Option<Session>,
     name: String,
@@ -105,6 +122,11 @@ impl FluidApp {
             uploaded: HashSet::new(),
             tess_accum_ms: 0.0,
             gpu_bytes: 0,
+            overlay: EditOverlay::new(),
+            edit_mode: false,
+            selected: None,
+            overlay_dirty: false,
+            last_pick_us: 0.0,
             session: None,
             name: "guest".to_string(),
             last_frame: 0.0,
@@ -131,12 +153,27 @@ impl FluidApp {
         self.uploaded.clear();
         self.tess_accum_ms = 0.0;
         self.gpu_bytes = 0;
+        // A fresh design has its own shape ids — drop any edits/selection.
+        self.overlay = EditOverlay::new();
+        self.selected = None;
+        self.overlay_dirty = false;
 
         if let Some(rs) = frame.wgpu_render_state() {
             init_renderer(rs);
             self.renderer_ready = true;
         }
         self.awaiting_first_frame = true;
+    }
+
+    /// Hit-test a world point against the TOP cell and update the selection.
+    /// TOP is at identity, so world nm == TOP-local nm (skeleton scope cut).
+    fn pick_at(&mut self, world: Vec2) {
+        let top = self.db.top;
+        let p = Point::new(world.x.round() as i32, world.y.round() as i32);
+        let t = web_time::Instant::now();
+        let hit = pick_in_cell(self.db.cell(top), p);
+        self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
+        self.selected = hit.map(|idx| (top, idx));
     }
 
     /// Tessellate + upload any visible cell **chunk** not yet on the GPU (lazy).
@@ -248,11 +285,15 @@ impl FluidApp {
         let cy = self.camera.center.y as f64;
         let view = fluideda_core::Bboxf::new(cx - half_w, cy - half_h, cx + half_w, cy + half_h);
         // Hot path uses the uncounted cull; only the opt-in debug readout pays for
-        // the per-cell index queries that fill visible_shapes.
+        // the per-cell index queries that fill visible_shapes. When there are edits
+        // we composite the overlay — but only then, so an unedited design takes the
+        // exact Phase 2b path (the "unedited cull time unchanged" requirement).
         let vs = if self.debug_stats {
             fluideda_core::cull_counted(&self.db, &view, self.camera.scale as f64, MIN_PIXEL)
-        } else {
+        } else if self.overlay.is_empty() {
             cull(&self.db, &view, self.camera.scale as f64, MIN_PIXEL)
+        } else {
+            cull_with_overlay(&self.db, &view, self.camera.scale as f64, MIN_PIXEL, &self.overlay)
         };
         self.cull_stats = vs.stats;
         self.visible = Arc::new(vs);
@@ -393,6 +434,19 @@ impl FluidApp {
             });
 
             ui.separator();
+            ui.label("Editing");
+            ui.checkbox(&mut self.edit_mode, "Edit mode (click to select)");
+            match self.selected {
+                Some((cell, idx)) => ui.small(format!("selected: cell {cell}, shape {idx}")),
+                None => ui.small("selected: (none)"),
+            };
+            if self.last_pick_us > 0.0 {
+                ui.small(format!("last hit-test: {:.0} µs", self.last_pick_us));
+            }
+            let edits = self.overlay.deleted.len() + self.overlay.edited.len();
+            ui.small(format!("edits: {edits}"));
+
+            ui.separator();
             if ui.button("Fit view").clicked() {
                 self.camera.fit(self.bbox_min, self.bbox_max);
             }
@@ -437,6 +491,15 @@ impl FluidApp {
                 }
             }
 
+            // Edit mode: a plain click selects a TOP-cell shape (drag still pans,
+            // so navigation is unaffected). Clicking empty space deselects.
+            if self.edit_mode && resp.clicked() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
+                    self.pick_at(self.camera.screen_to_world(local));
+                }
+            }
+
             if self.renderer_ready {
                 ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
                     rect,
@@ -448,6 +511,27 @@ impl FluidApp {
             }
 
             let painter = ui.painter_at(rect);
+
+            // Highlight the selected shape's outline (screen-space; TOP is at
+            // identity so its shape points are world nm directly). Uses the moved
+            // copy's geometry when the selection has been moved, so the highlight
+            // tracks the shape.
+            if let Some((cell, idx)) = self.selected {
+                let moved = self.overlay.edited.get(&(cell, idx));
+                let pts: Vec<Point> = match moved {
+                    Some(shape) => shape.points.clone(),
+                    None => self.db.cell(cell).shapes.points(idx as usize).to_vec(),
+                };
+                let screen: Vec<egui::Pos2> = pts
+                    .iter()
+                    .map(|p| self.world_to_screen(Vec2::new(p.x as f32, p.y as f32), rect))
+                    .collect();
+                if screen.len() >= 2 {
+                    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 230, 0));
+                    painter.add(egui::Shape::closed_line(screen, stroke));
+                }
+            }
+
             if let Some(s) = self.session.as_ref() {
                 for (_, pres) in s.remote.iter() {
                     let sp = self.world_to_screen(pres.cursor, rect);

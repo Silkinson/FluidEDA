@@ -73,6 +73,15 @@ impl ShapeIndex {
         let env = AABB::from_corners([query.min_x, query.min_y], [query.max_x, query.max_y]);
         self.tree.locate_in_envelope_intersecting(&env).count()
     }
+
+    /// Indices of shapes whose bbox contains `(x, y)` — the hit-test candidate set
+    /// (Phase 3). Only a bbox test; the caller refines with point-in-polygon.
+    pub fn at_point(&self, x: f64, y: f64) -> Vec<u32> {
+        self.tree
+            .locate_all_at_point(&[x, y])
+            .map(|e| e.data)
+            .collect()
+    }
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ pub mod edit;
 pub mod gds;
 pub mod gds_stream;
 pub mod index;
+pub mod pick;
 pub mod store;
 pub mod tess;
 pub mod transform;
@@ -35,6 +36,7 @@ pub use cull::{cull, cull_counted, cull_with_overlay, CellDraw, CullStats, Visib
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
 pub use edit::{BaseShapeId, EditOverlay, Shape};
 pub use index::ShapeIndex;
+pub use pick::{pick_in_cell, point_in_polygon};
 pub use store::ShapeStore;
 pub use tess::{tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_shapes, LayerMesh};
 pub use transform::{Bboxf, Transform};
