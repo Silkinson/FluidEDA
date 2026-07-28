@@ -4,6 +4,7 @@
 Cargo.lock
 .DS_Store
 .trunk
+.claude/
 
 # Phase 1.5 real-chip test data (fetched via scripts/fetch_testdata.sh)
 /testdata/
