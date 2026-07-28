@@ -153,7 +153,36 @@ pub struct CellDb {
     local_bboxes: Vec<Bbox>,
 }
 
+impl Cell {
+    /// Reconstruct a cell from already-computed parts (Phase 2b worker transfer):
+    /// name, chunked shape store, instances, and chunk table. The R-tree index is
+    /// **not** transferred — it stays a lazy `OnceCell`, rebuilt on the main
+    /// thread on first query exactly as for a locally-parsed cell.
+    pub fn from_parts(name: String, shapes: ShapeStore, instances: Vec<Instance>, chunks: Vec<Chunk>) -> Self {
+        Self { name, shapes, instances, chunks, index: OnceCell::new() }
+    }
+}
+
 impl CellDb {
+    /// Reconstruct a `CellDb` from parts the worker already computed — cells (each
+    /// with its chunked store), the top id, and the precomputed local bboxes.
+    /// `by_name` is cheap to rebuild from the cell names, so it is not transferred.
+    /// Does **no** geometry work (no chunking, no bbox recompute): that all
+    /// happened in the worker.
+    pub fn from_parts(cells: Vec<Cell>, top: CellId, local_bboxes: Vec<Bbox>) -> Self {
+        let by_name = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), i))
+            .collect();
+        CellDb { cells, top, by_name, local_bboxes }
+    }
+
+    /// The precomputed local bbox column, for serialization (Phase 2b worker).
+    pub fn local_bbox_column(&self) -> &[Bbox] {
+        &self.local_bboxes
+    }
+
     pub fn cell(&self, id: CellId) -> &Cell {
         &self.cells[id]
     }

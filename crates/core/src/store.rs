@@ -84,6 +84,28 @@ impl ShapeStore {
         &self.layers
     }
 
+    /// The three raw columns, for zero-work serialization (Phase 2b worker
+    /// transfer). Everything here is `Pod`, so a serializer casts these straight
+    /// to bytes with no per-shape traversal.
+    pub fn columns(&self) -> (&[i32], &[u32], &[Layer]) {
+        (&self.coords, &self.starts, &self.layers)
+    }
+
+    /// Rebuild a store from its raw columns (the inverse of [`columns`]). Used to
+    /// reconstruct a cell on the main thread from the worker's transferred
+    /// buffers. Trusts the columns as an already-valid store (as the worker
+    /// produced them); `starts` must have `layers.len() + 1` entries and end at
+    /// `coords.len() / 2`.
+    pub fn from_columns(coords: Vec<i32>, starts: Vec<u32>, layers: Vec<Layer>) -> Self {
+        debug_assert_eq!(starts.len(), layers.len() + 1, "starts must be layers+1");
+        debug_assert_eq!(
+            starts.last().copied().unwrap_or(0) as usize * 2,
+            coords.len(),
+            "starts must end at coords.len()/2"
+        );
+        Self { coords, starts, layers }
+    }
+
     /// Bbox of shape `i` (cell-local nm).
     pub fn bbox_of(&self, i: usize) -> Bbox {
         let mut b = Bbox::empty();
