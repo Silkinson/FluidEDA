@@ -41,6 +41,8 @@ pub struct FluidApp {
 
     // runtime loading
     load_slot: LoadSlot,
+    /// Worker-parsed designs land here (Phase 2b STEP 2); drained before load_slot.
+    design_slot: webio::DesignSlot,
     load_instant: web_time::Instant,
     awaiting_first_frame: bool,
     status: String,
@@ -111,11 +113,17 @@ impl FluidApp {
         camera.fit(design.bbox_min, design.bbox_max);
 
         let load_slot: LoadSlot = Rc::new(RefCell::new(None));
+        let design_slot: webio::DesignSlot = Rc::new(RefCell::new(None));
 
-        // Web: honor ?file=<url> by fetching it into the load slot.
+        // Web: honor ?file=<url>. Prefer the off-main-thread worker parse; the URL
+        // path streams the bytes straight into the worker (no main-thread copy).
         if let Some(url) = webio::query_file() {
             log::info!("autoloading ?file={url}");
-            webio::spawn_fetch(url, load_slot.clone());
+            if webio::worker_supported() {
+                webio::spawn_worker_fetch(url, design_slot.clone());
+            } else {
+                webio::spawn_fetch(url, load_slot.clone());
+            }
         }
 
         let mut app = Self {
@@ -131,6 +139,7 @@ impl FluidApp {
             total_shapes: design.total_shapes,
             metrics: design.metrics,
             load_slot,
+            design_slot,
             load_instant: web_time::Instant::now(),
             awaiting_first_frame: true, // measure TTFF for the default too
             status: String::new(),
@@ -375,6 +384,19 @@ impl FluidApp {
 
     /// Consume any pending drag-drop / fetched / picked file.
     fn drain_loads(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 0. Worker-parsed design ready (Phase 2b STEP 2). Drained first so a
+        //    freshly reconstructed design installs immediately.
+        let worker_done = self.design_slot.borrow_mut().take();
+        if let Some(res) = worker_done {
+            match res {
+                Ok(design) => {
+                    self.install(design, frame);
+                    self.status.clear();
+                }
+                Err(e) => self.status = format!("load failed: {e}"),
+            }
+        }
+
         // egui drag-and-drop (bytes on web, path on native).
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
@@ -392,17 +414,23 @@ impl FluidApp {
             }
         }
 
-        // Async slot (fetch / picker) — take at most one per frame.
+        // Byte slot (drag-drop / picker). Take at most one per frame. On web with
+        // worker support, hand the bytes off-thread instead of parsing here.
         let pending = self.load_slot.borrow_mut().take();
         if let Some((name, bytes)) = pending {
-            self.status = format!("loading {name} ({} KB)…", bytes.len() / 1024);
             self.load_instant = web_time::Instant::now();
-            match design::load_design(&name, &bytes) {
-                Ok(design) => {
-                    self.install(design, frame);
-                    self.status.clear();
+            if webio::worker_supported() {
+                self.status = format!("parsing {name} ({} KB) in worker…", bytes.len() / 1024);
+                webio::spawn_worker_bytes(name, bytes, self.design_slot.clone());
+            } else {
+                self.status = format!("loading {name} ({} KB)…", bytes.len() / 1024);
+                match design::load_design(&name, &bytes) {
+                    Ok(design) => {
+                        self.install(design, frame);
+                        self.status.clear();
+                    }
+                    Err(e) => self.status = format!("parse failed: {e}"),
                 }
-                Err(e) => self.status = format!("parse failed: {e}"),
             }
         }
     }

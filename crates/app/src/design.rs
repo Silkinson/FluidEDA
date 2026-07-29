@@ -6,7 +6,7 @@
 //! memory metrics. On wasm the metrics are also pushed to `window` and the
 //! console so the Playwright bench can read them.
 
-use fluideda_core::{CellDb, Layer};
+use fluideda_core::{CellDb, DbColumns, Layer};
 use web_time::Instant;
 
 /// Everything the app needs to render one design, plus how expensive it was.
@@ -38,11 +38,74 @@ pub struct Metrics {
     pub vertex_bytes: usize,
     pub index_bytes: usize,
     pub wasm_heap_bytes: usize,
-    /// Wasm linear-memory size sampled **immediately after parse**, before any
-    /// tessellation/index work. Because wasm memory only ever grows, this equals
-    /// the parse transient high-water — the number Phase 2b step 3 targets
-    /// (1.68 GB with gds21's whole-library intermediate). 0 on native.
+    /// Wasm linear-memory high-water of the **parse** (wasm memory never shrinks,
+    /// so this is the transient peak). Sync path: the main thread's heap after
+    /// parse. Worker path (Phase 2b STEP 2): the *worker's* heap — parse no longer
+    /// touches the main thread. Combined peak = this + `wasm_heap_bytes` (main).
     pub parse_heap_bytes: usize,
+    /// True when the design was parsed in a Web Worker off the main thread.
+    pub worker_used: bool,
+    /// Main-thread wall time to rebuild the CellDb from the worker's buffers
+    /// (worker path only) — the one load-time frame the main thread still spends.
+    pub reconstruct_ms: f64,
+}
+
+/// Everything the parse worker sends back: the four serialized columns plus the
+/// summary it computed (so the main thread doesn't rescan 3.9 M shapes). The
+/// worker path builds a [`Design`] from this via [`reconstruct`].
+pub struct WorkerMsg {
+    pub name: String,
+    pub file_bytes: usize,
+    pub coords: Vec<i32>,
+    pub starts: Vec<u32>,
+    pub layers: Vec<u32>,
+    pub meta: Vec<u8>,
+    pub bbox: [f64; 4],
+    pub total_shapes: u64,
+    pub distinct_polys: usize,
+    pub cell_defs: usize,
+    pub layers_packed: Vec<u32>,
+    pub parse_ms: f64,
+    pub worker_heap_bytes: usize,
+}
+
+/// Rebuild a `Design` on the main thread from the worker's transferred buffers.
+/// Does the columnar deserialize (a memcpy per column) and adopts the worker's
+/// precomputed summary — no reparse, no shape rescan.
+pub fn reconstruct(m: WorkerMsg) -> anyhow::Result<Design> {
+    let t = Instant::now();
+    let cols = DbColumns { coords: m.coords, starts: m.starts, layers: m.layers, meta: m.meta };
+    let db = fluideda_core::deserialize(cols)?;
+    let reconstruct_ms = t.elapsed().as_secs_f64() * 1e3;
+
+    let layers = m
+        .layers_packed
+        .iter()
+        .map(|&v| Layer::new((v & 0xffff) as u16, (v >> 16) as u16))
+        .collect();
+
+    let metrics = Metrics {
+        name: m.name,
+        file_bytes: m.file_bytes,
+        parse_ms: m.parse_ms,
+        cell_defs: m.cell_defs,
+        distinct_polys: m.distinct_polys,
+        flattened: m.total_shapes,
+        wasm_heap_bytes: wasm_heap_bytes(), // main-thread heap after reconstruction
+        parse_heap_bytes: m.worker_heap_bytes, // the parse peak now lives in the worker
+        worker_used: true,
+        reconstruct_ms,
+        ..Default::default()
+    };
+
+    Ok(Design {
+        db,
+        layers,
+        bbox_min: glam::Vec2::new(m.bbox[0] as f32, m.bbox[1] as f32),
+        bbox_max: glam::Vec2::new(m.bbox[2] as f32, m.bbox[3] as f32),
+        total_shapes: m.total_shapes,
+        metrics,
+    })
 }
 
 /// Parse only. Tessellation is now **lazy** (Phase 2a STEP 3): the app
@@ -138,7 +201,7 @@ impl Metrics {
              \"index_ms\":{:.1},\"index_p99_ms\":{:.3},\"index_max_ms\":{:.1},\"ttff_ms\":{:.1},\
              \"cell_defs\":{},\"distinct_polys\":{},\"flattened\":{},\"triangles\":{},\
              \"vertex_bytes\":{},\"index_bytes\":{},\"wasm_heap_bytes\":{},\
-             \"parse_heap_bytes\":{}}}",
+             \"parse_heap_bytes\":{},\"worker_used\":{},\"reconstruct_ms\":{:.1}}}",
             self.name.replace('"', "'"),
             self.file_bytes,
             self.parse_ms,
@@ -155,6 +218,8 @@ impl Metrics {
             self.index_bytes,
             self.wasm_heap_bytes,
             self.parse_heap_bytes,
+            self.worker_used,
+            self.reconstruct_ms,
         )
     }
 

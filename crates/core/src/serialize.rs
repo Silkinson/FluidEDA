@@ -48,12 +48,11 @@ pub struct DbColumns {
     pub meta: Vec<u8>,
 }
 
+/// Pack a `Layer` into one `u32` whose little-endian bytes equal the `Layer`'s
+/// own memory layout, so deserialize can cast the column back with no per-element
+/// work (see `deserialize`).
 fn pack_layer(l: Layer) -> u32 {
     l.layer as u32 | ((l.datatype as u32) << 16)
-}
-
-fn unpack_layer(v: u32) -> Layer {
-    Layer::new((v & 0xffff) as u16, (v >> 16) as u16)
 }
 
 /// Serialize a `CellDb` into transferable columns + metadata.
@@ -141,14 +140,17 @@ pub fn deserialize(cols: DbColumns) -> Result<CellDb> {
         let n_coords = r.u32()? as usize;
         let n_shapes = r.u32()? as usize;
 
-        // Slice this cell's columns out of the concatenated buffers.
+        // Slice this cell's columns out of the concatenated buffers (memcpy each,
+        // not an element loop — the reconstruction runs on the main thread and
+        // must stay inside a frame).
         let c = slice(&coords, &mut coord_off, n_coords)?.to_vec();
         // `starts` holds n_shapes + 1 entries per cell.
         let s = slice(&starts, &mut start_off, n_shapes + 1)?.to_vec();
-        let l = slice(&layers, &mut layer_off, n_shapes)?
-            .iter()
-            .map(|&v| unpack_layer(v))
-            .collect();
+        // A packed layer u32 has the exact little-endian byte layout of `Layer`
+        // (layer | datatype << 16 — see pack_layer), so on any LE target (wasm +
+        // all our natives) this cast is a memcpy, not 3.9 M unpack calls.
+        let lu = slice(&layers, &mut layer_off, n_shapes)?;
+        let l = bytemuck::cast_slice::<u32, Layer>(lu).to_vec();
         let shapes = ShapeStore::from_columns(c, s, l);
 
         let name_len = r.u32()? as usize;

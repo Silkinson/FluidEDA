@@ -27,7 +27,10 @@ self.onmessage = async (e) => {
     const starts = result.starts;
     const layers = result.layers;
     const meta = result.meta;
-    // Transfer the four columns' backing buffers (no copy across the boundary).
+    const layer_set = result.layer_set;
+    const world_bbox = result.world_bbox; // Float64Array [minx,miny,maxx,maxy]
+    // Transfer the big columns' backing buffers (no copy across the boundary);
+    // the small summary comes along by value.
     self.postMessage(
       {
         type: 'done',
@@ -35,10 +38,15 @@ self.onmessage = async (e) => {
         starts: starts.buffer,
         layers: layers.buffer,
         meta: meta.buffer,
+        layer_set: layer_set.buffer,
+        world_bbox: [world_bbox[0], world_bbox[1], world_bbox[2], world_bbox[3]],
+        total_shapes: result.total_shapes,
+        distinct_polys: result.distinct_polys,
+        cell_defs: result.cell_defs,
         worker_heap_bytes: result.worker_heap_bytes,
         parse_ms: result.parse_ms,
       },
-      [coords.buffer, starts.buffer, layers.buffer, meta.buffer]
+      [coords.buffer, starts.buffer, layers.buffer, meta.buffer, layer_set.buffer]
     );
     result.free();
   } catch (err) {

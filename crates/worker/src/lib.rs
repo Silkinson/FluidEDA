@@ -29,6 +29,15 @@ mod wasm {
         meta: Uint8Array,
         worker_heap_bytes: f64,
         parse_ms: f64,
+        // Summary the app would otherwise recompute on the main thread — layers
+        // (all_layers is an 80 ms scan of every shape's layer on caravel), the
+        // world bbox, and shape counts. Computed here (in the worker) so main-
+        // thread reconstruction stays inside one frame.
+        world_bbox: Vec<f64>, // [min_x, min_y, max_x, max_y]
+        total_shapes: f64,
+        distinct_polys: f64,
+        cell_defs: f64,
+        layer_set: Uint32Array, // distinct layers, packed (layer | datatype<<16)
     }
 
     #[wasm_bindgen]
@@ -59,6 +68,27 @@ mod wasm {
         pub fn parse_ms(&self) -> f64 {
             self.parse_ms
         }
+        /// `[min_x, min_y, max_x, max_y]` world bbox in nm.
+        #[wasm_bindgen(getter)]
+        pub fn world_bbox(&self) -> Vec<f64> {
+            self.world_bbox.clone()
+        }
+        #[wasm_bindgen(getter)]
+        pub fn total_shapes(&self) -> f64 {
+            self.total_shapes
+        }
+        #[wasm_bindgen(getter)]
+        pub fn distinct_polys(&self) -> f64 {
+            self.distinct_polys
+        }
+        #[wasm_bindgen(getter)]
+        pub fn cell_defs(&self) -> f64 {
+            self.cell_defs
+        }
+        #[wasm_bindgen(getter)]
+        pub fn layer_set(&self) -> Uint32Array {
+            self.layer_set.clone()
+        }
     }
 
     /// Parse GDS bytes into a serialized `CellDb`. Runs entirely in the worker.
@@ -73,6 +103,21 @@ mod wasm {
         let parse_ms = now_ms() - t0;
 
         let cols = fluideda_core::serialize(&db);
+
+        // Summary the main thread would otherwise recompute (all_layers alone is
+        // ~80 ms on caravel). Cheap here since the db is in hand.
+        let wb = db.world_bbox();
+        let world_bbox = vec![wb.min_x, wb.min_y, wb.max_x, wb.max_y];
+        let total_shapes = db.flat_shape_count() as f64;
+        let distinct_polys = db.cells.iter().map(|c| c.shapes.len()).sum::<usize>() as f64;
+        let cell_defs = db.cells.len() as f64;
+        let packed: Vec<u32> = db
+            .all_layers()
+            .iter()
+            .map(|l| l.layer as u32 | ((l.datatype as u32) << 16))
+            .collect();
+        let layer_set = Uint32Array::from(&packed[..]);
+
         // Sample the high-water AFTER parse+serialize (worst case both alive).
         let worker_heap_bytes = wasm_heap_bytes();
 
@@ -83,7 +128,19 @@ mod wasm {
         let layers = Uint32Array::from(&cols.layers[..]);
         let meta = Uint8Array::from(&cols.meta[..]);
 
-        Ok(ParseResult { coords, starts, layers, meta, worker_heap_bytes, parse_ms })
+        Ok(ParseResult {
+            coords,
+            starts,
+            layers,
+            meta,
+            worker_heap_bytes,
+            parse_ms,
+            world_bbox,
+            total_shapes,
+            distinct_polys,
+            cell_defs,
+            layer_set,
+        })
     }
 
     /// Current wasm linear-memory size in bytes.
