@@ -1,6 +1,13 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-07-28 · current branch: `phase2b-worker`_
+_Last updated: 2026-07-29 · current branch: `phase4` (integration trunk)_
+
+> `phase4` is the integration trunk. It merges the two finished feature branches
+> that had sat independently on top of `phase3-editing` — `phase2b-worker` (parse
+> worker) and `phase3-real-editing` (hierarchy pick/edit + GDS export) — into one
+> line. Both branched from `b619532`; they are semantically orthogonal (worker owns
+> the load path, editing owns pick/edit state), so the merge keeps both in full.
+> `main` is untouched (owner's choice); all Phase 4 work continues here.
 
 Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 (WebGPU, WebGL2 fallback), compiled to wasm. Full design in
@@ -26,6 +33,7 @@ per-user undo). A committed golden-image test guards the render pipeline.
 | 2b — streaming parser | `phase2b-streaming-parser` | ✅ done | Parse heap 1.68 GB→777 MB, parse 2.4→1.2 s, leaf TTFF 2.6→1.4 s. Byte-identical to gds21 (oracle). Committed golden test |
 | 2b — worker offload | `phase2b-worker` | ✅ done | Plain transferable-buffer worker (stable, no atomics). Parse off main; combined peak ~1.4 GB << 4 GB; parse freeze 1.2 s → ~0 (pannable during parse), residual ~200 ms swap frame |
 | 3 — editing (skeleton) | `phase3-editing` | ✅ done | Copy-on-write overlay, select/move/delete of TOP-cell shapes, incremental re-tess (1 chunk), CRDT sync + per-user undo. Two-browser + golden verified |
+| 3 — real editing | `phase3-real-editing` | ✅ done | SLICE 1: GDS export (round-trip + pixel-match). SLICE 2: non-TOP editing under the transform stack (landmine eliminated), master-edit semantics, finer chunking (edit 22→0.8 ms), two-browser non-TOP convergence |
 | 4 — backend/OASIS/DRC | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
@@ -94,33 +102,43 @@ per-user undo). A committed golden-image test guards the render pipeline.
 - **Scale ceiling:** caravel is hobby-class (half the ~10 M-poly ceiling).
   Production SoCs need out-of-core / server-side tiling — a different memory story
   to decide before committing to that market.
-- **Phase 3 scope cuts to restore** (named in code): editing is TOP-cell-only
-  (dodges hit-testing under a transform stack + the edit-one-AREF-instance-vs-master
-  question); move+delete only (no vertex edit, booleans, draw-new); single
-  selection. When per-cell editing lands, `caravel_core`'s coarse 75k-shape chunks
-  need a finer grid or per-shape mesh diff for sub-16ms edits (TOP is fine at 80 µs).
-- **GDS export of edits not built** — needs flattening base+overlay. The overlay
-  carries the owning CellId per entry so this isn't designed out.
+- ~~Phase 3: editing is TOP-cell-only~~ **RESOLVED** (`phase3-real-editing` SLICE 2):
+  hit-test walks the instance tree under the transform stack (chunk-scan, no R-tree
+  build — landmine *eliminated*, caravel first-click ~2.7 ms). Editing a shape edits
+  the cell **master**, all placements update. caravel_core's coarse 75k-shape chunks
+  are re-partitioned finer *on edit* (index-preserving, CRDT-safe) — edit re-tess
+  22 ms → 0.8 ms. Editing one AREF placement vs the master, vertex edit, draw-new,
+  booleans, DRC remain deferred.
+- ~~GDS export of edits not built~~ **RESOLVED** (`phase3-real-editing` SLICE 1):
+  `write_gds` composites base+overlay → GDSII, round-trip verified through our
+  reader + gds21 + a pixel-match render test. "Save GDS" button.
 - **Late-joiner edit sync** relies on a full-state broadcast on `join`; there is
   no y-sync handshake, so a peer must join before others edit (skeleton limitation,
   same as Phase 0 markers).
 
-## Git hygiene (action needed)
+## Git hygiene
 
-- **Nothing is merged to `main`** — it's still "Initial commit". All phases are a
-  stacked branch chain (`phase0 → 1 → 1.5 → 2a → 2b`). `origin` is missing
-  `phase2b-chunk-worker`. Recommend: merge the chain into `main` so it becomes the
-  real trunk, then branch future work from `main`.
-- `.claude/` shows untracked; add to `.gitignore`.
+- **`main` is intentionally untouched** (owner's choice) — it's still "Initial
+  commit". The real trunk is now **`phase4`**, which merges the full stacked chain
+  (`phase0 → 1 → 1.5 → 2a → 2b`) plus both finished feature branches
+  (`phase2b-worker`, `phase3-real-editing`). All Phase 4 work continues on `phase4`.
+- `origin` is still missing several local branches (`phase2b-chunk-worker`,
+  `phase2b-*`, the phase3 line, `phase4`). Push when ready to share.
+- ~~`.claude/` untracked~~ **RESOLVED** — gitignored in `b619532`.
 
 ## Next step
 
-**Phase 3 real editing** (`phase3-real-editing`, next) — un-defer the skeleton's
-scope cuts, in two slices: (1) GDS export (flatten base+overlay, save), (2) non-TOP
-editing (hit-test under a transform stack, AREF/master semantics, finer chunking
-for sub-16 ms edits on big cells). The overlay model + CRDT + undo carry over.
+**Phase 4 STEP 2 — fit-view tessellation offload (in progress).** The parse worker
+took the parse freeze off the main thread, but fit-view still tessellates the giant
+flat cells on the main thread (~2.5 s freeze). Route that through the worker too:
+main sends `(cell, chunk)` jobs for visible chunks, the worker returns `Pod`
+vertex/index buffers (transferable), main uploads — reusing the lazy `uploaded` /
+`dirty_keys` machinery, with a coarse bbox proxy drawn until real geometry arrives.
+Editing's incremental re-tess routes through the **same** path (the convergence
+point); tiny edit chunks may stay inline if a round-trip is slower (measure).
 
-Smaller follow-ups, deferred: single-copy worker reconstruction (swap frame <100 ms);
-chunk-tessellation in the worker or a fit LOD proxy (the fit-view ~2.5 s freeze);
-progressive render during parse; ~6% fit-view chunking cost on real WebGPU after a
-wgpu upgrade.
+Remaining Phase 3 editing follow-ons (deferred, named in code): edit one AREF
+placement vs. the master; vertex editing; draw-new-shape; booleans; DRC.
+
+Other deferred: single-copy worker reconstruction (swap frame <100 ms); progressive
+render during parse; ~6% fit-view chunking cost on real WebGPU after a wgpu upgrade.

@@ -292,6 +292,50 @@ fn base_shape(db: &fluideda_core::CellDb, cell: usize, idx: usize) -> Polygon {
     Polygon { layer: s.layer(idx), points: s.points(idx).to_vec() }
 }
 
+/// GDS export round-trip renders identically (Phase 3 SLICE 1): an edited design
+/// (base + overlay) and the same design after export→re-import must produce the
+/// same picture. Proves "save your edits and reopen gets you back what you saw."
+#[test]
+fn export_round_trip_renders_identically() {
+    pollster::block_on(async {
+        let db = fluideda_core::gds::load_gds_db(EDIT_FIXTURE).expect("parse fixture");
+        let top = db.top;
+        let wb = db.world_bbox();
+        let (cx, cy) = ((wb.min_x + wb.max_x) * 0.5, (wb.min_y + wb.max_y) * 0.5);
+        let span = wb.width().max(wb.height()) * 1.05;
+
+        // One overlay carrying both an edit kinds: move shape 0, delete shape 2.
+        let s0 = base_shape(&db, top, 0);
+        let mut overlay = EditOverlay::new();
+        overlay.move_shape((top, 0), fluideda_core::edit::translate(s0.layer, &s0.points, 1200, 700));
+        overlay.delete((top, 2));
+
+        // Export the composite, re-import it (a plain design, no overlay).
+        let bytes = fluideda_core::write_gds(&db, &overlay);
+        let reimported = fluideda_core::gds::load_gds_db(&bytes).expect("re-import export");
+
+        let instance = wgpu::Instance::default();
+        let adapter = instance.request_adapter(&Default::default()).await.expect("adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .await
+            .expect("device");
+
+        let edited = render_frame(&device, &queue, &db, cx, cy, span, Some(&overlay));
+        let saved = render_frame(&device, &queue, &reimported, cx, cy, span, None);
+
+        let (changed, worst) = diff(&edited, &saved);
+        let frac = changed as f64 / (W * H) as f64;
+        eprintln!("export round-trip: {changed} px differ ({:.4}%), worst Δ {worst}", frac * 100.0);
+        assert!(
+            frac <= FRAC_TOL,
+            "exported+reimported render differs from the edited view by {:.4}% (> {:.4}% tol)",
+            frac * 100.0,
+            FRAC_TOL * 100.0
+        );
+    });
+}
+
 /// Render one fit frame of `db` with an optional overlay, mirroring the app's
 /// compositing exactly: cull (with overlay), tessellate dirty base chunks with
 /// suppressions, tessellate the overlay geometry, draw. Returns RGBA pixels.

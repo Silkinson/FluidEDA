@@ -9,8 +9,8 @@ use crate::paint::{init_renderer, renderer_mut, LayoutPaint};
 use crate::webio::{self, LoadSlot};
 use eframe::egui;
 use fluideda_core::{
-    cull, cull_with_overlay, pick_in_cell, BaseShapeId, CellDb, CellId, ChunkId, CullStats,
-    EditOverlay, Layer, Point, VisibleSet,
+    cull, cull_with_overlay, pick_hierarchy, BaseShapeId, CellDb, CellId, ChunkId, CullStats,
+    EditOverlay, Layer, Point, Transform, VisibleSet,
 };
 use fluideda_render::Camera;
 use fluideda_sync::{color_from_id, EditKind, Marker, Presence, Session};
@@ -65,13 +65,19 @@ pub struct FluidApp {
     /// Copy-on-write edits over the immutable base. Empty ⇒ pristine Phase 2b
     /// render path (the cull hot path is unchanged; see `recull`).
     overlay: EditOverlay,
-    /// When on, a left-click selects a TOP-cell shape instead of doing nothing;
-    /// pan/zoom still work. Move/delete of the selection arrive in step 3.
+    /// When on, a left-click selects the shape under the cursor (any cell, through
+    /// the instance hierarchy) and drag/nudge/delete edit it; pan/zoom still work.
     edit_mode: bool,
-    /// The currently selected base shape (TOP cell only, this skeleton).
+    /// The currently selected base shape — a cell **master** + shape index; editing
+    /// it updates every placement of that cell (SLICE 2: any cell, not just TOP).
     selected: Option<BaseShapeId>,
-    /// Current translation (nm) applied to the selection, measured from its base
-    /// position. Accumulated by nudges/drag; the moved copy is always base+this.
+    /// World transform of the placement that was clicked, for the highlight and for
+    /// mapping a world-space drag into the selected cell's local frame. Identity
+    /// for a TOP-cell selection.
+    selected_tf: Transform,
+    /// Current translation applied to the selection, in the selected cell's LOCAL
+    /// nm, measured from its base. Accumulated by nudges/drag; the moved copy is
+    /// always base + this (so it round-trips through the CRDT as "M dx dy").
     move_delta: (i32, i32),
     /// World point where a move-drag began (`None` when not dragging a shape).
     drag_move_from: Option<Vec2>,
@@ -81,6 +87,9 @@ pub struct FluidApp {
     /// suppressions) on the next `ensure_uploaded`. Only these rebuild, not the
     /// whole cell: the incremental-edit property.
     dirty_keys: HashSet<(CellId, ChunkId)>,
+    /// Cells whose chunk table was just re-partitioned (finer, on first big-cell
+    /// edit): the renderer must drop all their now-stale (cell, old-chunk) buffers.
+    renderer_drop_cells: HashSet<CellId>,
     /// Overlay geometry needs re-upload (set when the overlay changed).
     overlay_dirty: bool,
     /// Last hit-test latency, shown in the panel (the lazy-index-build cost).
@@ -151,10 +160,12 @@ impl FluidApp {
             overlay: EditOverlay::new(),
             edit_mode: false,
             selected: None,
+            selected_tf: Transform::IDENTITY,
             move_delta: (0, 0),
             drag_move_from: None,
             drag_move_base: (0, 0),
             dirty_keys: HashSet::new(),
+            renderer_drop_cells: HashSet::new(),
             overlay_dirty: false,
             last_pick_us: 0.0,
             last_edit_chunks: 0,
@@ -194,9 +205,11 @@ impl FluidApp {
         // design). Editing/undo keep working immediately.
         self.overlay = EditOverlay::new();
         self.selected = None;
+        self.selected_tf = Transform::IDENTITY;
         self.move_delta = (0, 0);
         self.drag_move_from = None;
         self.dirty_keys.clear();
+        self.renderer_drop_cells.clear();
         self.overlay_dirty = false;
         self.session = Session::new(Presence {
             cursor: Vec2::ZERO,
@@ -222,24 +235,35 @@ impl FluidApp {
         self.awaiting_first_frame = true;
     }
 
-    /// Hit-test a world point against the TOP cell and update the selection.
-    /// TOP is at identity, so world nm == TOP-local nm (skeleton scope cut).
+    /// Hit-test a world point through the instance hierarchy and update the
+    /// selection. Resolves to a cell **master** + shape, plus the clicked
+    /// placement's world transform (SLICE 2 — any cell, under a transform stack).
     fn pick_at(&mut self, world: Vec2) {
-        let top = self.db.top;
         let p = Point::new(world.x.round() as i32, world.y.round() as i32);
         let t = web_time::Instant::now();
-        let hit = pick_in_cell(self.db.cell(top), p);
+        let hit = pick_hierarchy(&self.db, p);
         self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
-        self.selected = hit.map(|idx| (top, idx));
-        // Seed the move delta from any existing move of the newly selected shape,
-        // so a nudge/drag continues from where it sits rather than snapping back.
-        self.move_delta = self.selected.map_or((0, 0), |id| self.existing_delta(id));
+        match hit {
+            Some(h) => {
+                self.selected = Some(h.id);
+                self.selected_tf = h.world_tf;
+                self.move_delta = self.existing_delta(h.id);
+            }
+            None => {
+                self.selected = None;
+                self.selected_tf = Transform::IDENTITY;
+                self.move_delta = (0, 0);
+            }
+        }
     }
 
-    /// Does world point `w` land inside the selection's *current* geometry (the
-    /// moved copy if moved, else the base)? Used to decide drag = move vs pan.
+    /// Does world point `w` land inside the selection's *current* geometry? Tests
+    /// in the selected cell's local frame (inverse-mapping through the placement's
+    /// transform), against the moved copy if moved else the base. Decides drag =
+    /// move vs pan.
     fn point_hits(&self, id: BaseShapeId, w: Vec2) -> bool {
-        let p = Point::new(w.x.round() as i32, w.y.round() as i32);
+        let (lx, ly) = self.selected_tf.inverse().apply(w.x as f64, w.y as f64);
+        let p = Point::new(lx.round() as i32, ly.round() as i32);
         match self.overlay.edited.get(&id) {
             Some(moved) => fluideda_core::point_in_polygon(&moved.points, p),
             None => fluideda_core::point_in_polygon(self.db.cell(id.0).shapes.points(id.1 as usize), p),
@@ -283,11 +307,27 @@ impl FluidApp {
         self.reconcile_edits();
     }
 
-    /// Nudge step (nm): a visible fraction of the design, so panel nudges are
-    /// obvious at any zoom. Kept modest so repeated nudges stay on-screen.
+    /// Nudge step in the selected cell's LOCAL nm — a visible fraction of the
+    /// design, divided by the placement's scale so the on-screen move is the same
+    /// size regardless of how deep (and scaled) the selected cell is.
     fn nudge_step(&self) -> i32 {
-        let w = (self.bbox_max.x - self.bbox_min.x).max(1.0);
-        ((w * 0.02) as i32).max(1)
+        let world = (self.bbox_max.x - self.bbox_min.x).max(1.0) as f64 * 0.02;
+        let scale = self.selected_tf.scale_factor().max(1e-9);
+        ((world / scale) as i32).max(1)
+    }
+
+    /// Convert a world-space delta into the selected cell's local frame (apply the
+    /// inverse of the placement's linear part). For a TOP selection (identity) this
+    /// is the identity.
+    fn world_delta_to_local(&self, wdx: f64, wdy: f64) -> (i32, i32) {
+        let t = &self.selected_tf;
+        let det = t.a * t.d - t.b * t.c;
+        if det.abs() < 1e-12 {
+            return (wdx.round() as i32, wdy.round() as i32);
+        }
+        let ldx = (t.d * wdx - t.c * wdy) / det;
+        let ldy = (-t.b * wdx + t.a * wdy) / det;
+        (ldx.round() as i32, ldy.round() as i32)
     }
 
     /// Nudge the selection by `(dx, dy)` on top of its current move delta (a
@@ -308,6 +348,17 @@ impl FluidApp {
         }
     }
 
+    /// Export the current design (base composited with the edit overlay) to GDSII
+    /// and save it (web: download; native: write a file). Phase 3 SLICE 1.
+    fn save_gds(&mut self) {
+        let bytes = fluideda_core::write_gds(&self.db, &self.overlay);
+        let name = out_name(&self.metrics.name);
+        match webio::save_bytes(&name, &bytes) {
+            Ok(()) => self.status = format!("saved {name} ({} KB)", bytes.len() / 1024),
+            Err(e) => self.status = format!("save failed: {e}"),
+        }
+    }
+
     /// Undo the last local edit (per-user; a peer's edits are never on our undo
     /// stack) and reconcile the overlay from the reverted CRDT state.
     fn do_undo(&mut self) {
@@ -325,12 +376,37 @@ impl FluidApp {
         }
     }
 
-    /// Mark the chunk that owns `id`'s base shape for re-tessellation, and flag
-    /// the overlay geometry for re-upload. This is the whole of "incremental":
-    /// one chunk (of possibly dozens in the cell) rebuilds, not the cell.
+    /// Nudge target: keep an edited chunk small enough to re-tessellate under a
+    /// frame. caravel_core's coarse ~35–75 k-shape chunks are re-tessellated whole
+    /// on each edit (~20–43 ms); splitting the touched chunk to this size brings a
+    /// single-shape edit to ~1–2 ms. Only large chunks of *edited* cells are split.
+    const EDIT_CHUNK_TARGET: usize = 3000;
+
+    /// Mark the chunk that owns `id`'s base shape for re-tessellation, and flag the
+    /// overlay geometry for re-upload — the "incremental" property: one chunk
+    /// rebuilds, not the cell. If that chunk is large (a big flat cell like
+    /// caravel_core), first split it into finer contiguous sub-chunks so the
+    /// re-tessellation stays under a frame; the split preserves shape indices, so
+    /// it is safe for the CRDT and can happen independently on each peer.
     fn invalidate(&mut self, id: BaseShapeId) {
         if let Some(chunk) = self.db.cell(id.0).chunk_of(id.1) {
-            self.dirty_keys.insert((id.0, chunk));
+            let big = {
+                let c = &self.db.cells[id.0].chunks[chunk as usize];
+                (c.end - c.start) as usize > Self::EDIT_CHUNK_TARGET
+            };
+            if big {
+                // Splitting shifts this cell's chunk ids, so drop all its uploads;
+                // ensure_uploaded rebuilds the (now finer) visible chunks.
+                self.db.cells[id.0].subdivide_chunk(chunk as usize, Self::EDIT_CHUNK_TARGET);
+                self.uploaded.retain(|&(c, _)| c != id.0);
+                self.dirty_keys.retain(|&(c, _)| c != id.0);
+                self.renderer_drop_cells.insert(id.0);
+                if let Some(fine) = self.db.cell(id.0).chunk_of(id.1) {
+                    self.dirty_keys.insert((id.0, fine));
+                }
+            } else {
+                self.dirty_keys.insert((id.0, chunk));
+            }
         }
         self.overlay_dirty = true;
     }
@@ -347,9 +423,14 @@ impl FluidApp {
 
         // Phase 3 invalidation: drop the chunks an edit dirtied so the loop below
         // re-tessellates just those (with suppressions), not the whole cell.
-        let editing = !self.dirty_keys.is_empty() || self.overlay_dirty;
+        let editing = !self.dirty_keys.is_empty() || self.overlay_dirty || !self.renderer_drop_cells.is_empty();
         let edit_t = web_time::Instant::now();
         let mut rebuilt = 0usize;
+        // A re-partitioned cell (SLICE 2 finer chunking) shifted its chunk ids —
+        // drop all its stale GPU buffers before re-uploading the finer chunks.
+        for cell in self.renderer_drop_cells.drain() {
+            renderer.drop_cell(cell);
+        }
         for key in self.dirty_keys.drain() {
             renderer.drop_chunk(key);
             self.uploaded.remove(&key);
@@ -526,13 +607,14 @@ impl FluidApp {
         if new.deleted == self.overlay.deleted && new.edited == self.overlay.edited {
             return; // nothing edit-related changed (e.g. a marker-only update)
         }
-        for id in changed_ids(&self.overlay, &new) {
-            if let Some(chunk) = self.db.cell(id.0).chunk_of(id.1) {
-                self.dirty_keys.insert((id.0, chunk));
-            }
-        }
+        let changed: Vec<BaseShapeId> = changed_ids(&self.overlay, &new).into_iter().collect();
         self.overlay = new;
-        self.overlay_dirty = true;
+        // Route through the same invalidate() the direct-edit path uses, so a
+        // committed or remote edit of a big cell also triggers the finer-chunking
+        // (SLICE 2) — not just a local drag preview.
+        for id in changed {
+            self.invalidate(id);
+        }
         // Keep the nudge accumulator + highlight in step with the authoritative state.
         if let Some(id) = self.selected {
             self.move_delta = self.existing_delta(id);
@@ -634,6 +716,7 @@ impl FluidApp {
         }
         let top = self.db.top;
         let sel = self.selected.map_or(-1i64, |(_, i)| i as i64);
+        let sel_cell = self.selected.map_or(-1i64, |(c, _)| c as i64);
         // Every edit tombstones its base (move records a copy too), so
         // `deleted` holds ALL edited shapes and `edited` is the moved subset:
         //   edited shapes = deleted.len(); moves = edited.len();
@@ -641,13 +724,14 @@ impl FluidApp {
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"selected\":{},\"top_shapes\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"selected\":{},\"selected_cell\":{},\"top_shapes\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
             moves,
             edited - moves,
             sel,
+            sel_cell,
             self.db.cell(top).shapes.len(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
@@ -665,13 +749,30 @@ impl FluidApp {
             Some("join") => self.connect(),
             Some("edit_mode") => self.edit_mode = true,
             Some("select") => {
-                // `select <idx>` — select a TOP-cell shape by index (dodges needing
-                // pixel-accurate clicks in the harness).
-                if let Some(idx) = parts.next().and_then(|s| s.parse::<u32>().ok()) {
-                    if (idx as usize) < self.db.cell(top).shapes.len() {
-                        self.selected = Some((top, idx));
-                        self.move_delta = self.existing_delta((top, idx));
-                    }
+                // `select <idx>` selects a TOP shape; `select <cell> <idx>` selects
+                // a specific master (SLICE 2 non-TOP editing). The placement
+                // transform is left identity — fine for the headless CRDT test,
+                // which drives moves/deletes keyed by (cell, idx) and checks
+                // convergence, not pixels.
+                let a = parts.next().and_then(|s| s.parse::<u32>().ok());
+                let b = parts.next().and_then(|s| s.parse::<u32>().ok());
+                let (cell, idx) = match (a, b) {
+                    (Some(c), Some(i)) => (c as usize, i),
+                    (Some(i), None) => (top, i),
+                    _ => return,
+                };
+                if cell < self.db.cells.len() && (idx as usize) < self.db.cell(cell).shapes.len() {
+                    self.selected = Some((cell, idx));
+                    self.selected_tf = Transform::IDENTITY;
+                    self.move_delta = self.existing_delta((cell, idx));
+                }
+            }
+            Some("pick") => {
+                // `pick <x> <y>` — run the real hierarchy hit-test at a world point.
+                let x = parts.next().and_then(|s| s.parse::<f32>().ok());
+                let y = parts.next().and_then(|s| s.parse::<f32>().ok());
+                if let (Some(x), Some(y)) = (x, y) {
+                    self.pick_at(Vec2::new(x, y));
                 }
             }
             Some("nudge") => {
@@ -820,6 +921,9 @@ impl FluidApp {
                     self.do_redo();
                 }
             });
+            if ui.button("💾 Save GDS").clicked() {
+                self.save_gds();
+            }
 
             ui.separator();
             if ui.button("Fit view").clicked() {
@@ -853,12 +957,12 @@ impl FluidApp {
                 if let (Some(from), Some(id), Some(p)) =
                     (self.drag_move_from, self.selected, resp.interact_pointer_pos())
                 {
+                    // World drag delta → the selected cell's LOCAL frame (the move
+                    // is stored cell-local), so at the clicked placement the shape
+                    // follows the cursor even under rotation/scale.
                     let d = world_at(p, &self.camera) - from;
-                    self.preview_move(
-                        id,
-                        self.drag_move_base.0 + d.x.round() as i32,
-                        self.drag_move_base.1 + d.y.round() as i32,
-                    );
+                    let (ldx, ldy) = self.world_delta_to_local(d.x as f64, d.y as f64);
+                    self.preview_move(id, self.drag_move_base.0 + ldx, self.drag_move_base.1 + ldy);
                 } else if !shift {
                     let d = resp.drag_delta();
                     self.camera.pan_pixels(d.x, d.y);
@@ -926,10 +1030,10 @@ impl FluidApp {
 
             let painter = ui.painter_at(rect);
 
-            // Highlight the selected shape's outline (screen-space; TOP is at
-            // identity so its shape points are world nm directly). Uses the moved
-            // copy's geometry when the selection has been moved, so the highlight
-            // tracks the shape.
+            // Highlight the selected shape's outline at the clicked placement:
+            // cell-local points → world (via the placement transform) → screen.
+            // Uses the moved copy's geometry when the selection has been moved, so
+            // the highlight tracks the shape.
             if let Some((cell, idx)) = self.selected {
                 let moved = self.overlay.edited.get(&(cell, idx));
                 let pts: Vec<Point> = match moved {
@@ -938,7 +1042,10 @@ impl FluidApp {
                 };
                 let screen: Vec<egui::Pos2> = pts
                     .iter()
-                    .map(|p| self.world_to_screen(Vec2::new(p.x as f32, p.y as f32), rect))
+                    .map(|p| {
+                        let (wx, wy) = self.selected_tf.apply_point(*p);
+                        self.world_to_screen(Vec2::new(wx as f32, wy as f32), rect)
+                    })
                     .collect();
                 if screen.len() >= 2 {
                     let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 230, 0));
@@ -970,6 +1077,14 @@ impl FluidApp {
         let d = (world - self.camera.center) * self.camera.scale;
         egui::pos2(rect.min.x + half.x + d.x, rect.min.y + half.y - d.y)
     }
+}
+
+/// Export filename derived from the loaded file's name: `caravel.gds` →
+/// `caravel-edited.gds`. Strips any parenthetical suffix (e.g. the embedded label).
+fn out_name(loaded: &str) -> String {
+    let base = loaded.split_whitespace().next().unwrap_or("design");
+    let stem = base.strip_suffix(".gds").unwrap_or(base);
+    format!("{stem}-edited.gds")
 }
 
 fn server_url() -> String {

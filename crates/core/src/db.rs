@@ -111,6 +111,44 @@ impl Cell {
         self.shapes.distinct_layers()
     }
 
+    /// Split chunk `ci` into contiguous sub-chunks of at most `fine_target` shapes
+    /// each, so a later single-shape edit re-tessellates only ~`fine_target` shapes
+    /// instead of the whole (coarse) chunk. Phase 3 SLICE 2 incremental fix for big
+    /// flat cells (caravel_core's ~35–75 k-shape chunks are too coarse for a
+    /// sub-16 ms edit).
+    ///
+    /// Contiguous ranges ⇒ shape indices are **unchanged** (the store is not
+    /// reordered), so this is safe for the CRDT (`BaseShapeId` stability) and can
+    /// be applied independently on each peer. No-op if the chunk is already small
+    /// enough. Reads only chunk `ci`'s shapes to bound the sub-bboxes (~1 ms for a
+    /// 35 k-shape chunk), not the whole cell.
+    pub fn subdivide_chunk(&mut self, ci: usize, fine_target: usize) {
+        let chunk = self.chunks[ci];
+        let n = (chunk.end - chunk.start) as usize;
+        if n <= fine_target || fine_target == 0 {
+            return;
+        }
+        let parts = n.div_ceil(fine_target);
+        let per = (n.div_ceil(parts)).max(1) as u32;
+        let mut subs = Vec::with_capacity(parts);
+        let mut s = chunk.start;
+        while s < chunk.end {
+            let e = (s + per).min(chunk.end);
+            let mut bbox = Bbox::empty();
+            for i in s..e {
+                let b = self.shapes.bbox_of(i as usize);
+                if b.min.x > b.max.x {
+                    continue; // degenerate shape
+                }
+                bbox.expand(b.min);
+                bbox.expand(b.max);
+            }
+            subs.push(Chunk { start: s, end: e, bbox });
+            s = e;
+        }
+        self.chunks.splice(ci..ci + 1, subs);
+    }
+
     /// Which chunk owns shape `idx`. Chunks are contiguous, sorted, and cover
     /// every shape (Phase 2b invariant), so this is a binary search. Used by the
     /// editor to invalidate exactly the chunk an edit touches (Phase 3), not the

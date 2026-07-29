@@ -118,6 +118,7 @@ fn cull_inner(
         overlay,
         grouped: HashMap::new(),
         dirty_cells: std::collections::HashSet::new(),
+        edited_placements: HashMap::new(),
         set: VisibleSet::default(),
     };
     ctx.walk(db.top, Transform::IDENTITY);
@@ -140,32 +141,56 @@ fn cull_inner(
     }
     ctx.set.stats.proxy_count = ctx.set.proxies.len();
 
-    // Emit overlay geometry (moved copies + added). Skeleton scope: TOP cell only,
-    // drawn at identity — so world nm == the shapes' stored (TOP-local) nm. A
-    // viewport bbox test keeps this cheap even as edits accumulate.
+    // Emit overlay geometry (moved copies + added), in world nm, at EVERY placement
+    // of each edited cell — so an edit to a cell master shows at all its instances
+    // (the base half of every move is suppressed at all placements too, via the
+    // cell-local dirty chunk). For the TOP cell this is one placement at identity,
+    // so it reduces to the skeleton's behavior byte-for-byte.
+    let edited_placements = std::mem::take(&mut ctx.edited_placements);
     if let Some(o) = overlay {
-        emit_overlay(o, db.top, view, &mut ctx.set.overlay);
+        emit_overlay(o, &edited_placements, view, &mut ctx.set.overlay);
     }
 
     ctx.set
 }
 
-/// Collect the overlay's moved/added shapes for the top cell that fall in `view`.
-fn emit_overlay(overlay: &EditOverlay, top: CellId, view: &Bboxf, out: &mut Vec<Shape>) {
-    let mut push_if_visible = |s: &Shape| {
-        if shape_in_view(s, view) {
-            out.push(s.clone());
+/// Collect the overlay's moved/added shapes, each transformed to world at every
+/// placement of its owning cell, that fall in `view`.
+fn emit_overlay(
+    overlay: &EditOverlay,
+    placements: &HashMap<CellId, Vec<Transform>>,
+    view: &Bboxf,
+    out: &mut Vec<Shape>,
+) {
+    let mut emit = |cell: CellId, shape: &Shape| {
+        let Some(tfs) = placements.get(&cell) else { return };
+        for tf in tfs {
+            let world = transform_shape(shape, tf);
+            if shape_in_view(&world, view) {
+                out.push(world);
+            }
         }
     };
     for (&(cell, _), shape) in &overlay.edited {
-        if cell == top {
-            push_if_visible(shape);
-        }
+        emit(cell, shape);
     }
     for (cell, shape) in &overlay.added {
-        if *cell == top {
-            push_if_visible(shape);
-        }
+        emit(*cell, shape);
+    }
+}
+
+/// Apply `tf` to every point of a cell-local shape, producing a world-nm shape.
+fn transform_shape(s: &Shape, tf: &Transform) -> Shape {
+    Shape {
+        layer: s.layer,
+        points: s
+            .points
+            .iter()
+            .map(|&p| {
+                let (x, y) = tf.apply_point(p);
+                crate::types::Point::new(x.round() as i32, y.round() as i32)
+            })
+            .collect(),
     }
 }
 
@@ -200,6 +225,9 @@ struct CullCtx<'a> {
     /// Cells emitted this frame that the overlay edits — their base chunks are
     /// marked `dirty` so tessellation drops the suppressed shapes.
     dirty_cells: std::collections::HashSet<CellId>,
+    /// World transforms at which each edited cell is drawn this frame — where the
+    /// overlay's moved/added geometry must be emitted (one entry per placement).
+    edited_placements: HashMap<CellId, Vec<Transform>>,
     set: VisibleSet,
 }
 
@@ -234,11 +262,13 @@ impl CullCtx<'_> {
         // of a fit-view frame on a real chip, and the renderer never needs it.
         if !cell.chunks.is_empty() {
             // Phase 3: flag cells the overlay edits so their base chunks are
-            // re-tessellated with suppressed shapes removed. One hash lookup, only
-            // for emitted cells and only when an overlay is present — the pristine
-            // path (overlay = None) never runs this.
+            // re-tessellated with suppressed shapes removed, and record this
+            // placement so the overlay's moved/added geometry is drawn here too.
+            // One hash lookup, only for emitted cells and only when an overlay is
+            // present — the pristine path (overlay = None) never runs this.
             if self.overlay.map_or(false, |o| o.edits_cell(id)) {
                 self.dirty_cells.insert(id);
+                self.edited_placements.entry(id).or_default().push(world_tf);
             }
             if self.count_visible {
                 let local_view = world_tf.inverse().apply_bboxf(&self.view);
@@ -338,7 +368,8 @@ impl CullCtx<'_> {
 
 /// Transform for array element `(c,r)`: base placement plus the parent-frame
 /// lattice offset (a pure translation, so it only shifts the base translation).
-fn placement(base: &Transform, col_step: [f64; 2], row_step: [f64; 2], c: i32, r: i32) -> Transform {
+/// `pub(crate)` so the hit-test walk ([`crate::pick`]) can place AREF elements.
+pub(crate) fn placement(base: &Transform, col_step: [f64; 2], row_step: [f64; 2], c: i32, r: i32) -> Transform {
     let mut t = *base;
     t.tx += c as f64 * col_step[0] + r as f64 * row_step[0];
     t.ty += c as f64 * col_step[1] + r as f64 * row_step[1];
@@ -350,8 +381,10 @@ fn placement(base: &Transform, col_step: [f64; 2], row_step: [f64; 2], c: i32, r
 /// the viewport rectangle (expanded by one element's footprint) into lattice
 /// (col,row) space and taking the bounding range; the per-element `walk` then
 /// drops any conservative extras via its own intersect test.
+/// `pub(crate)` so the hit-test walk ([`crate::pick`]) can find the AREF elements
+/// under a point by passing a tiny box around it.
 #[allow(clippy::too_many_arguments)]
-fn visible_range(
+pub(crate) fn visible_range(
     view: &Bboxf,
     parent_world: Transform,
     base: Transform,

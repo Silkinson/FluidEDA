@@ -168,6 +168,49 @@ pub fn spawn_picker(slot: LoadSlot) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_picker(_slot: LoadSlot) {}
 
+/// Save `bytes` as a download named `name` (Phase 3 SLICE 1 — export edits).
+/// Wraps the bytes in a Blob and clicks a transient `<a download>`.
+#[cfg(target_arch = "wasm32")]
+pub fn save_bytes(name: &str, bytes: &[u8]) -> Result<(), String> {
+    use wasm_bindgen::{JsCast, JsValue};
+    let win = web_sys::window().ok_or("no window")?;
+    let doc = win.document().ok_or("no document")?;
+
+    // Blob from the bytes (one Uint8Array copy into a JS-owned buffer).
+    let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+    arr.copy_from(bytes);
+    let parts = js_sys::Array::of1(&arr.buffer());
+    let opts = web_sys::BlobPropertyBag::new();
+    opts.set_type("application/octet-stream");
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)
+        .map_err(|e| format!("blob: {e:?}"))?;
+
+    let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(|e| format!("url: {e:?}"))?;
+    let a = doc
+        .create_element("a")
+        .map_err(|e| format!("a: {e:?}"))?
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| "anchor cast".to_string())?;
+    a.set_href(&url);
+    a.set_download(name);
+    let _ = a.style().set_property("display", "none");
+    let _ = doc.body().ok_or("no body")?.append_child(&a);
+    a.click();
+    let _ = doc.body().unwrap().remove_child(&a);
+    let _ = web_sys::Url::revoke_object_url(&url);
+    let _ = JsValue::NULL;
+    Ok(())
+}
+
+/// Native: write `bytes` to `name` in the current directory. (The GUI has no file
+/// dialog wired; a headless exporter would take an explicit --out path.)
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_bytes(name: &str, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(name, bytes).map_err(|e| e.to_string())?;
+    log::info!("wrote {} ({} bytes)", name, bytes.len());
+    Ok(())
+}
+
 /// Minimal percent-decode for the query value (enough for file paths/URLs).
 #[cfg(target_arch = "wasm32")]
 fn js_decode(s: &str) -> String {
