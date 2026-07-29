@@ -16,11 +16,10 @@ command_arguments = ["scripts/build_worker.sh"]
 address = "127.0.0.1"
 port = 8080
 
-# Cross-origin isolation (required for SharedArrayBuffer + wasm threads in Phase 2).
-# Trunk expects `headers` as a single map of name = value, not [[serve.headers]] tables.
-[serve.headers]
-"Cross-Origin-Opener-Policy" = "same-origin"
-"Cross-Origin-Embedder-Policy" = "require-corp"
+# NOTE: no COOP/COEP headers. They were set for the abandoned shared-heap worker
+# (they enable SharedArrayBuffer via cross-origin isolation). The shipped worker
+# is a plain transferable-buffer worker, so cross-origin isolation is not needed —
+# and dropping COEP:require-corp avoids its subresource CORP requirement.
 
 # Proxy the collaboration WebSocket to the relay (Phase 0 server on :9000), so the
 # page and its socket share one origin. The app connects to ws://<host>/ws.

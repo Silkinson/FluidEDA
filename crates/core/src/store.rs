@@ -11,8 +11,9 @@
 //!      shape*; caravel has 3.9 M shapes, so that overhead alone ran to ~120 MB.
 //!      Here a shape costs one `u32` offset + one 4-byte `Layer`.
 //!   3. **It is plain bytes.** Every column is `Pod` — no pointers, no enums, no
-//!      `Vec` headers — so the store can back onto a `SharedArrayBuffer` and be
-//!      read by a worker and the main thread with zero copies.
+//!      `Vec` headers — so a parse worker can serialize the store to transferable
+//!      `ArrayBuffer`s (`bytemuck::cast_slice`, a memcpy) and hand it to the main
+//!      thread with no traversal (Phase 2b STEP 2; see `crate::serialize`).
 //!
 //! Coordinates stay `i32` nm throughout; nothing here casts to float except the
 //! bbox helpers, which use `f64` (exact for `i32` inputs).
