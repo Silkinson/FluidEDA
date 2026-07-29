@@ -1,6 +1,10 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-07-26 · current branch: `phase3-editing`_
+_Last updated: 2026-07-28 · current branch: `phase3-real-editing`_
+
+> Note: two feature branches sit on top of `phase3-editing` independently —
+> `phase2b-worker` (parse worker) and `phase3-real-editing` (this one). Each is a
+> separate deliverable; neither includes the other.
 
 Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 (WebGPU, WebGL2 fallback), compiled to wasm. Full design in
@@ -26,6 +30,7 @@ golden-image test guards the render pipeline (now incl. move/delete goldens).
 | 2b — streaming parser | `phase2b-streaming-parser` | ✅ done | Parse heap 1.68 GB→777 MB, parse 2.4→1.2 s, leaf TTFF 2.6→1.4 s. Byte-identical to gds21 (oracle). Committed golden test |
 | 2b — worker offload | — | ⏸ after parser | Now a plain transferable-buffer worker on **stable** (STEP 3 killed the shared-heap requirement). Hides remaining ~1.2 s parse |
 | 3 — editing (skeleton) | `phase3-editing` | ✅ done | Copy-on-write overlay, select/move/delete of TOP-cell shapes, incremental re-tess (1 chunk), CRDT sync + per-user undo. Two-browser + golden verified |
+| 3 — real editing | `phase3-real-editing` | ✅ done | SLICE 1: GDS export (round-trip + pixel-match). SLICE 2: non-TOP editing under the transform stack (landmine eliminated), master-edit semantics, finer chunking (edit 22→0.8 ms), two-browser non-TOP convergence |
 | 4 — backend/OASIS/DRC | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
@@ -85,13 +90,16 @@ golden-image test guards the render pipeline (now incl. move/delete goldens).
 - **Scale ceiling:** caravel is hobby-class (half the ~10 M-poly ceiling).
   Production SoCs need out-of-core / server-side tiling — a different memory story
   to decide before committing to that market.
-- **Phase 3 scope cuts to restore** (named in code): editing is TOP-cell-only
-  (dodges hit-testing under a transform stack + the edit-one-AREF-instance-vs-master
-  question); move+delete only (no vertex edit, booleans, draw-new); single
-  selection. When per-cell editing lands, `caravel_core`'s coarse 75k-shape chunks
-  need a finer grid or per-shape mesh diff for sub-16ms edits (TOP is fine at 80 µs).
-- **GDS export of edits not built** — needs flattening base+overlay. The overlay
-  carries the owning CellId per entry so this isn't designed out.
+- ~~Phase 3: editing is TOP-cell-only~~ **RESOLVED** (`phase3-real-editing` SLICE 2):
+  hit-test walks the instance tree under the transform stack (chunk-scan, no R-tree
+  build — landmine *eliminated*, caravel first-click ~2.7 ms). Editing a shape edits
+  the cell **master**, all placements update. caravel_core's coarse 75k-shape chunks
+  are re-partitioned finer *on edit* (index-preserving, CRDT-safe) — edit re-tess
+  22 ms → 0.8 ms. Editing one AREF placement vs the master, vertex edit, draw-new,
+  booleans, DRC remain deferred.
+- ~~GDS export of edits not built~~ **RESOLVED** (`phase3-real-editing` SLICE 1):
+  `write_gds` composites base+overlay → GDSII, round-trip verified through our
+  reader + gds21 + a pixel-match render test. "Save GDS" button.
 - **Late-joiner edit sync** relies on a full-state broadcast on `join`; there is
   no y-sync handshake, so a peer must join before others edit (skeleton limitation,
   same as Phase 0 markers).
@@ -106,16 +114,16 @@ golden-image test guards the render pipeline (now incl. move/delete goldens).
 
 ## Next step
 
-Two independent threads of work are now unblocked; pick by priority:
+The stacked feature branches (`phase2b-worker`, `phase3-real-editing`) are ready to
+**merge into `main`** — nothing is on `main` yet (see Git hygiene). Merge order does
+not matter (they touch disjoint areas: worker = load path; real-editing = pick/edit).
 
-1. **Worker offload (Phase 2b STEP 2)** — a plain stable-Rust transferable-buffer
-   worker (STEP 3 removed the shared-heap requirement: ~0.8 GB parse peak, so a
-   parse-and-copy worker peaks ~1.2 GB, under 4 GB). Takes the remaining ~1.2 s
-   parse freeze off the main thread. No nightly / build-std / atomics.
-2. **Phase 3 real editing** — un-defer the skeleton's scope cuts: editing in
-   non-TOP cells (hit-test under a transform stack; finer chunking for sub-16ms
-   edits on big cells), vertex editing, draw-new-shape, booleans, DRC, GDS export
-   of the overlay. The overlay model + CRDT + undo carry straight over.
+Remaining Phase 3 editing follow-ons (deferred, named in code): edit one AREF
+placement vs. the master; vertex editing; draw-new-shape; booleans; DRC. Editing
+follow-up: the finer-chunking first-edit still re-tessellates the *visible* chunks of
+a re-partitioned big cell — fine when zoomed in (viewport-bounded), a hitch only if
+you edit caravel_core at fit (you can't — shapes are sub-pixel there).
 
-Deferred: progressive render during streaming parse; the ~6% fit-view chunking
-cost on real WebGPU after a wgpu upgrade.
+Other deferred: single-copy worker reconstruction (swap frame <100 ms);
+chunk-tessellation in the worker / fit LOD proxy (fit-view ~2.5 s freeze); progressive
+render during parse; ~6% fit-view chunking cost on real WebGPU after a wgpu upgrade.

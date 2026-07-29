@@ -288,6 +288,16 @@ impl HierRenderer {
         }
     }
 
+    /// Forget every uploaded chunk of `cell`. Used when a cell's chunk table is
+    /// re-partitioned (SLICE 2 finer chunking on edit) and its old chunk ids no
+    /// longer match cull's output.
+    pub fn drop_cell(&mut self, cell: CellId) {
+        let keys: Vec<ChunkKey> = self.cells.keys().copied().filter(|&(c, _)| c == cell).collect();
+        for key in keys {
+            self.drop_chunk(key);
+        }
+    }
+
     /// Replace the edit-overlay geometry (Phase 3). `meshes` are per-layer meshes
     /// in **world nm**; the renderer draws them on top of the base with one
     /// identity, origin-rebased instance. Tiny by construction (a handful of

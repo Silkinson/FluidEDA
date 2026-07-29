@@ -38,7 +38,7 @@ pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
 pub use edit::{BaseShapeId, EditOverlay, Shape};
 pub use gds_write::write_gds;
 pub use index::ShapeIndex;
-pub use pick::{pick_in_cell, point_in_polygon};
+pub use pick::{pick_hierarchy, pick_in_cell, point_in_polygon, PickHit};
 pub use store::ShapeStore;
 pub use tess::{tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_shapes, LayerMesh};
 pub use transform::{Bboxf, Transform};

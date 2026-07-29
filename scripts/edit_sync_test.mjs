@@ -84,6 +84,17 @@ async function main() {
     const bu = await waitFor(B, (s) => s.edited === 2, 'B: sees A\'s undo');
     check(au.deletes === 0 && au.moves === 2, 'A undo removed the delete, kept both moves');
     check(bu.deletes === 0 && bu.moves === 2, 'B reflects A\'s undo (per-user: B\'s move intact)');
+
+    // 4. NON-TOP editing (SLICE 2): edit a shape in the LEAF *child* cell (id 0),
+    //    not TOP. The CRDT op is cell-scoped ("cell:idx"), so it must converge the
+    //    same way — proving hierarchy editing syncs with no protocol change.
+    await cmd(A, 'select 0 0');
+    const asel = await waitFor(A, (s) => s.selected_cell === 0, 'A selected a non-TOP (LEAF) shape');
+    check(asel.selected === 0, 'selection resolved to LEAF shape 0');
+    await cmd(A, 'nudge');
+    const a4 = await waitFor(A, (s) => s.edited === 3, 'A recorded the non-TOP move');
+    const b4 = await waitFor(B, (s) => s.edited === 3, 'B sees the non-TOP move');
+    check(a4.moves === 3 && b4.moves === 3, 'non-TOP (LEAF) edit converges A→B (cell-scoped CRDT)');
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {
