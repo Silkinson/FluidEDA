@@ -92,6 +92,25 @@ impl ShapeStore {
         (&self.coords, &self.starts, &self.layers)
     }
 
+    /// The column slices a tessellation job needs for chunk `start..end` (Phase 4
+    /// STEP 2 — off-main-thread tessellation).
+    ///
+    /// `coords` (interleaved x,y) and packed `layers` are **borrowed** straight out
+    /// of this store, shipped to the worker as-is; only `starts` is rebased to 0
+    /// (owned, `len == n + 1`) so the worker indexes the coord slice directly.
+    /// Feeds [`crate::tessellate_columns`], which reads them exactly as
+    /// [`crate::tessellate_chunk`] reads this store — so an offloaded chunk and an
+    /// inline chunk tessellate identically. Cheap: two slices plus `n + 1` small
+    /// integers, no geometry copy on the main thread.
+    pub fn chunk_columns(&self, start: u32, end: u32) -> (&[i32], Vec<u32>, &[u32]) {
+        let (s, e) = (start as usize, end as usize);
+        let base = self.starts[s];
+        let coords = &self.coords[self.starts[s] as usize * 2..self.starts[e] as usize * 2];
+        let starts: Vec<u32> = self.starts[s..=e].iter().map(|&x| x - base).collect();
+        let layers: &[u32] = cast_slice(&self.layers[s..e]);
+        (coords, starts, layers)
+    }
+
     /// Rebuild a store from its raw columns (the inverse of [`columns`]). Used to
     /// reconstruct a cell on the main thread from the worker's transferred
     /// buffers. Trusts the columns as an already-valid store (as the worker

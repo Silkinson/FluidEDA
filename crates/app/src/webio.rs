@@ -390,3 +390,146 @@ fn get_u32_vec(data: &wasm_bindgen::JsValue, key: &str) -> Vec<u32> {
 fn get_u8_vec(data: &wasm_bindgen::JsValue, key: &str) -> Vec<u8> {
     js_sys::Uint8Array::new(&get_val(data, key)).to_vec()
 }
+
+// --- Phase 4 STEP 2: persistent tessellation worker -------------------------
+//
+// A long-lived worker (separate from the one-shot parse worker) that tessellates
+// chunks off the main thread, so fit-view no longer freezes on the giant flat
+// cells. Each job ships the chunk's raw Pod columns in and transfers finished
+// vertex/index buffers back; the reply is reconstructed here into per-layer
+// meshes the renderer uploads. Unlike the parse worker it is NOT terminated per
+// job — the app keeps one per design and respawns it on load / re-partition.
+
+/// A tessellated chunk from the worker, reconstructed into per-layer meshes on
+/// the main thread and ready for `HierRenderer::upload_chunk`. `gen` stamps the
+/// design/partition epoch it was requested under, so the app drops stale replies.
+pub struct TessReply {
+    pub cell: usize,
+    pub chunk: u32,
+    pub gen: u32,
+    pub meshes: Vec<fluideda_core::LayerMesh>,
+}
+
+/// Completed tessellation jobs land here for the app to drain each frame (like
+/// [`DesignSlot`], but a queue — several chunks can finish between frames).
+pub type TessSlot = Rc<RefCell<Vec<TessReply>>>;
+
+#[cfg(target_arch = "wasm32")]
+const TESS_WORKER_URL: &str = "assets/worker/tess_worker.js";
+
+/// Handle to the persistent tessellation worker plus its live `onmessage`
+/// closure. Dropping it terminates the worker (reclaiming its wasm memory and
+/// discarding any in-flight jobs) — how the app invalidates on a new load.
+#[cfg(target_arch = "wasm32")]
+pub struct TessWorker {
+    worker: web_sys::Worker,
+    _onmessage: wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl TessWorker {
+    /// Spawn the tessellation worker; completed jobs push into `slot`.
+    pub fn new(slot: TessSlot) -> Result<Self, String> {
+        use wasm_bindgen::closure::Closure;
+        use wasm_bindgen::JsCast;
+        let worker =
+            web_sys::Worker::new(TESS_WORKER_URL).map_err(|e| format!("tess worker spawn: {e:?}"))?;
+        let onmessage =
+            Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
+                let data = e.data();
+                match get_str(&data, "type").as_deref() {
+                    Some("tess_done") => slot.borrow_mut().push(reconstruct_tess(&data)),
+                    Some("tess_error") => {
+                        log::error!("tess worker: {}", get_str(&data, "message").unwrap_or_default())
+                    }
+                    _ => {}
+                }
+            });
+        worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        Ok(Self { worker, _onmessage: onmessage })
+    }
+
+    /// Dispatch a chunk-tessellation job. The three columns are copied once into
+    /// JS buffers and **transferred** (moved) to the worker; `cell`/`chunk`/`gen`
+    /// ride along so the reply can be keyed and staleness-checked.
+    pub fn post(&self, cell: usize, chunk: u32, gen: u32, coords: &[i32], starts: &[u32], layers: &[u32]) {
+        use wasm_bindgen::JsValue;
+        let carr = js_sys::Int32Array::from(coords);
+        let sarr = js_sys::Uint32Array::from(starts);
+        let larr = js_sys::Uint32Array::from(layers);
+        let payload = js_sys::Object::new();
+        let set = |k: &str, v: &JsValue| {
+            let _ = js_sys::Reflect::set(&payload, &k.into(), v);
+        };
+        set("type", &"tess".into());
+        set("cell", &JsValue::from_f64(cell as f64));
+        set("chunk", &JsValue::from_f64(chunk as f64));
+        set("gen", &JsValue::from_f64(gen as f64));
+        set("coords", &carr.buffer());
+        set("starts", &sarr.buffer());
+        set("layers", &larr.buffer());
+        let transfer = js_sys::Array::of3(&carr.buffer(), &sarr.buffer(), &larr.buffer());
+        if let Err(e) = self.worker.post_message_with_transfer(&payload, &transfer) {
+            log::error!("tess post failed: {e:?}");
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for TessWorker {
+    fn drop(&mut self) {
+        self.worker.terminate();
+    }
+}
+
+/// Rebuild the per-layer meshes from a `tess_done` message's transferred buffers:
+/// split the concatenated vertex/index buffers by the per-mesh side tables.
+#[cfg(target_arch = "wasm32")]
+fn reconstruct_tess(data: &wasm_bindgen::JsValue) -> TessReply {
+    use fluideda_core::{Layer, LayerMesh, Vertex};
+    let cell = get_f64(data, "cell") as usize;
+    let chunk = get_f64(data, "chunk") as u32;
+    let gen = get_f64(data, "gen") as u32;
+    let mesh_layers = get_u32_vec(data, "mesh_layers");
+    let vert_counts = get_u32_vec(data, "vert_counts");
+    let index_counts = get_u32_vec(data, "index_counts");
+    let verts = get_f32_vec(data, "verts");
+    let indices = get_u32_vec(data, "indices");
+
+    let mut meshes = Vec::with_capacity(mesh_layers.len());
+    let (mut vo, mut io) = (0usize, 0usize);
+    for i in 0..mesh_layers.len() {
+        let vc = vert_counts[i] as usize;
+        let ic = index_counts[i] as usize;
+        let packed = mesh_layers[i];
+        let layer = Layer::new((packed & 0xffff) as u16, (packed >> 16) as u16);
+        let vertices: Vec<Vertex> = verts[vo..vo + vc]
+            .chunks_exact(2)
+            .map(|c| Vertex { pos: [c[0], c[1]] })
+            .collect();
+        let mesh_indices = indices[io..io + ic].to_vec();
+        meshes.push(LayerMesh { layer, vertices, indices: mesh_indices });
+        vo += vc;
+        io += ic;
+    }
+    TessReply { cell, chunk, gen, meshes }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn get_f32_vec(data: &wasm_bindgen::JsValue, key: &str) -> Vec<f32> {
+    js_sys::Float32Array::new(&get_val(data, key)).to_vec()
+}
+
+/// Native stub — the tessellation worker is web-only (`worker_supported()` is
+/// false natively, so `TessWorker::new` is never actually called), but the app's
+/// call sites must compile.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct TessWorker;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl TessWorker {
+    pub fn new(_slot: TessSlot) -> Result<Self, String> {
+        Err("tessellation worker is web-only".into())
+    }
+    pub fn post(&self, _cell: usize, _chunk: u32, _gen: u32, _coords: &[i32], _starts: &[u32], _layers: &[u32]) {}
+}

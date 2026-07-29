@@ -33,6 +33,11 @@ pub struct CellDraw {
     /// (see [`crate::tess::tessellate_chunk_filtered`]). Always `false` when
     /// there is no overlay — the hot path is untouched.
     pub dirty: bool,
+    /// The chunk's loose bbox in **cell-local** nm (a copy of `Chunk::bbox`).
+    /// Phase 4 STEP 2: when this chunk's geometry hasn't been tessellated yet
+    /// (a worker job is in flight), the renderer draws this box — transformed to
+    /// world at each placement — as a coarse proxy until the real mesh arrives.
+    pub bbox: crate::types::Bbox,
 }
 
 /// Result of a viewport query.
@@ -137,7 +142,8 @@ fn cull_inner(
     for ((cell, chunk), transforms) in grouped {
         ctx.set.stats.instances_emitted += transforms.len() as u64;
         let dirty = dirty_cells.contains(&cell);
-        ctx.set.draws.push(CellDraw { cell, chunk, transforms, dirty });
+        let bbox = db.cell(cell).chunks[chunk as usize].bbox;
+        ctx.set.draws.push(CellDraw { cell, chunk, transforms, dirty, bbox });
     }
     ctx.set.stats.proxy_count = ctx.set.proxies.len();
 

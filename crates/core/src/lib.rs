@@ -42,7 +42,10 @@ pub use index::ShapeIndex;
 pub use pick::{pick_hierarchy, pick_in_cell, point_in_polygon, PickHit};
 pub use serialize::{deserialize, serialize, DbColumns};
 pub use store::ShapeStore;
-pub use tess::{tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_shapes, LayerMesh};
+pub use tess::{
+    tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_columns, tessellate_shapes,
+    LayerMesh,
+};
 pub use transform::{Bboxf, Transform};
 pub use types::{Bbox, FlatLayout, Layer, Point, Polygon, Vertex};
 

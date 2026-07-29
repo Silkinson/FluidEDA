@@ -26,6 +26,27 @@ const HIER_GDS: &[u8] = include_bytes!("../../../assets/hier.gds");
 /// A cell projecting smaller than this many pixels becomes an LOD proxy.
 const MIN_PIXEL: f64 = 4.0;
 
+/// Phase 4 STEP 2: a visible **pristine** chunk with at least this many shapes is
+/// tessellated in the worker (fit-view / pan offload); smaller chunks tessellate
+/// inline, since a worker round-trip costs more than just doing them. Set above
+/// `EDIT_CHUNK_TARGET` (3 k) so an edit's finer chunks always stay inline (they
+/// need overlay suppressions and are already < 1 ms). Only consulted on web with
+/// worker support; native / no-worker always tessellates inline.
+const TESS_WORKER_MIN_SHAPES: usize = 8_000;
+
+/// Bound the per-frame main-thread cost of the offload: at most this many new jobs
+/// dispatched (each copies one chunk's columns into a transferable buffer) and this
+/// many finished chunks uploaded, per frame. Keeps the longest fit-view frame small
+/// while the die streams in as geometry over the following frames.
+const TESS_JOBS_PER_FRAME: usize = 8;
+
+/// Offload only kicks in when **more** than this many big chunks are unresolved in
+/// one frame (the fit-view freeze). At or below it — a leaf zoom or a gentle pan —
+/// the few big chunks tessellate inline, so leaf stays byte-for-byte the same
+/// experience and no bbox proxy flashes for a small zoom-in. Kept low enough that
+/// the inline case (`≤ this × ~9 ms/chunk`) is well under the 100 ms frame target.
+const TESS_INLINE_MAX: usize = 6;
+
 pub struct FluidApp {
     camera: Camera,
     db: CellDb,
@@ -57,9 +78,37 @@ pub struct FluidApp {
     /// chunks the viewport has actually touched.
     uploaded: HashSet<(CellId, ChunkId)>,
     /// Cumulative main-thread tessellation time so far (ms) — the lazy TTFF cost.
+    /// Phase 4 STEP 2: this now counts only chunks tessellated *inline*; the big
+    /// fit-view chunks tessellate in the worker and never touch this number, which
+    /// is the point — it is the residual main-thread freeze, now ~0.
     tess_accum_ms: f64,
     /// Cumulative uploaded GPU geometry bytes so far.
     gpu_bytes: usize,
+
+    // --- Phase 4 STEP 2: off-main-thread (worker) tessellation ---
+    /// Persistent tessellation worker. `None` on native / no-worker / before the
+    /// first offloaded chunk (spawned lazily). Dropping it terminates the worker.
+    tess: Option<webio::TessWorker>,
+    /// Completed worker jobs, drained (rate-limited) each frame in `ensure_uploaded`.
+    tess_results: webio::TessSlot,
+    /// Chunks a worker job is in flight for (dispatched, not yet returned) — so a
+    /// chunk isn't re-dispatched every frame while its bbox proxy shows.
+    tess_pending: HashSet<(CellId, ChunkId)>,
+    /// Epoch bumped on load / chunk re-partition and stamped on every job; a reply
+    /// whose `gen` differs is stale (its `(cell, chunk)` no longer means the same
+    /// geometry) and is dropped on arrival.
+    tess_gen: u32,
+    /// Chunks tessellated in the worker so far (panel readout; the offload count).
+    tess_worker_chunks: usize,
+    /// STEP 2 measurement: longest single `update()` (main-thread frame) since the
+    /// current design installed, in ms — the freeze metric. Reset on load; the
+    /// inline fit path spikes it to seconds, the offload keeps it small. Published
+    /// to `window.__fluideda_perf` each frame for the browser harness.
+    max_frame_ms: f64,
+    perf_frames: u64,
+    /// `?tessinline=1`: force the pre-STEP-2 inline path (offload off), so the
+    /// before/after fit-view freeze can be measured on one build.
+    force_inline: bool,
 
     // --- Phase 3 editing ---
     /// Copy-on-write edits over the immutable base. Empty ⇒ pristine Phase 2b
@@ -157,6 +206,14 @@ impl FluidApp {
             uploaded: HashSet::new(),
             tess_accum_ms: 0.0,
             gpu_bytes: 0,
+            tess: None,
+            tess_results: Rc::new(RefCell::new(Vec::new())),
+            tess_pending: HashSet::new(),
+            tess_gen: 0,
+            tess_worker_chunks: 0,
+            max_frame_ms: 0.0,
+            perf_frames: 0,
+            force_inline: webio::query_flag("tessinline"),
             overlay: EditOverlay::new(),
             edit_mode: false,
             selected: None,
@@ -211,6 +268,12 @@ impl FluidApp {
         self.dirty_keys.clear();
         self.renderer_drop_cells.clear();
         self.overlay_dirty = false;
+        // Drop the old design's tessellation worker + any in-flight jobs.
+        self.reset_tess();
+        self.tess_worker_chunks = 0;
+        // Fresh freeze measurement for this design (from the install frame onward).
+        self.max_frame_ms = 0.0;
+        self.perf_frames = 0;
         self.session = Session::new(Presence {
             cursor: Vec2::ZERO,
             name: self.name.clone(),
@@ -400,6 +463,9 @@ impl FluidApp {
                 self.db.cells[id.0].subdivide_chunk(chunk as usize, Self::EDIT_CHUNK_TARGET);
                 self.uploaded.retain(|&(c, _)| c != id.0);
                 self.dirty_keys.retain(|&(c, _)| c != id.0);
+                // The chunk-id shift invalidates any in-flight worker jobs (their
+                // keys now point at different geometry): reset the tess pipeline.
+                self.reset_tess();
                 self.renderer_drop_cells.insert(id.0);
                 if let Some(fine) = self.db.cell(id.0).chunk_of(id.1) {
                     self.dirty_keys.insert((id.0, fine));
@@ -411,10 +477,30 @@ impl FluidApp {
         self.overlay_dirty = true;
     }
 
-    /// Tessellate + upload any visible cell **chunk** not yet on the GPU (lazy).
-    /// Runs after culling, before paint, so the paint callback sees uploaded
-    /// buffers. First view of a chunk costs one tessellation on the main thread
-    /// (the source of any pan hitch); thereafter it's cached.
+    /// Invalidate the tessellation-worker pipeline: drop the worker (terminating
+    /// it discards in-flight jobs and reclaims its wasm memory), clear the pending
+    /// set + result queue, and bump the generation so any reply already queued is
+    /// recognised as stale on arrival. Called on a new design load and on a chunk
+    /// re-partition — both change what a `(cell, chunk)` key means. The worker
+    /// respawns lazily the next time a chunk needs offloading.
+    fn reset_tess(&mut self) {
+        self.tess = None;
+        self.tess_pending.clear();
+        self.tess_results.borrow_mut().clear();
+        self.tess_gen = self.tess_gen.wrapping_add(1);
+    }
+
+    /// Tessellate + upload any visible cell **chunk** not yet on the GPU. Runs
+    /// after culling, before paint, so the paint callback sees uploaded buffers.
+    ///
+    /// Phase 4 STEP 2 routing — this is the single convergence point for fit-view
+    /// first-paint AND editing's incremental re-tess:
+    ///   * a `dirty` (edited) chunk tessellates **inline** with the overlay's
+    ///     suppressions — tiny and < 1 ms, and it needs the overlay state;
+    ///   * a big **pristine** chunk (the fit-view freeze) is sent to the worker and
+    ///     drawn as a bbox proxy until its geometry arrives;
+    ///   * a small pristine chunk tessellates inline — a round-trip isn't worth it.
+    /// Dispatches and uploads are rate-limited so no single frame stalls.
     fn ensure_uploaded(&mut self, frame: &mut eframe::Frame) {
         let Some(rs) = frame.wgpu_render_state() else { return };
         let device = rs.device.clone();
@@ -436,15 +522,84 @@ impl FluidApp {
             self.uploaded.remove(&key);
         }
 
+        // 0. Upload chunks the worker just finished (rate-limited). Stale replies —
+        //    a different generation, or no longer expected — are dropped, not drawn.
+        let mut ready: Vec<webio::TessReply> = Vec::new();
+        {
+            let mut q = self.tess_results.borrow_mut();
+            let mut i = 0;
+            while i < q.len() {
+                if q[i].gen != self.tess_gen || !self.tess_pending.contains(&(q[i].cell, q[i].chunk)) {
+                    q.swap_remove(i); // stale — drop, re-check the element swapped in
+                } else if ready.len() < TESS_JOBS_PER_FRAME {
+                    ready.push(q.swap_remove(i));
+                } else {
+                    i += 1; // over budget this frame; leave for the next
+                }
+            }
+        }
+        for reply in &ready {
+            let key = (reply.cell, reply.chunk);
+            self.tess_pending.remove(&key);
+            renderer.upload_chunk(&device, key, &reply.meshes);
+            self.uploaded.insert(key);
+            self.tess_worker_chunks += 1;
+        }
+
         let empty = std::collections::HashSet::new();
         let visible = self.visible.clone();
+
+        // Decide per frame whether to offload. Only when MANY big chunks are
+        // unresolved at once — the fit-view freeze, where the whole die's geometry
+        // wants to tessellate in one frame. A leaf/pan view touching a handful of
+        // big chunks tessellates them inline exactly as before (~22 ms, under a
+        // frame), so leaf stays unchanged and no proxy flashes on a small zoom-in.
+        // `tess_pending` (in-flight) chunks are still not-uploaded, so the count
+        // stays high across the fit load and the mode doesn't flip mid-stream.
+        let big_unresolved = visible
+            .draws
+            .iter()
+            .filter(|d| {
+                !d.dirty
+                    && !self.uploaded.contains(&(d.cell, d.chunk))
+                    && self.db.cells[d.cell].chunks[d.chunk as usize].len() >= TESS_WORKER_MIN_SHAPES
+            })
+            .count();
+        let offload =
+            webio::worker_supported() && !self.force_inline && big_unresolved > TESS_INLINE_MAX;
+
+        let mut dispatched = 0usize;
         for d in &visible.draws {
             let key = (d.cell, d.chunk);
-            if self.uploaded.contains(&key) {
-                continue;
+            if self.uploaded.contains(&key) || self.tess_pending.contains(&key) {
+                continue; // already on the GPU, or a worker job is in flight (proxy shows)
             }
             let cell = &self.db.cells[d.cell];
             let chunk = &cell.chunks[d.chunk as usize];
+
+            // Offload a big pristine chunk to the worker (drawn as a bbox proxy
+            // until it lands); a dirty/small chunk — and everything when not in
+            // offload mode — tessellates inline. See the fn note for the rationale.
+            if offload && !d.dirty && chunk.len() >= TESS_WORKER_MIN_SHAPES {
+                if dispatched >= TESS_JOBS_PER_FRAME {
+                    continue; // dispatch budget spent; the proxy holds, retry next frame
+                }
+                if self.tess.is_none() {
+                    match webio::TessWorker::new(self.tess_results.clone()) {
+                        Ok(w) => self.tess = Some(w),
+                        Err(e) => log::error!("tess worker unavailable: {e}"),
+                    }
+                }
+                if let Some(w) = &self.tess {
+                    let (coords, starts, layers) = cell.shapes.chunk_columns(chunk.start, chunk.end);
+                    w.post(d.cell, d.chunk, self.tess_gen, coords, &starts, layers);
+                    self.tess_pending.insert(key);
+                    dispatched += 1;
+                    continue;
+                }
+                // Worker spawn failed: fall through to inline so geometry still shows.
+            }
+
             let t = web_time::Instant::now();
             // A dirty chunk (its cell has overlay edits) tessellates with the
             // suppressed base shapes removed; every other chunk is untouched.
@@ -551,6 +706,33 @@ impl FluidApp {
         self.metrics.publish();
         self.awaiting_first_frame = false;
     }
+
+    /// Publish the per-frame perf snapshot to `window.__fluideda_perf` (wasm only):
+    /// the longest main-thread frame since load (the freeze metric), frame count,
+    /// worker vs inline tessellation counts. The browser harness polls this to
+    /// prove the fit-view freeze is gone and geometry streamed in off-thread.
+    #[cfg(target_arch = "wasm32")]
+    fn publish_perf(&self) {
+        let Some(w) = web_sys::window() else { return };
+        let json = format!(
+            "{{\"max_frame_ms\":{:.1},\"frames\":{},\"worker_chunks\":{},\"in_flight\":{},\
+             \"inline_tess_ms\":{:.1},\"uploaded\":{},\"force_inline\":{},\
+             \"last_edit_ms\":{:.2},\"last_edit_chunks\":{}}}",
+            self.max_frame_ms,
+            self.perf_frames,
+            self.tess_worker_chunks,
+            self.tess_pending.len(),
+            self.tess_accum_ms,
+            self.uploaded.len(),
+            self.force_inline,
+            self.last_edit_ms,
+            self.last_edit_chunks,
+        );
+        let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn publish_perf(&self) {}
 
     /// Apply a `?zoom=` override (fit|mid|leaf) by setting the camera span,
     /// centered on the design. Used by the browser bench to measure fps at a
@@ -664,6 +846,9 @@ fn changed_ids(old: &EditOverlay, new: &EditOverlay) -> std::collections::HashSe
 
 impl eframe::App for FluidApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Time the whole main-thread frame (the fit-view freeze lives inside
+        // `ensure_uploaded` below). `max_frame_ms` is the STEP 2 headline number.
+        let frame_t = web_time::Instant::now();
         let now = ctx.input(|i| i.time);
         let dt = (now - self.last_frame).max(1e-4);
         self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt) as f32;
@@ -693,6 +878,13 @@ impl eframe::App for FluidApp {
         self.ensure_uploaded(frame);
 
         ctx.request_repaint();
+
+        // Record the longest main-thread frame since load, and publish the perf
+        // snapshot for the browser harness (STEP 2 measurement).
+        let ms = frame_t.elapsed().as_secs_f64() * 1e3;
+        self.max_frame_ms = self.max_frame_ms.max(ms);
+        self.perf_frames += 1;
+        self.publish_perf();
     }
 }
 
@@ -775,6 +967,47 @@ impl FluidApp {
                     self.pick_at(Vec2::new(x, y));
                 }
             }
+            Some("select_biggest") => {
+                // Select shape 0 of the cell with the most shapes (caravel_core on
+                // caravel) — a data-independent handle on the big flat cell.
+                let biggest = (0..self.db.cells.len())
+                    .max_by_key(|&c| self.db.cell(c).shapes.len())
+                    .filter(|&c| self.db.cell(c).shapes.len() > 0);
+                if let Some(cell) = biggest {
+                    self.selected = Some((cell, 0));
+                    self.selected_tf = Transform::IDENTITY;
+                    self.move_delta = self.existing_delta((cell, 0));
+                }
+            }
+            Some("edit_bench") => {
+                // Viewport-independent edit-frame measurement (STEP 2): time a first
+                // edit of the biggest cell — the finer-chunking re-partition plus the
+                // incremental re-tessellation of the fine chunk owning the shape,
+                // exactly the work `ensure_uploaded` does for a dirty chunk. Records
+                // it into `last_edit_ms`/`last_edit_chunks` (published to the harness)
+                // without depending on where the cell is placed or what's on screen.
+                let biggest = (0..self.db.cells.len())
+                    .max_by_key(|&c| self.db.cell(c).shapes.len())
+                    .filter(|&c| self.db.cell(c).shapes.len() > 0);
+                if let Some(cell) = biggest {
+                    let idx = 0u32;
+                    let t = web_time::Instant::now();
+                    if let Some(ch) = self.db.cell(cell).chunk_of(idx) {
+                        if self.db.cells[cell].chunks[ch as usize].len() > Self::EDIT_CHUNK_TARGET {
+                            self.db.cells[cell].subdivide_chunk(ch as usize, Self::EDIT_CHUNK_TARGET);
+                        }
+                    }
+                    if let Some(fine) = self.db.cell(cell).chunk_of(idx) {
+                        let cref = self.db.cell(cell);
+                        let chunk = &cref.chunks[fine as usize];
+                        let mut suppressed = std::collections::HashSet::new();
+                        suppressed.insert(idx); // as a delete of shape 0 would suppress
+                        let _ = fluideda_core::tessellate_chunk_filtered(&cref.shapes, chunk, &suppressed);
+                    }
+                    self.last_edit_ms = t.elapsed().as_secs_f64() * 1e3;
+                    self.last_edit_chunks = 1;
+                }
+            }
             Some("nudge") => {
                 if let Some(id) = self.selected {
                     let step = self.nudge_step();
@@ -823,6 +1056,13 @@ impl FluidApp {
                     self.tess_accum_ms,
                     self.uploaded.len()
                 ));
+                if self.tess_worker_chunks > 0 || !self.tess_pending.is_empty() {
+                    ui.small(format!(
+                        "tess (worker): {} chunks off-thread, {} in flight",
+                        self.tess_worker_chunks,
+                        self.tess_pending.len()
+                    ));
+                }
                 ui.small(format!("GPU geo:     {} MB (visible only)", self.gpu_bytes / 1_048_576));
                 if m.parse_heap_bytes > 0 {
                     ui.small(format!("parse heap:  {} MB (high-water)", m.parse_heap_bytes / 1_048_576));

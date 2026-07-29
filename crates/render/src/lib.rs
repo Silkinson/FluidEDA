@@ -28,7 +28,7 @@ pub fn layer_color(layer: fluideda_core::Layer) -> [f32; 4] {
 }
 
 use bytemuck::{Pod, Zeroable};
-use fluideda_core::{CellId, ChunkId, LayerMesh, Layer, VisibleSet};
+use fluideda_core::{Bboxf, CellId, ChunkId, LayerMesh, Layer, VisibleSet};
 use std::collections::{HashMap, HashSet};
 use wgpu::util::DeviceExt;
 
@@ -355,10 +355,21 @@ impl HierRenderer {
         let mut raw: Vec<InstanceRaw> = Vec::with_capacity(total);
 
         self.cell_plan.clear();
+        // Phase 4 STEP 2: visible chunks whose geometry isn't uploaded yet (a
+        // tessellation worker job is in flight) are drawn as a coarse bbox proxy
+        // at each placement until the real mesh arrives — progressive refinement.
+        // On native / no-worker this is always empty: the app tessellates every
+        // visible chunk inline before paint, so the loop below always finds it.
+        let mut pending_proxies: Vec<Bboxf> = Vec::new();
         for d in &visible.draws {
             let key = (d.cell, d.chunk);
             if !self.cells.contains_key(&key) {
-                continue; // chunk has no drawable geometry (or isn't uploaded yet)
+                // Not tessellated yet: proxy the chunk's world footprint at each
+                // placement (a loose AABB of the local bbox under the transform).
+                for t in &d.transforms {
+                    pending_proxies.push(t.apply_bbox(&d.bbox));
+                }
+                continue;
             }
             let first = raw.len() as u32;
             for t in &d.transforms {
@@ -374,9 +385,11 @@ impl HierRenderer {
             });
         }
 
+        // Proxies: the culler's LOD boxes (sub-pixel cells) plus this frame's
+        // not-yet-tessellated chunk boxes. Both draw as the same dim proxy quad.
         self.proxy_first = raw.len() as u32;
-        self.proxy_count = visible.proxies.len() as u32;
-        for b in &visible.proxies {
+        self.proxy_count = (visible.proxies.len() + pending_proxies.len()) as u32;
+        for b in visible.proxies.iter().chain(pending_proxies.iter()) {
             let w = (b.max_x - b.min_x).max(0.0) as f32;
             let h = (b.max_y - b.min_y).max(0.0) as f32;
             raw.push(InstanceRaw {

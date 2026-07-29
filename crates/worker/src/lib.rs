@@ -15,7 +15,7 @@
 
 #[cfg(target_arch = "wasm32")]
 mod wasm {
-    use js_sys::{Int32Array, Uint32Array, Uint8Array};
+    use js_sys::{Float32Array, Int32Array, Uint32Array, Uint8Array};
     use wasm_bindgen::prelude::*;
 
     /// The serialized `CellDb`, ready to transfer. Each field is a typed array
@@ -141,6 +141,81 @@ mod wasm {
             cell_defs,
             layer_set,
         })
+    }
+
+    /// A tessellated chunk, ready to transfer (Phase 4 STEP 2 — off-main-thread
+    /// tessellation). The per-layer meshes are flattened into two concatenated Pod
+    /// buffers (`verts`, `indices`) plus three small per-mesh side tables so the
+    /// main thread can split them back apart and upload one GPU buffer per layer.
+    /// Every field is its own `ArrayBuffer`, moved to the main thread with a
+    /// transfer list (zero copy across the boundary).
+    #[wasm_bindgen]
+    pub struct TessResult {
+        mesh_layers: Uint32Array,  // packed `layer | datatype << 16`, one per mesh
+        vert_counts: Uint32Array,  // f32 count per mesh (= 2 * vertex count)
+        index_counts: Uint32Array, // u32 index count per mesh
+        verts: Float32Array,       // every mesh's vertex floats, concatenated
+        indices: Uint32Array,      // every mesh's indices, concatenated (per-mesh 0-based)
+    }
+
+    #[wasm_bindgen]
+    impl TessResult {
+        #[wasm_bindgen(getter)]
+        pub fn mesh_layers(&self) -> Uint32Array {
+            self.mesh_layers.clone()
+        }
+        #[wasm_bindgen(getter)]
+        pub fn vert_counts(&self) -> Uint32Array {
+            self.vert_counts.clone()
+        }
+        #[wasm_bindgen(getter)]
+        pub fn index_counts(&self) -> Uint32Array {
+            self.index_counts.clone()
+        }
+        #[wasm_bindgen(getter)]
+        pub fn verts(&self) -> Float32Array {
+            self.verts.clone()
+        }
+        #[wasm_bindgen(getter)]
+        pub fn indices(&self) -> Uint32Array {
+            self.indices.clone()
+        }
+    }
+
+    /// Tessellate one chunk from its raw columns (transferred in) and return the
+    /// per-layer meshes as flat transferable buffers. The heavy lyon work runs
+    /// here, off the main thread; `crate::tessellate_columns` guarantees the
+    /// output is identical to the main thread's inline `tessellate_chunk`.
+    #[wasm_bindgen]
+    pub fn tessellate(coords: Vec<i32>, starts: Vec<u32>, layers: Vec<u32>) -> TessResult {
+        console_error_panic_hook::set_once();
+
+        let meshes = fluideda_core::tessellate_columns(&coords, &starts, &layers);
+
+        let mut mesh_layers = Vec::with_capacity(meshes.len());
+        let mut vert_counts = Vec::with_capacity(meshes.len());
+        let mut index_counts = Vec::with_capacity(meshes.len());
+        let mut verts: Vec<f32> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        for m in &meshes {
+            mesh_layers.push(m.layer.layer as u32 | ((m.layer.datatype as u32) << 16));
+            vert_counts.push((m.vertices.len() * 2) as u32);
+            index_counts.push(m.indices.len() as u32);
+            for v in &m.vertices {
+                verts.push(v.pos[0]);
+                verts.push(v.pos[1]);
+            }
+            indices.extend_from_slice(&m.indices);
+        }
+
+        // One copy of each column out of wasm memory into its own ArrayBuffer.
+        TessResult {
+            mesh_layers: Uint32Array::from(&mesh_layers[..]),
+            vert_counts: Uint32Array::from(&vert_counts[..]),
+            index_counts: Uint32Array::from(&index_counts[..]),
+            verts: Float32Array::from(&verts[..]),
+            indices: Uint32Array::from(&indices[..]),
+        }
     }
 
     /// Current wasm linear-memory size in bytes.
