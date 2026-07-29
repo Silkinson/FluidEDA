@@ -247,6 +247,19 @@ impl HierRenderer {
         }
     }
 
+    /// Drop all uploaded geometry (cells + overlay) but keep the compiled
+    /// pipeline, bind groups, and buffers. Used when a new design is installed so
+    /// the swap doesn't pay a shader/pipeline recompile — the ~50-100 ms cost of
+    /// building a fresh `HierRenderer` in WebGL2. Everything reuploads lazily.
+    pub fn reset(&mut self) {
+        self.cells.clear();
+        self.overlay.clear();
+        self.uploaded_bytes = 0;
+        self.hidden.clear();
+        self.cell_plan.clear();
+        self.draw_seq.clear();
+    }
+
     /// Is this cell chunk's geometry already tessellated + uploaded?
     pub fn has_chunk(&self, key: ChunkKey) -> bool {
         self.cells.contains_key(&key)

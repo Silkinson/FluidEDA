@@ -208,7 +208,74 @@ fit/mid/leaf.**
 
 ---
 
-## STEP 2 — worker offload (NOT implemented)
+## STEP 2 — worker offload (SHIPPED)
+
+**Status: shipped as a plain transferable-buffer worker on stable Rust** (branch
+`phase2b-worker`). Parse runs in a Web Worker — a separate `fluideda-core`-only
+wasm module (174 KB, no wgpu/egui) with its own linear memory. It receives the
+file bytes (transferred in), runs the streaming parser + chunking, serializes the
+`CellDb` to Pod columns, and transfers those back as `ArrayBuffer`s; the main
+thread rebuilds the `CellDb` and proceeds exactly as before (cull → lazy tess →
+draw). No shared heap, no atomics, no `build-std`, no COOP/COEP — STEP 3's
+~0.8 GB parse peak is what made a parse-and-copy worker fit under 4 GB.
+
+### Results (browser, headless Chromium, WebGL2/ANGLE, leaf zoom)
+
+Leaf/mid is where parse was the whole freeze (chunking took tessellation to
+22 ms). Measured with `scripts/worker_test.mjs`:
+
+| metric | caravel (278 MB) | caravan-signoff (329 MB) |
+|---|--:|--:|
+| parsed in worker | ✅ | ✅ |
+| parse wall (in worker, off main) | ~1.05 s | ~1.23 s |
+| main-thread reconstruct | ~62 ms | ~72 ms |
+| **worker heap (parse peak)** | ~1.03 GB | ~0.89 GB |
+| main heap (after reconstruct) | ~0.45 GB | ~0.50 GB |
+| **combined peak** | **~1.46 GB** | **~1.39 GB** |
+| longest main-thread frame during load | ~200 ms | ~260 ms |
+
+**Closes the "combined-peak not demonstrated" debt.** Peak across worker+main is
+~1.4–1.5 GB, well under 4 GB (the worker's parse peak of ~1 GB plus the main
+thread's ~0.5 GB reconstructed copy, both alive at the instant before the worker
+is terminated). The worker's memory is *reclaimed*: each load spawns a one-shot
+worker that is `terminate()`d after the transfer, freeing its whole wasm instance
+(wasm memory never shrinks in place, so reclamation = terminate).
+
+**The parse freeze is gone.** During the ~1 s parse the main thread runs at ~16 ms
+frames — the canvas stays pannable while caravel parses, which was the point.
+
+**The residual is a ~200 ms design-swap frame**, not a parse freeze — down from
+the old ~1.2 s parse block. It is the moment the reconstructed design installs:
+two ~150 MB coordinate copies (JS→wasm when reading the transferred typed array,
+then the per-cell split inside `deserialize`), plus meta parse, plus the first
+cull+tessellate. The worker's summary (layers/bbox/counts) is computed worker-side
+so the main thread does *not* rescan 3.9 M shapes (that alone was 80 ms), and the
+packed layer column is cast (not unpacked) on the main thread. Getting the swap
+under 100 ms would need a **single-copy reconstruction** — build each cell's `Vec`
+directly from a per-cell `subarray` of the transferred column, eliminating the
+concatenated intermediate — noted as a follow-up, not built here. The renderer is
+now *reset* rather than rebuilt on install, so a second file-open doesn't recompile
+the shader pipeline.
+
+> ⚠️ **Fit view is a separate, larger freeze the parse worker does NOT address.**
+> At fit, the giant flat cells tessellate on the main thread (~2.5 s) — measured
+> here as a ~7 s swap frame at fit. That is tessellation, not parse; offloading it
+> would mean chunk-tessellation in the worker (a bigger protocol) or a fit-view LOD
+> proxy. Out of scope for STEP 2, which is parse-only.
+
+### Optional follow-up: progressive render (feasible, not built)
+
+The streaming parser finalizes cells in file order (on ENDSTR), so the worker
+*could* emit each completed cell's columns as it parses and the main thread draw
+the design filling in, instead of one reconstruct at the end. The obstacle is the
+one flagged before: **GDSII allows forward references** — an SREF/AREF can name a
+child whose definition comes later — so a cell is only safe to draw once every
+cell in its instance subtree is finalized. In practice tools write children-first
+(caravel has 0 forward references), so the common case works with a "defer a cell
+whose descendants aren't all done" guard. Whether it is worth it is questionable
+now that parse is off the main thread and the canvas is already responsive during
+it; the win would be showing geometry sooner (lower time-to-*useful*-frame), not
+removing a freeze. Deferred.
 
 ### What STEP 1 changed about the requirement
 

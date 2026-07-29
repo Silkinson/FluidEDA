@@ -205,7 +205,18 @@ impl FluidApp {
         });
 
         if let Some(rs) = frame.wgpu_render_state() {
-            init_renderer(rs);
+            // Reuse the existing renderer (keeping its compiled pipeline) rather
+            // than rebuilding it — a fresh HierRenderer recompiles the shader
+            // program, ~50-100 ms in WebGL2, which would land as a stall on the
+            // design-swap frame. Reset drops the old design's GPU buffers only.
+            let mut guard = rs.renderer.write();
+            match renderer_mut(&mut guard.callback_resources) {
+                Some(r) => r.reset(),
+                None => {
+                    drop(guard);
+                    init_renderer(rs);
+                }
+            }
             self.renderer_ready = true;
         }
         self.awaiting_first_frame = true;
