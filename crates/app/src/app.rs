@@ -288,6 +288,17 @@ impl FluidApp {
         }
     }
 
+    /// Export the current design (base composited with the edit overlay) to GDSII
+    /// and save it (web: download; native: write a file). Phase 3 SLICE 1.
+    fn save_gds(&mut self) {
+        let bytes = fluideda_core::write_gds(&self.db, &self.overlay);
+        let name = out_name(&self.metrics.name);
+        match webio::save_bytes(&name, &bytes) {
+            Ok(()) => self.status = format!("saved {name} ({} KB)", bytes.len() / 1024),
+            Err(e) => self.status = format!("save failed: {e}"),
+        }
+    }
+
     /// Undo the last local edit (per-user; a peer's edits are never on our undo
     /// stack) and reconcile the overlay from the reverted CRDT state.
     fn do_undo(&mut self) {
@@ -781,6 +792,9 @@ impl FluidApp {
                     self.do_redo();
                 }
             });
+            if ui.button("💾 Save GDS").clicked() {
+                self.save_gds();
+            }
 
             ui.separator();
             if ui.button("Fit view").clicked() {
@@ -931,6 +945,14 @@ impl FluidApp {
         let d = (world - self.camera.center) * self.camera.scale;
         egui::pos2(rect.min.x + half.x + d.x, rect.min.y + half.y - d.y)
     }
+}
+
+/// Export filename derived from the loaded file's name: `caravel.gds` →
+/// `caravel-edited.gds`. Strips any parenthetical suffix (e.g. the embedded label).
+fn out_name(loaded: &str) -> String {
+    let base = loaded.split_whitespace().next().unwrap_or("design");
+    let stem = base.strip_suffix(".gds").unwrap_or(base);
+    format!("{stem}-edited.gds")
 }
 
 fn server_url() -> String {
