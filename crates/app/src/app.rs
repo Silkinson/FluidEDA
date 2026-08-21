@@ -9,8 +9,8 @@ use crate::paint::{init_renderer, renderer_mut, LayoutPaint};
 use crate::webio::{self, LoadSlot};
 use eframe::egui;
 use fluideda_core::{
-    cull, cull_with_overlay, pick_hierarchy, BaseShapeId, CellDb, CellId, ChunkId, CullStats,
-    EditOverlay, Layer, Point, Transform, VisibleSet,
+    cull, cull_with_overlay, pick_hierarchy, AddId, BaseShapeId, CellDb, CellId, ChunkId,
+    CullStats, EditOverlay, Layer, Point, Transform, VisibleSet,
 };
 use fluideda_render::Camera;
 use fluideda_sync::{color_from_id, EditKind, Marker, Presence, Session};
@@ -25,6 +25,36 @@ const HIER_GDS: &[u8] = include_bytes!("../../../assets/hier.gds");
 
 /// A cell projecting smaller than this many pixels becomes an LOD proxy.
 const MIN_PIXEL: f64 = 4.0;
+
+/// Drawing grid (Phase 5 SLICE 1): every authored coordinate snaps to this many
+/// nm. Small enough to be invisible at any sane zoom, big enough that a drawn
+/// vertex is reproducible across peers and sessions. Coordinates stay i32 nm.
+const SNAP_NM: i32 = 5;
+
+/// Snap a world coordinate (nm, f32 out of the camera) onto the drawing grid.
+fn snap_nm(v: f32) -> i32 {
+    ((v / SNAP_NM as f32).round() as i64 * SNAP_NM as i64) as i32
+}
+
+/// What a left-click selects / a drag edits (Phase 5: base shapes and drawn
+/// shapes are both editable, but they are different id spaces — an added shape
+/// has no base index, so it is referenced by its [`AddId`] everywhere).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Selection {
+    /// A base shape: cell master + index (editing updates every placement).
+    Base(BaseShapeId),
+    /// A shape drawn this session (TOP-cell, identity frame).
+    Added(AddId),
+}
+
+/// The active canvas tool (Phase 5 SLICE 1). Select = Phase 3 behavior; the two
+/// draw tools author new TOP-cell shapes on the active layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tool {
+    Select,
+    Rect,
+    Poly,
+}
 
 /// Phase 4 STEP 2: a visible **pristine** chunk with at least this many shapes is
 /// tessellated in the worker (fit-view / pan offload); smaller chunks tessellate
@@ -117,9 +147,17 @@ pub struct FluidApp {
     /// When on, a left-click selects the shape under the cursor (any cell, through
     /// the instance hierarchy) and drag/nudge/delete edit it; pan/zoom still work.
     edit_mode: bool,
-    /// The currently selected base shape — a cell **master** + shape index; editing
-    /// it updates every placement of that cell (SLICE 2: any cell, not just TOP).
-    selected: Option<BaseShapeId>,
+    /// The active canvas tool (Phase 5): Select, or one of the draw tools.
+    tool: Tool,
+    /// Index into `layers` of the layer new shapes are drawn on.
+    active_layer: usize,
+    /// Rect tool: the snapped world anchor of an in-progress corner drag.
+    rect_anchor: Option<Point>,
+    /// Poly tool: the snapped vertices accumulated so far (world = TOP-local nm).
+    poly_pts: Vec<Point>,
+    /// The current selection — a base shape (cell **master** + index; editing it
+    /// updates every placement) or an added shape (by its stable AddId).
+    selected: Option<Selection>,
     /// World transform of the placement that was clicked, for the highlight and for
     /// mapping a world-space drag into the selected cell's local frame. Identity
     /// for a TOP-cell selection.
@@ -132,6 +170,9 @@ pub struct FluidApp {
     drag_move_from: Option<Vec2>,
     /// `move_delta` at the moment a move-drag began.
     drag_move_base: (i32, i32),
+    /// Geometry of the selected ADDED shape when its move-drag began — previews
+    /// translate this snapshot; the CRDT record is rewritten once, on release.
+    drag_added_start: Option<Vec<Point>>,
     /// Base chunks whose geometry an edit invalidated — re-tessellated (with
     /// suppressions) on the next `ensure_uploaded`. Only these rebuild, not the
     /// whole cell: the incremental-edit property.
@@ -216,11 +257,16 @@ impl FluidApp {
             force_inline: webio::query_flag("tessinline"),
             overlay: EditOverlay::new(),
             edit_mode: false,
+            tool: Tool::Select,
+            active_layer: 0,
+            rect_anchor: None,
+            poly_pts: Vec::new(),
             selected: None,
             selected_tf: Transform::IDENTITY,
             move_delta: (0, 0),
             drag_move_from: None,
             drag_move_base: (0, 0),
+            drag_added_start: None,
             dirty_keys: HashSet::new(),
             renderer_drop_cells: HashSet::new(),
             overlay_dirty: false,
@@ -265,6 +311,11 @@ impl FluidApp {
         self.selected_tf = Transform::IDENTITY;
         self.move_delta = (0, 0);
         self.drag_move_from = None;
+        self.drag_added_start = None;
+        self.tool = Tool::Select;
+        self.active_layer = 0;
+        self.rect_anchor = None;
+        self.poly_pts.clear();
         self.dirty_keys.clear();
         self.renderer_drop_cells.clear();
         self.overlay_dirty = false;
@@ -298,17 +349,30 @@ impl FluidApp {
         self.awaiting_first_frame = true;
     }
 
-    /// Hit-test a world point through the instance hierarchy and update the
-    /// selection. Resolves to a cell **master** + shape, plus the clicked
-    /// placement's world transform (SLICE 2 — any cell, under a transform stack).
+    /// Hit-test a world point and update the selection. Added shapes draw on top
+    /// of the base, so they are tested first (a linear scan — there are few, and
+    /// they are TOP-cell so world == local); otherwise the pick walks the
+    /// instance hierarchy and resolves to a cell **master** + shape, plus the
+    /// clicked placement's world transform.
     fn pick_at(&mut self, world: Vec2) {
         let p = Point::new(world.x.round() as i32, world.y.round() as i32);
         let t = web_time::Instant::now();
+        let top = self.db.top;
+        // Last-drawn wins when adds overlap (matches their draw order: on top).
+        for a in self.overlay.added.iter().rev() {
+            if a.cell == top && fluideda_core::point_in_polygon(&a.shape.points, p) {
+                self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
+                self.selected = Some(Selection::Added(a.id));
+                self.selected_tf = Transform::IDENTITY;
+                self.move_delta = (0, 0);
+                return;
+            }
+        }
         let hit = pick_hierarchy(&self.db, p);
         self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
         match hit {
             Some(h) => {
-                self.selected = Some(h.id);
+                self.selected = Some(Selection::Base(h.id));
                 self.selected_tf = h.world_tf;
                 self.move_delta = self.existing_delta(h.id);
             }
@@ -322,14 +386,20 @@ impl FluidApp {
 
     /// Does world point `w` land inside the selection's *current* geometry? Tests
     /// in the selected cell's local frame (inverse-mapping through the placement's
-    /// transform), against the moved copy if moved else the base. Decides drag =
-    /// move vs pan.
-    fn point_hits(&self, id: BaseShapeId, w: Vec2) -> bool {
+    /// transform), against the current overlay copy when one exists. Decides
+    /// drag = move vs pan.
+    fn point_hits(&self, sel: Selection, w: Vec2) -> bool {
         let (lx, ly) = self.selected_tf.inverse().apply(w.x as f64, w.y as f64);
         let p = Point::new(lx.round() as i32, ly.round() as i32);
-        match self.overlay.edited.get(&id) {
-            Some(moved) => fluideda_core::point_in_polygon(&moved.points, p),
-            None => fluideda_core::point_in_polygon(self.db.cell(id.0).shapes.points(id.1 as usize), p),
+        match sel {
+            Selection::Added(id) => self
+                .overlay
+                .find_added(id)
+                .is_some_and(|a| fluideda_core::point_in_polygon(&a.shape.points, p)),
+            Selection::Base(id) => match self.overlay.edited.get(&id) {
+                Some(moved) => fluideda_core::point_in_polygon(&moved.points, p),
+                None => fluideda_core::point_in_polygon(self.db.cell(id.0).shapes.points(id.1 as usize), p),
+            },
         }
     }
 
@@ -393,22 +463,80 @@ impl FluidApp {
         (ldx.round() as i32, ldy.round() as i32)
     }
 
-    /// Nudge the selection by `(dx, dy)` on top of its current move delta (a
-    /// discrete, immediately-committed edit).
-    fn nudge(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
-        let (cx, cy) = self.move_delta;
-        self.commit_move(id, cx + dx, cy + dy);
+    /// Nudge the selection by `(dx, dy)` (a discrete, immediately-committed
+    /// edit). Base shapes commit a translation op on top of the current delta;
+    /// added shapes rewrite their geometry (geometry IS their CRDT state).
+    fn nudge(&mut self, sel: Selection, dx: i32, dy: i32) {
+        match sel {
+            Selection::Base(id) => {
+                let (cx, cy) = self.move_delta;
+                self.commit_move(id, cx + dx, cy + dy);
+            }
+            Selection::Added(id) => {
+                let Some(a) = self.overlay.find_added(id) else { return };
+                let moved = fluideda_core::edit::translate(a.shape.layer, &a.shape.points, dx, dy);
+                self.session.set_added_geometry(id, a.cell, moved.layer, &moved.points);
+                self.reconcile_edits();
+            }
+        }
     }
 
     /// Delete the selection: a CRDT tombstone, then reconcile. No base mutation —
-    /// the containing chunk re-tessellates without the shape.
-    fn delete_shape(&mut self, id: BaseShapeId) {
-        self.session.set_edit(id, EditKind::Delete);
+    /// a base shape's chunk re-tessellates without it; an added shape's record
+    /// tombstones by its AddId.
+    fn delete_shape(&mut self, sel: Selection) {
+        match sel {
+            Selection::Base(id) => self.session.set_edit(id, EditKind::Delete),
+            Selection::Added(id) => self.session.delete_added(id),
+        }
         self.reconcile_edits();
-        if self.selected == Some(id) {
+        if self.selected == Some(sel) {
             self.selected = None;
             self.move_delta = (0, 0);
         }
+    }
+
+    // --- Phase 5 SLICE 1: draw tools -----------------------------------------
+
+    /// Commit a drawn rectangle spanning snapped corners `a`..`b` (world = TOP
+    /// nm). Degenerate spans (a dimension that snapped to zero) are dropped.
+    fn commit_rect(&mut self, a: Point, b: Point) {
+        let (x0, x1) = (a.x.min(b.x), a.x.max(b.x));
+        let (y0, y1) = (a.y.min(b.y), a.y.max(b.y));
+        if x1 - x0 < SNAP_NM || y1 - y0 < SNAP_NM {
+            return;
+        }
+        self.commit_add(vec![
+            Point::new(x0, y0),
+            Point::new(x1, y0),
+            Point::new(x1, y1),
+            Point::new(x0, y1),
+            Point::new(x0, y0), // closed ring, GDS boundary convention
+        ]);
+    }
+
+    /// Close and commit the in-progress polygon if it has ≥ 3 distinct vertices.
+    fn commit_poly(&mut self) {
+        let mut pts = std::mem::take(&mut self.poly_pts);
+        if pts.len() < 3 {
+            return;
+        }
+        let first = pts[0];
+        pts.push(first); // close the ring
+        self.commit_add(pts);
+    }
+
+    /// Commit a brand-new TOP-cell shape on the active layer: mint its AddId via
+    /// the CRDT (full geometry — the documented amendment), reconcile so the
+    /// overlay/upload paths pick it up, and select it.
+    fn commit_add(&mut self, pts: Vec<Point>) {
+        let layer = self.layers.get(self.active_layer).copied().unwrap_or(Layer::new(1, 0));
+        let top = self.db.top;
+        let id = self.session.add_shape(top, layer, &pts);
+        self.reconcile_edits();
+        self.selected = Some(Selection::Added(id));
+        self.selected_tf = Transform::IDENTITY;
+        self.move_delta = (0, 0);
     }
 
     /// Export the current design (base composited with the edit overlay) to GDSII
@@ -786,7 +914,8 @@ impl FluidApp {
     /// changed. Skipped mid-drag so a live move preview isn't clobbered.
     fn reconcile_edits(&mut self) {
         let new = self.overlay_from_crdt();
-        if new.deleted == self.overlay.deleted && new.edited == self.overlay.edited {
+        let added_changed = new.added != self.overlay.added;
+        if !added_changed && new.deleted == self.overlay.deleted && new.edited == self.overlay.edited {
             return; // nothing edit-related changed (e.g. a marker-only update)
         }
         let changed: Vec<BaseShapeId> = changed_ids(&self.overlay, &new).into_iter().collect();
@@ -797,9 +926,22 @@ impl FluidApp {
         for id in changed {
             self.invalidate(id);
         }
+        // Adds live only in the overlay geometry — no base chunk to dirty, just
+        // the (tiny) overlay buffer to re-upload.
+        if added_changed {
+            self.overlay_dirty = true;
+        }
         // Keep the nudge accumulator + highlight in step with the authoritative state.
-        if let Some(id) = self.selected {
-            self.move_delta = self.existing_delta(id);
+        match self.selected {
+            Some(Selection::Base(id)) => self.move_delta = self.existing_delta(id),
+            Some(Selection::Added(id)) => {
+                // The selection may have been deleted remotely (or by undo).
+                if self.overlay.find_added(id).is_none() {
+                    self.selected = None;
+                    self.move_delta = (0, 0);
+                }
+            }
+            None => {}
         }
     }
 
@@ -822,6 +964,16 @@ impl FluidApp {
                     o.move_shape(id, moved);
                 }
             }
+        }
+        // Added shapes (Phase 5 SLICE 1): geometry ships in the record; tombstoned
+        // adds return None and are skipped. `session.adds()` is sorted by id, so
+        // every peer rebuilds the same deterministic draw order.
+        for (id, geom) in self.session.adds() {
+            let Some(g) = geom else { continue };
+            if g.cell >= self.db.cells.len() {
+                continue;
+            }
+            o.add(id, g.cell, fluideda_core::Shape { layer: g.layer, points: g.points });
         }
         o
     }
@@ -907,23 +1059,35 @@ impl FluidApp {
             }
         }
         let top = self.db.top;
-        let sel = self.selected.map_or(-1i64, |(_, i)| i as i64);
-        let sel_cell = self.selected.map_or(-1i64, |(c, _)| c as i64);
-        // Every edit tombstones its base (move records a copy too), so
-        // `deleted` holds ALL edited shapes and `edited` is the moved subset:
+        // Base-selection fields keep their Phase 3 semantics (the harness relies
+        // on them); an added-shape selection reports its index in the (sorted,
+        // cross-peer-deterministic) added list instead.
+        let (sel, sel_cell, sel_added) = match self.selected {
+            Some(Selection::Base((c, i))) => (i as i64, c as i64, -1i64),
+            Some(Selection::Added(id)) => (
+                -1,
+                -1,
+                self.overlay.added.iter().position(|a| a.id == id).map_or(-1, |i| i as i64),
+            ),
+            None => (-1, -1, -1),
+        };
+        // Every base edit tombstones its base (move records a copy too), so
+        // `deleted` holds ALL edited base shapes and `edited` is the moved subset:
         //   edited shapes = deleted.len(); moves = edited.len();
         //   pure deletes  = deleted.len() - edited.len().
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"selected\":{},\"selected_cell\":{},\"top_shapes\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
             moves,
             edited - moves,
+            self.overlay.added.len(),
             sel,
             sel_cell,
+            sel_added,
             self.db.cell(top).shapes.len(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
@@ -954,9 +1118,55 @@ impl FluidApp {
                     _ => return,
                 };
                 if cell < self.db.cells.len() && (idx as usize) < self.db.cell(cell).shapes.len() {
-                    self.selected = Some((cell, idx));
+                    self.selected = Some(Selection::Base((cell, idx)));
                     self.selected_tf = Transform::IDENTITY;
                     self.move_delta = self.existing_delta((cell, idx));
+                }
+            }
+            Some("select_added") => {
+                // `select_added <i>` — select the i-th live added shape. The added
+                // list is sorted by AddId, so the index means the same on every
+                // peer (the harness uses this to reference a peer's drawn shape).
+                if let Some(i) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
+                    if let Some(a) = self.overlay.added.get(i) {
+                        self.selected = Some(Selection::Added(a.id));
+                        self.selected_tf = Transform::IDENTITY;
+                        self.move_delta = (0, 0);
+                    }
+                }
+            }
+            Some("tool") => match parts.next() {
+                Some("rect") => self.tool = Tool::Rect,
+                Some("poly") => self.tool = Tool::Poly,
+                _ => self.tool = Tool::Select,
+            },
+            Some("layer") => {
+                if let Some(i) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
+                    if i < self.layers.len() {
+                        self.active_layer = i;
+                    }
+                }
+            }
+            Some("draw_rect") => {
+                // `draw_rect x0 y0 x1 y1` — commit a rectangle directly (dodges
+                // pixel-accurate synthetic drags, same stance as `select`).
+                let mut n = || parts.next().and_then(|s| s.parse::<i32>().ok());
+                if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (n(), n(), n(), n()) {
+                    self.commit_rect(
+                        Point::new(snap_nm(x0 as f32), snap_nm(y0 as f32)),
+                        Point::new(snap_nm(x1 as f32), snap_nm(y1 as f32)),
+                    );
+                }
+            }
+            Some("draw_poly") => {
+                // `draw_poly x0 y0 x1 y1 x2 y2 [...]` — commit a polygon directly.
+                let coords: Vec<i32> = parts.filter_map(|s| s.parse::<i32>().ok()).collect();
+                if coords.len() >= 6 && coords.len() % 2 == 0 {
+                    self.poly_pts = coords
+                        .chunks_exact(2)
+                        .map(|c| Point::new(snap_nm(c[0] as f32), snap_nm(c[1] as f32)))
+                        .collect();
+                    self.commit_poly();
                 }
             }
             Some("pick") => {
@@ -974,7 +1184,7 @@ impl FluidApp {
                     .max_by_key(|&c| self.db.cell(c).shapes.len())
                     .filter(|&c| self.db.cell(c).shapes.len() > 0);
                 if let Some(cell) = biggest {
-                    self.selected = Some((cell, 0));
+                    self.selected = Some(Selection::Base((cell, 0)));
                     self.selected_tf = Transform::IDENTITY;
                     self.move_delta = self.existing_delta((cell, 0));
                 }
@@ -1124,21 +1334,48 @@ impl FluidApp {
             ui.separator();
             ui.label("Editing");
             ui.checkbox(&mut self.edit_mode, "Edit mode (click to select)");
+            if self.edit_mode {
+                // Phase 5 SLICE 1: the canvas tools + the layer new shapes draw on.
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tool, Tool::Select, "Select");
+                    ui.selectable_value(&mut self.tool, Tool::Rect, "▭ Rect");
+                    ui.selectable_value(&mut self.tool, Tool::Poly, "⬠ Poly");
+                });
+                if self.tool != Tool::Select && !self.layers.is_empty() {
+                    self.active_layer = self.active_layer.min(self.layers.len() - 1);
+                    let cur = self.layers[self.active_layer];
+                    egui::ComboBox::from_label("draw layer")
+                        .selected_text(format!("L{}/{}", cur.layer, cur.datatype))
+                        .show_ui(ui, |ui| {
+                            for i in 0..self.layers.len() {
+                                let l = self.layers[i];
+                                ui.selectable_value(&mut self.active_layer, i, format!("L{}/{}", l.layer, l.datatype));
+                            }
+                        });
+                    if self.tool == Tool::Poly {
+                        ui.small("click vertices · Enter/double-click closes · Esc cancels");
+                    } else {
+                        ui.small("drag corner-to-corner");
+                    }
+                    ui.small(format!("snap: {SNAP_NM} nm grid"));
+                }
+            }
             match self.selected {
-                Some((cell, idx)) => ui.small(format!("selected: cell {cell}, shape {idx}")),
+                Some(Selection::Base((cell, idx))) => ui.small(format!("selected: cell {cell}, shape {idx}")),
+                Some(Selection::Added((client, seq))) => ui.small(format!("selected: drawn #{client:x}:{seq}")),
                 None => ui.small("selected: (none)"),
             };
-            if let Some(id) = self.selected {
+            if let Some(sel) = self.selected {
                 // Nudge = a fixed translation step, the deterministic move path.
                 let step = self.nudge_step();
                 ui.horizontal(|ui| {
-                    if ui.button("←").clicked() { self.nudge(id, -step, 0); }
-                    if ui.button("→").clicked() { self.nudge(id, step, 0); }
-                    if ui.button("↑").clicked() { self.nudge(id, 0, step); }
-                    if ui.button("↓").clicked() { self.nudge(id, 0, -step); }
+                    if ui.button("←").clicked() { self.nudge(sel, -step, 0); }
+                    if ui.button("→").clicked() { self.nudge(sel, step, 0); }
+                    if ui.button("↑").clicked() { self.nudge(sel, 0, step); }
+                    if ui.button("↓").clicked() { self.nudge(sel, 0, -step); }
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() { self.delete_shape(id); }
+                    if ui.button("Delete").clicked() { self.delete_shape(sel); }
                     if ui.button("Deselect").clicked() { self.selected = None; }
                 });
                 ui.small(format!("move Δ: ({}, {}) nm", self.move_delta.0, self.move_delta.1));
@@ -1146,9 +1383,11 @@ impl FluidApp {
             if self.last_pick_us > 0.0 {
                 ui.small(format!("last hit-test: {:.0} µs", self.last_pick_us));
             }
-            let edits = self.overlay.deleted.len() + self.overlay.edited.len();
-            ui.small(format!("edits: {edits} (moved {}, deleted {})",
-                self.overlay.edited.len(), self.overlay.deleted.len()));
+            let edits = self.overlay.deleted.len() + self.overlay.edited.len() + self.overlay.added.len();
+            ui.small(format!("edits: {edits} (moved {}, deleted {}, drawn {})",
+                self.overlay.edited.len(),
+                self.overlay.deleted.len().saturating_sub(self.overlay.edited.len()),
+                self.overlay.added.len()));
             if self.last_edit_ms > 0.0 {
                 ui.small(format!("last edit: {} chunk(s) re-tess, {:.2} ms",
                     self.last_edit_chunks, self.last_edit_ms));
@@ -1183,27 +1422,99 @@ impl FluidApp {
                 cam.screen_to_world(Vec2::new(p.x - rect.min.x, p.y - rect.min.y))
             };
 
-            // Edit mode: a drag that begins on the selected shape moves it (from
-            // the base, via copy-on-write); any other drag pans as usual.
-            if resp.drag_started() && self.edit_mode && !shift {
-                if let (Some(id), Some(p)) = (self.selected, resp.interact_pointer_pos()) {
-                    if self.point_hits(id, world_at(p, &self.camera)) {
+            // Tool bookkeeping: an in-progress polygon only lives in the Poly tool.
+            if self.tool != Tool::Poly && !self.poly_pts.is_empty() {
+                self.poly_pts.clear();
+            }
+            let drawing = self.edit_mode && self.tool != Tool::Select;
+
+            // Draw tools (Phase 5 SLICE 1). Rect: drag corner-to-corner. Poly:
+            // click vertices; Enter/double-click closes; Escape cancels. Every
+            // authored coordinate snaps to the SNAP_NM grid.
+            if drawing && !shift {
+                match self.tool {
+                    Tool::Rect => {
+                        if resp.drag_started() {
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let w = world_at(p, &self.camera);
+                                self.rect_anchor = Some(Point::new(snap_nm(w.x), snap_nm(w.y)));
+                            }
+                        }
+                        if resp.drag_stopped() {
+                            if let (Some(a), Some(p)) = (self.rect_anchor.take(), resp.interact_pointer_pos()) {
+                                let w = world_at(p, &self.camera);
+                                self.commit_rect(a, Point::new(snap_nm(w.x), snap_nm(w.y)));
+                            }
+                        }
+                    }
+                    Tool::Poly => {
+                        if resp.double_clicked() {
+                            self.commit_poly();
+                        } else if resp.clicked() {
+                            if let Some(p) = resp.interact_pointer_pos() {
+                                let w = world_at(p, &self.camera);
+                                let v = Point::new(snap_nm(w.x), snap_nm(w.y));
+                                if self.poly_pts.last() != Some(&v) {
+                                    self.poly_pts.push(v);
+                                }
+                            }
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.commit_poly();
+                        }
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.poly_pts.clear();
+                        }
+                    }
+                    Tool::Select => {}
+                }
+            }
+
+            // Edit mode (Select tool): a drag that begins on the selected shape
+            // moves it (copy-on-write); any other drag pans as usual.
+            if resp.drag_started() && self.edit_mode && !drawing && !shift {
+                if let (Some(sel), Some(p)) = (self.selected, resp.interact_pointer_pos()) {
+                    if self.point_hits(sel, world_at(p, &self.camera)) {
                         self.drag_move_from = Some(world_at(p, &self.camera));
                         self.drag_move_base = self.move_delta;
+                        // An added shape has no base to rebuild from — snapshot its
+                        // geometry so the preview translates from a fixed origin.
+                        self.drag_added_start = match sel {
+                            Selection::Added(id) => self.overlay.find_added(id).map(|a| a.shape.points.clone()),
+                            Selection::Base(_) => None,
+                        };
                     }
                 }
             }
             if resp.dragged() {
-                if let (Some(from), Some(id), Some(p)) =
+                if let (Some(from), Some(sel), Some(p)) =
                     (self.drag_move_from, self.selected, resp.interact_pointer_pos())
                 {
-                    // World drag delta → the selected cell's LOCAL frame (the move
-                    // is stored cell-local), so at the clicked placement the shape
-                    // follows the cursor even under rotation/scale.
                     let d = world_at(p, &self.camera) - from;
-                    let (ldx, ldy) = self.world_delta_to_local(d.x as f64, d.y as f64);
-                    self.preview_move(id, self.drag_move_base.0 + ldx, self.drag_move_base.1 + ldy);
-                } else if !shift {
+                    match sel {
+                        Selection::Base(id) => {
+                            // World drag delta → the selected cell's LOCAL frame (the
+                            // move is stored cell-local), so at the clicked placement
+                            // the shape follows the cursor even under rotation/scale.
+                            let (ldx, ldy) = self.world_delta_to_local(d.x as f64, d.y as f64);
+                            self.preview_move(id, self.drag_move_base.0 + ldx, self.drag_move_base.1 + ldy);
+                        }
+                        Selection::Added(id) => {
+                            // TOP-cell adds: world == local. Preview by translating
+                            // the drag-start snapshot; the CRDT write happens once,
+                            // on release.
+                            let (ddx, ddy) = (d.x.round() as i32, d.y.round() as i32);
+                            if let Some(start) = self.drag_added_start.clone() {
+                                if let Some(a) = self.overlay.find_added_mut(id) {
+                                    a.shape.points =
+                                        start.iter().map(|q| Point::new(q.x + ddx, q.y + ddy)).collect();
+                                    self.move_delta = (ddx, ddy);
+                                    self.overlay_dirty = true;
+                                }
+                            }
+                        }
+                    }
+                } else if !shift && !drawing {
                     let d = resp.drag_delta();
                     self.camera.pan_pixels(d.x, d.y);
                     self.dragging = true;
@@ -1212,11 +1523,20 @@ impl FluidApp {
             if resp.drag_stopped() {
                 // Commit the previewed move to the CRDT once (broadcast + undoable).
                 if self.drag_move_from.is_some() {
-                    if let Some(id) = self.selected {
-                        self.commit_move(id, self.move_delta.0, self.move_delta.1);
+                    match self.selected {
+                        Some(Selection::Base(id)) => self.commit_move(id, self.move_delta.0, self.move_delta.1),
+                        Some(Selection::Added(id)) => {
+                            if let Some(a) = self.overlay.find_added(id) {
+                                let (cell, layer, pts) = (a.cell, a.shape.layer, a.shape.points.clone());
+                                self.session.set_added_geometry(id, cell, layer, &pts);
+                                self.reconcile_edits();
+                            }
+                        }
+                        None => {}
                     }
                 }
                 self.drag_move_from = None;
+                self.drag_added_start = None;
             }
 
             // Delete key removes the selection.
@@ -1249,9 +1569,10 @@ impl FluidApp {
                 }
             }
 
-            // Edit mode: a plain click selects a TOP-cell shape (drag still pans,
-            // so navigation is unaffected). Clicking empty space deselects.
-            if self.edit_mode && resp.clicked() {
+            // Edit mode, Select tool: a plain click selects the shape under the
+            // cursor (drag still pans, so navigation is unaffected). Clicking
+            // empty space deselects. The draw tools consume clicks instead.
+            if self.edit_mode && self.tool == Tool::Select && resp.clicked() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
                     self.pick_at(self.camera.screen_to_world(local));
@@ -1272,13 +1593,19 @@ impl FluidApp {
 
             // Highlight the selected shape's outline at the clicked placement:
             // cell-local points → world (via the placement transform) → screen.
-            // Uses the moved copy's geometry when the selection has been moved, so
+            // Uses the current overlay geometry (moved copy / added shape), so
             // the highlight tracks the shape.
-            if let Some((cell, idx)) = self.selected {
-                let moved = self.overlay.edited.get(&(cell, idx));
-                let pts: Vec<Point> = match moved {
-                    Some(shape) => shape.points.clone(),
-                    None => self.db.cell(cell).shapes.points(idx as usize).to_vec(),
+            if let Some(sel) = self.selected {
+                let pts: Vec<Point> = match sel {
+                    Selection::Base((cell, idx)) => match self.overlay.edited.get(&(cell, idx)) {
+                        Some(shape) => shape.points.clone(),
+                        None => self.db.cell(cell).shapes.points(idx as usize).to_vec(),
+                    },
+                    Selection::Added(id) => self
+                        .overlay
+                        .find_added(id)
+                        .map(|a| a.shape.points.clone())
+                        .unwrap_or_default(),
                 };
                 let screen: Vec<egui::Pos2> = pts
                     .iter()
@@ -1291,6 +1618,32 @@ impl FluidApp {
                     let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 230, 0));
                     painter.add(egui::Shape::closed_line(screen, stroke));
                 }
+            }
+
+            // Draw-tool previews (Phase 5 SLICE 1): the in-progress rect corner
+            // drag and the open polygon, screen-space like the highlight.
+            let preview_stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 220, 255));
+            if let Some(a) = self.rect_anchor {
+                if let Some(p) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) {
+                    let w = world_at(p, &self.camera);
+                    let b = Point::new(snap_nm(w.x), snap_nm(w.y));
+                    let r = egui::Rect::from_two_pos(
+                        self.world_to_screen(Vec2::new(a.x as f32, a.y as f32), rect),
+                        self.world_to_screen(Vec2::new(b.x as f32, b.y as f32), rect),
+                    );
+                    painter.rect_stroke(r, 0.0, preview_stroke);
+                }
+            }
+            if !self.poly_pts.is_empty() {
+                let mut screen: Vec<egui::Pos2> = self
+                    .poly_pts
+                    .iter()
+                    .map(|q| self.world_to_screen(Vec2::new(q.x as f32, q.y as f32), rect))
+                    .collect();
+                if let Some(p) = resp.hover_pos() {
+                    screen.push(p); // rubber band to the cursor
+                }
+                painter.add(egui::Shape::line(screen, preview_stroke));
             }
 
             for (_, pres) in self.session.remote.iter() {

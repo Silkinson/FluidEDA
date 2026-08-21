@@ -231,10 +231,12 @@ fn edit_overlay_goldens() {
     check_one("edit_base", get("base"));
     check_one("edit_moved", get("moved"));
     check_one("edit_deleted", get("deleted"));
+    check_one("edit_added", get("added"));
 
     // Sanity: the edits must actually move pixels, or the goldens prove nothing.
     let (moved_changed, _) = diff(get("moved"), get("base"));
     let (deleted_changed, _) = diff(get("deleted"), get("base"));
+    let (added_changed, _) = diff(get("added"), get("base"));
     assert!(
         moved_changed as f64 / (W * H) as f64 > 0.01,
         "move changed only {moved_changed} px — suspiciously close to a no-op"
@@ -243,10 +245,15 @@ fn edit_overlay_goldens() {
         deleted_changed as f64 / (W * H) as f64 > 0.005,
         "delete changed only {deleted_changed} px — suspiciously close to a no-op"
     );
+    assert!(
+        added_changed as f64 / (W * H) as f64 > 0.005,
+        "drawn shape changed only {added_changed} px — suspiciously close to a no-op"
+    );
 }
 
 /// Render the edit fixture at fit under: no overlay ("base"), an empty overlay
-/// ("empty"), a moved shape 0 ("moved"), a deleted shape 2 ("deleted").
+/// ("empty"), a moved shape 0 ("moved"), a deleted shape 2 ("deleted"), and a
+/// drawn rectangle ("added" — Phase 5 SLICE 1).
 async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
     let db = fluideda_core::gds::load_gds_db(EDIT_FIXTURE).expect("parse fixture");
     let top = db.top;
@@ -260,6 +267,10 @@ async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
     moved.move_shape((top, 0), fluideda_core::edit::translate(s0.layer, &s0.points, 1200, 700));
     let mut deleted = EditOverlay::new();
     deleted.delete((top, 2));
+    // Draw a brand-new rectangle in empty space (as the rect tool would emit it:
+    // closed ring, snapped coords) — big enough to be a couple hundred pixels.
+    let mut added = EditOverlay::new();
+    added.add((1, 0), top, added_rect(&db));
     let empty = EditOverlay::new();
 
     let instance = wgpu::Instance::default();
@@ -272,11 +283,12 @@ async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
         .await
         .expect("request_device");
 
-    let overlays: [(&'static str, Option<&EditOverlay>); 4] = [
+    let overlays: [(&'static str, Option<&EditOverlay>); 5] = [
         ("base", None),
         ("empty", Some(&empty)),
         ("moved", Some(&moved)),
         ("deleted", Some(&deleted)),
+        ("added", Some(&added)),
     ];
     let mut out = Vec::new();
     for (name, overlay) in overlays {
@@ -292,6 +304,24 @@ fn base_shape(db: &fluideda_core::CellDb, cell: usize, idx: usize) -> Polygon {
     Polygon { layer: s.layer(idx), points: s.points(idx).to_vec() }
 }
 
+/// A deterministic drawn rectangle placed in the fixture's lower-left quadrant —
+/// sized to the design so it covers a visible block of pixels at fit.
+fn added_rect(db: &fluideda_core::CellDb) -> Polygon {
+    let wb = db.world_bbox();
+    let (x0, y0) = (wb.min_x as i32 + 200, wb.min_y as i32 + 200);
+    let (x1, y1) = (x0 + (wb.width() * 0.25) as i32, y0 + (wb.height() * 0.18) as i32);
+    Polygon {
+        layer: fluideda_core::Layer::new(3, 0),
+        points: vec![
+            fluideda_core::Point::new(x0, y0),
+            fluideda_core::Point::new(x1, y0),
+            fluideda_core::Point::new(x1, y1),
+            fluideda_core::Point::new(x0, y1),
+            fluideda_core::Point::new(x0, y0),
+        ],
+    }
+}
+
 /// GDS export round-trip renders identically (Phase 3 SLICE 1): an edited design
 /// (base + overlay) and the same design after export→re-import must produce the
 /// same picture. Proves "save your edits and reopen gets you back what you saw."
@@ -304,11 +334,14 @@ fn export_round_trip_renders_identically() {
         let (cx, cy) = ((wb.min_x + wb.max_x) * 0.5, (wb.min_y + wb.max_y) * 0.5);
         let span = wb.width().max(wb.height()) * 1.05;
 
-        // One overlay carrying both an edit kinds: move shape 0, delete shape 2.
+        // One overlay carrying every edit kind: move shape 0, delete shape 2, and
+        // DRAW a new rectangle (Phase 5 SLICE 1 — draw → export → reimport must
+        // pixel-match too).
         let s0 = base_shape(&db, top, 0);
         let mut overlay = EditOverlay::new();
         overlay.move_shape((top, 0), fluideda_core::edit::translate(s0.layer, &s0.points, 1200, 700));
         overlay.delete((top, 2));
+        overlay.add((1, 0), top, added_rect(&db));
 
         // Export the composite, re-import it (a plain design, no overlay).
         let bytes = fluideda_core::write_gds(&db, &overlay);

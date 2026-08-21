@@ -180,8 +180,8 @@ fn emit_overlay(
     for (&(cell, _), shape) in &overlay.edited {
         emit(cell, shape);
     }
-    for (cell, shape) in &overlay.added {
-        emit(*cell, shape);
+    for a in &overlay.added {
+        emit(a.cell, &a.shape);
     }
 }
 

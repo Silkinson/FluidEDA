@@ -36,7 +36,7 @@ pub mod types;
 pub use chunk::{Chunk, ChunkId};
 pub use cull::{cull, cull_counted, cull_with_overlay, CellDraw, CullStats, VisibleSet};
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
-pub use edit::{BaseShapeId, EditOverlay, Shape};
+pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, Shape};
 pub use gds_write::write_gds;
 pub use index::ShapeIndex;
 pub use pick::{pick_hierarchy, pick_in_cell, point_in_polygon, PickHit};

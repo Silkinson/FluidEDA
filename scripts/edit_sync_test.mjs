@@ -95,6 +95,37 @@ async function main() {
     const a4 = await waitFor(A, (s) => s.edited === 3, 'A recorded the non-TOP move');
     const b4 = await waitFor(B, (s) => s.edited === 3, 'B sees the non-TOP move');
     check(a4.moves === 3 && b4.moves === 3, 'non-TOP (LEAF) edit converges A→B (cell-scoped CRDT)');
+
+    // --- Phase 5 SLICE 1: draw-new-shape --------------------------------------
+
+    // 5. A draws a rect; the add ships its geometry (there is no base to rebuild
+    //    from), so B must see the same shape.
+    await cmd(A, 'draw_rect 100 100 3100 2100');
+    const a5 = await waitFor(A, (s) => s.adds === 1, 'A recorded its drawn rect');
+    const b5 = await waitFor(B, (s) => s.adds === 1, "B sees A's drawn rect");
+    check(a5.adds === 1 && b5.adds === 1, 'drawn rect propagates A→B (geometry-carrying add)');
+
+    // 6. CONCURRENT adds: both peers draw before waiting on either — distinct
+    //    creators mint distinct AddIds, so BOTH shapes must survive convergence.
+    await cmd(A, 'draw_rect 5000 5000 8000 7000');
+    await cmd(B, 'draw_poly 9000 9000 12000 9000 10500 11500');
+    const a6 = await waitFor(A, (s) => s.adds === 3, 'A converges to 3 drawn shapes');
+    const b6 = await waitFor(B, (s) => s.adds === 3, 'B converges to 3 drawn shapes');
+    check(a6.adds === 3 && b6.adds === 3, 'concurrent adds converge: both survive (distinct AddIds)');
+
+    // 7. B deletes A's first drawn shape BY ITS AddId (`select_added` indexes the
+    //    sorted add list — deterministic, so index 0 is the same shape on both).
+    await cmd(B, 'select_added 0');
+    await waitFor(B, (s) => s.selected_added === 0, 'B selected the added shape');
+    await cmd(B, 'delete');
+    const a7 = await waitFor(A, (s) => s.adds === 2, "A sees B's delete of the added shape");
+    check(a7.adds === 2, 'a peer deletes an added shape by AddId; converges');
+
+    // 8. Undo in B restores the add it just deleted (per-user undo covers adds).
+    await cmd(B, 'undo');
+    const a8 = await waitFor(A, (s) => s.adds === 3, "A sees B's undo restore the add");
+    const b8 = await waitFor(B, (s) => s.adds === 3, 'B restored the add locally');
+    check(a8.adds === 3 && b8.adds === 3, 'undo of an added-shape delete restores it everywhere');
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

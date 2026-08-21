@@ -91,9 +91,9 @@ pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
                 w.boundary(shape.layer, &shape.points);
             }
         }
-        for (c, shape) in &overlay.added {
-            if *c == id {
-                w.boundary(shape.layer, &shape.points);
+        for a in &overlay.added {
+            if a.cell == id {
+                w.boundary(a.shape.layer, &a.shape.points);
             }
         }
 
@@ -280,9 +280,9 @@ mod tests {
                 out.push((s.layer, s.points.clone()));
             }
         }
-        for (cc, s) in &overlay.added {
-            if *cc == cell {
-                out.push((s.layer, s.points.clone()));
+        for a in &overlay.added {
+            if a.cell == cell {
+                out.push((a.shape.layer, a.shape.points.clone()));
             }
         }
         out.sort_by_key(|(l, p)| (l.layer, l.datatype, p.first().map(|q| (q.x, q.y))));
@@ -292,7 +292,8 @@ mod tests {
     /// Assert an export re-imports (through a `reader`) to the composited design.
     fn assert_round_trip(bytes: &[u8], reader: fn(&[u8]) -> anyhow::Result<CellDb>, label: &str) {
         let db = crate::gds::load_gds_db(bytes).unwrap();
-        // A representative edit: move shape 0 of TOP, delete shape 1 (if present).
+        // Representative edits: move shape 0 of TOP, delete shape 1, and ADD a
+        // brand-new rectangle (Phase 5 SLICE 1 — export must carry drawn shapes).
         let top = db.top;
         let mut overlay = EditOverlay::new();
         if db.cells[top].shapes.len() >= 2 {
@@ -301,6 +302,20 @@ mod tests {
             overlay.move_shape((top, 0), crate::edit::translate(l0, &pts0, 4000, -2000));
             overlay.delete((top, 1));
         }
+        overlay.add(
+            (99, 0),
+            top,
+            crate::edit::Shape {
+                layer: Layer::new(3, 0),
+                points: vec![
+                    Point::new(100, 100),
+                    Point::new(600, 100),
+                    Point::new(600, 400),
+                    Point::new(100, 400),
+                    Point::new(100, 100), // closed ring, as the draw tools emit
+                ],
+            },
+        );
 
         let out = write_gds(&db, &overlay);
         let re = reader(&out).unwrap_or_else(|e| panic!("{label}: re-import failed: {e}"));

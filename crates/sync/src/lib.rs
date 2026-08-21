@@ -20,7 +20,7 @@
 
 use anyhow::Result;
 use ewebsock::{WsMessage, WsReceiver, WsSender};
-use fluideda_core::BaseShapeId;
+use fluideda_core::{AddId, BaseShapeId, CellId, Layer, Point};
 use glam::Vec2;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,16 +47,32 @@ pub struct Presence {
     pub color: [f32; 4],
 }
 
-/// A shape edit as carried by the CRDT. Geometry is NOT shipped — a move stores
-/// only its translation, and the receiver reconstructs the moved shape from its
-/// own copy of the base (both peers loaded the same GDS, so base ids + geometry
-/// match). Keeps edits tiny and independent of tessellation.
+/// A base-shape edit as carried by the CRDT. Geometry is NOT shipped for
+/// move/delete — a move stores only its translation, and the receiver
+/// reconstructs the moved shape from its own copy of the base (both peers loaded
+/// the same GDS, so base ids + geometry match). Keeps edits tiny and independent
+/// of tessellation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EditKind {
     /// Translate the base shape by `(dx, dy)` nm.
     Move { dx: i32, dy: i32 },
     /// Tombstone the base shape.
     Delete,
+}
+
+/// The CRDT-side record of an **added** shape (Phase 5 SLICE 1).
+///
+/// AMENDMENT to the "ship the op, not geometry" rule: an add MUST ship its full
+/// geometry — there is no base shape on the peer to rebuild it from. The record
+/// is the shape's complete current state (cell + layer + points), last-writer-wins
+/// per [`AddId`]; a later move/vertex-edit of the added shape rewrites this record
+/// wholesale. `None` geometry = the add was deleted (tombstone value), kept as an
+/// entry so LWW between a concurrent move and delete stays well-defined.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddedGeom {
+    pub cell: CellId,
+    pub layer: Layer,
+    pub points: Vec<Point>,
 }
 
 /// Message envelope on the wire. Byte 0 tags the channel.
@@ -90,6 +106,10 @@ pub struct Session {
     pub local: Presence,
     pub remote: HashMap<u64, Presence>,
     client_id: u64,
+    /// Per-client counter minting [`AddId`]s for shapes drawn in this session.
+    /// `(client_id, seq)` is unique across peers (distinct client ids) and across
+    /// this session's own adds (monotonic seq) — the id survives concurrent adds.
+    next_add_seq: u32,
 }
 
 impl Session {
@@ -129,6 +149,7 @@ impl Session {
             local,
             remote: HashMap::new(),
             client_id,
+            next_add_seq: 0,
         }
     }
 
@@ -222,6 +243,69 @@ impl Session {
                 out.push((id, kind));
             }
         }
+        out
+    }
+
+    // --- Phase 5 SLICE 1: added shapes ---------------------------------------
+    //
+    // Adds live in the SAME "edits" map as base edits, under a distinct key form
+    // (`a<client>:<seq>` — base keys are digit-first `<cell>:<idx>`, so the two
+    // can never collide). One map ⇒ one UndoManager scope: undo/redo covers adds
+    // with zero extra machinery, and per-key LWW gives the concurrency story:
+    // concurrent adds have distinct keys (both survive); concurrent ops on the
+    // SAME added shape (move vs delete vs vertex-edit) converge last-writer-wins.
+
+    /// Draw a brand-new shape into `cell`. Ships the FULL geometry (see
+    /// [`AddedGeom`] for the documented amendment) and returns the freshly minted
+    /// stable id peers will know it by.
+    pub fn add_shape(&mut self, cell: CellId, layer: Layer, points: &[Point]) -> AddId {
+        let id: AddId = (self.client_id, self.next_add_seq);
+        self.next_add_seq += 1;
+        self.write_add(id, cell, layer, points);
+        id
+    }
+
+    /// Rewrite an added shape's geometry wholesale (its move or vertex-edit —
+    /// geometry IS the state for adds, last-writer-wins per id).
+    pub fn set_added_geometry(&mut self, id: AddId, cell: CellId, layer: Layer, points: &[Point]) {
+        self.write_add(id, cell, layer, points);
+    }
+
+    /// Delete an added shape: overwrite its record with the tombstone value.
+    /// (An overwrite, not a key removal, so a concurrent geometry rewrite and a
+    /// delete converge by plain LWW like every other pair of ops.)
+    pub fn delete_added(&mut self, id: AddId) {
+        {
+            let mut txn = self.doc.transact_mut_with(self.origin.clone());
+            self.edits.insert(&mut txn, add_key_of(id), "X".to_string());
+        }
+        self.broadcast_local();
+    }
+
+    fn write_add(&mut self, id: AddId, cell: CellId, layer: Layer, points: &[Point]) {
+        let mut value = format!("A {} {} {}", cell, layer.layer, layer.datatype);
+        for p in points {
+            value.push_str(&format!(" {} {}", p.x, p.y));
+        }
+        {
+            let mut txn = self.doc.transact_mut_with(self.origin.clone());
+            self.edits.insert(&mut txn, add_key_of(id), value);
+        }
+        self.broadcast_local();
+    }
+
+    /// Every added-shape record currently in the CRDT: `(id, Some(geometry))` for
+    /// live shapes, `(id, None)` for tombstoned ones. The app rebuilds its
+    /// overlay's `added` from the live entries (sorted by id for a deterministic
+    /// cross-peer draw order).
+    pub fn adds(&self) -> Vec<(AddId, Option<AddedGeom>)> {
+        let txn = self.doc.transact();
+        let mut out = Vec::new();
+        for (k, v) in self.edits.iter(&txn) {
+            let (Some(id), Out::Any(Any::String(s))) = (parse_add_key(k), v) else { continue };
+            out.push((id, parse_add_value(&s)));
+        }
+        out.sort_by_key(|(id, _)| *id);
         out
     }
 
@@ -324,6 +408,36 @@ fn parse_key(k: &str) -> Option<BaseShapeId> {
     Some((c.parse().ok()?, i.parse().ok()?))
 }
 
+/// Added-shape key: `a<client>:<seq>`. Digit-first base keys can never collide
+/// with the `a` prefix, so both kinds share the one map (and one undo scope).
+fn add_key_of(id: AddId) -> String {
+    format!("a{}:{}", id.0, id.1)
+}
+
+fn parse_add_key(k: &str) -> Option<AddId> {
+    let rest = k.strip_prefix('a')?;
+    let (c, s) = rest.split_once(':')?;
+    Some((c.parse().ok()?, s.parse().ok()?))
+}
+
+/// Added-shape value: `A <cell> <layer> <datatype> <x0> <y0> ...` (live) or `X`
+/// (tombstoned). Returns `None` for the tombstone or anything malformed.
+fn parse_add_value(s: &str) -> Option<AddedGeom> {
+    let mut it = s.split_whitespace();
+    if it.next()? != "A" {
+        return None; // "X" tombstone, or garbage
+    }
+    let cell: CellId = it.next()?.parse().ok()?;
+    let layer: u16 = it.next()?.parse().ok()?;
+    let datatype: u16 = it.next()?.parse().ok()?;
+    let coords: Vec<i32> = it.map(|t| t.parse().ok()).collect::<Option<Vec<_>>>()?;
+    if coords.len() < 6 || coords.len() % 2 != 0 {
+        return None; // need at least 3 points, in pairs
+    }
+    let points = coords.chunks_exact(2).map(|c| Point::new(c[0], c[1])).collect();
+    Some(AddedGeom { cell, layer: Layer::new(layer, datatype), points })
+}
+
 fn parse_kind(s: &str) -> Option<EditKind> {
     let mut it = s.split_whitespace();
     match it.next()? {
@@ -424,6 +538,90 @@ mod tests {
         eb.sort_by_key(|(id, _)| *id);
         assert_eq!(ea, eb, "both sessions must converge to the same edit set");
         assert_eq!(ea.len(), 2);
+    }
+
+    fn exchange(a: &mut Session, b: &mut Session) {
+        let ua = a.doc.transact().encode_state_as_update_v1(&StateVector::default());
+        let ub = b.doc.transact().encode_state_as_update_v1(&StateVector::default());
+        {
+            let mut txn = a.doc.transact_mut();
+            let _ = txn.apply_update(yrs::Update::decode_v1(&ub).unwrap());
+        }
+        {
+            let mut txn = b.doc.transact_mut();
+            let _ = txn.apply_update(yrs::Update::decode_v1(&ua).unwrap());
+        }
+    }
+
+    fn tri(x: i32, y: i32) -> Vec<Point> {
+        vec![Point::new(x, y), Point::new(x + 100, y), Point::new(x + 100, y + 80), Point::new(x, y)]
+    }
+
+    #[test]
+    fn add_key_and_value_round_trip() {
+        assert_eq!(parse_add_key("a184467:12"), Some((184467u64, 12u32)));
+        assert_eq!(parse_add_key("5:3"), None, "base keys must not parse as adds");
+        let g = parse_add_value("A 7 66 20 0 0 100 0 100 80").unwrap();
+        assert_eq!(g.cell, 7);
+        assert_eq!(g.layer, Layer::new(66, 20));
+        assert_eq!(g.points.len(), 3);
+        assert_eq!(parse_add_value("X"), None, "tombstone parses as no geometry");
+        assert_eq!(parse_add_value("A 7 66 20 0 0 100 0"), None, "< 3 points rejected");
+    }
+
+    /// THE SLICE 1 convergence requirement: two peers drawing simultaneously
+    /// (before any exchange) must both survive — distinct creators mint distinct
+    /// ids, so the adds land under different map keys.
+    #[test]
+    fn concurrent_adds_converge_to_both() {
+        let mut a = Session::new(Presence { cursor: Vec2::ZERO, name: "a".into(), color: [0.0; 4] });
+        let mut b = Session::new(Presence { cursor: Vec2::ZERO, name: "b".into(), color: [0.0; 4] });
+
+        let ida = a.add_shape(0, Layer::new(1, 0), &tri(0, 0));
+        let idb = b.add_shape(0, Layer::new(2, 0), &tri(500, 500));
+        assert_ne!(ida, idb, "distinct clients must mint distinct ids");
+
+        exchange(&mut a, &mut b);
+
+        let (adds_a, adds_b) = (a.adds(), b.adds());
+        assert_eq!(adds_a, adds_b, "both peers see the identical add set");
+        assert_eq!(adds_a.len(), 2, "both concurrent adds survive");
+        assert!(adds_a.iter().all(|(_, g)| g.is_some()));
+    }
+
+    /// Moving/deleting an ADDED shape references its AddId (not a BaseShapeId)
+    /// and converges: here A adds, B (after sync) deletes A's shape by id.
+    #[test]
+    fn peer_can_delete_an_added_shape_by_id() {
+        let mut a = Session::new(Presence { cursor: Vec2::ZERO, name: "a".into(), color: [0.0; 4] });
+        let mut b = Session::new(Presence { cursor: Vec2::ZERO, name: "b".into(), color: [0.0; 4] });
+
+        let id = a.add_shape(0, Layer::new(1, 0), &tri(0, 0));
+        exchange(&mut a, &mut b);
+        assert_eq!(b.adds().len(), 1, "B received the add");
+
+        b.delete_added(id);
+        exchange(&mut a, &mut b);
+        assert_eq!(a.adds(), b.adds());
+        assert!(a.adds()[0].1.is_none(), "the add is tombstoned on both peers");
+    }
+
+    /// Undo covers adds with no extra machinery (same map, same tracked origin):
+    /// undoing an add removes it; redo restores it — and only for the author.
+    #[test]
+    fn undo_covers_adds_per_user() {
+        let mut a = Session::new(Presence { cursor: Vec2::ZERO, name: "a".into(), color: [0.0; 4] });
+        let id = a.add_shape(0, Layer::new(1, 0), &tri(0, 0));
+        assert_eq!(a.adds().len(), 1);
+
+        assert!(a.undo(), "undo of the add");
+        assert!(a.adds().is_empty() || a.adds()[0].1.is_none(), "add gone after undo");
+
+        assert!(a.redo(), "redo of the add");
+        let redone = a.adds();
+        assert_eq!(redone.len(), 1);
+        assert_eq!(redone[0].0, id, "redo restores the same stable id");
+        assert!(redone[0].1.is_some());
     }
 
     /// Undo reverts only the local client's edits, not a peer's.

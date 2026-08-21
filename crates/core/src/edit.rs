@@ -56,18 +56,38 @@ use std::collections::{HashMap, HashSet};
 /// keyed by `(cell, index)` rather than by shipping geometry.
 pub type BaseShapeId = (CellId, u32);
 
+/// Identifies one **added** shape: `(creator's CRDT client id, per-client seq)`.
+///
+/// An added shape has no base index to agree on, so its id must be minted by its
+/// creator and survive concurrent adds: two peers drawing simultaneously mint
+/// distinct ids (distinct client ids) and both shapes exist after convergence.
+/// Plain data — core stays network-free; the sync crate maps this to a CRDT key.
+pub type AddId = (u64, u32);
+
 /// An overlay polygon (a moved copy or an added shape), in its cell's local nm.
 /// Aliased to [`Polygon`] so the existing tessellator consumes it directly.
 pub type Shape = Polygon;
+
+/// A brand-new shape drawn in this session (Phase 5 SLICE 1). Carries its stable
+/// cross-peer [`AddId`] (so later moves/deletes/vertex-edits of it reference the
+/// id, not a `BaseShapeId`) and its owning cell (the coordinate frame — TOP for
+/// everything the draw tools produce today).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddedShape {
+    pub id: AddId,
+    pub cell: CellId,
+    pub shape: Shape,
+}
 
 /// The copy-on-write editing overlay. Empty overlay ⇒ the scene renders exactly
 /// as the base (the golden invariant).
 #[derive(Default, Clone)]
 pub struct EditOverlay {
-    /// Brand-new shapes and their owning cell. (The prompt models this as
-    /// `Vec<Shape>`; we carry the `CellId` too so added geometry has a coordinate
-    /// frame and a home for GDS export — see the module non-goal note.)
-    pub added: Vec<(CellId, Shape)>,
+    /// Brand-new shapes (Phase 5 SLICE 1 — the draw tools). Each carries its
+    /// stable cross-peer id and its owning cell (the coordinate frame and its
+    /// home for GDS export). Kept sorted by id when rebuilt from the CRDT so
+    /// every peer draws them in the same deterministic order.
+    pub added: Vec<AddedShape>,
     /// Copy-on-write replacements: the moved copy of a base shape.
     pub edited: HashMap<BaseShapeId, Shape>,
     /// Tombstoned base shapes — a delete, and the base half of every move.
@@ -130,6 +150,46 @@ impl EditOverlay {
         self.recompute_cell(id.0);
     }
 
+    // --- added shapes (Phase 5 SLICE 1) --------------------------------------
+
+    /// Record a brand-new shape. Replaces any existing entry with the same id
+    /// (an add's geometry is last-writer-wins — a move/vertex-edit of an added
+    /// shape rewrites it wholesale, since there is no base to diff against).
+    pub fn add(&mut self, id: AddId, cell: CellId, shape: Shape) {
+        match self.added.iter_mut().find(|a| a.id == id) {
+            Some(a) => {
+                let old_cell = a.cell;
+                a.cell = cell;
+                a.shape = shape;
+                if old_cell != cell {
+                    self.recompute_cell(old_cell);
+                }
+            }
+            None => self.added.push(AddedShape { id, cell, shape }),
+        }
+        self.edited_cells.insert(cell);
+    }
+
+    /// Drop an added shape (its delete, or the undo of its add). No tombstone —
+    /// there is no base underneath to suppress.
+    pub fn remove_added(&mut self, id: AddId) {
+        if let Some(pos) = self.added.iter().position(|a| a.id == id) {
+            let cell = self.added.remove(pos).cell;
+            self.recompute_cell(cell);
+        }
+    }
+
+    /// The added shape with this id, if it exists.
+    pub fn find_added(&self, id: AddId) -> Option<&AddedShape> {
+        self.added.iter().find(|a| a.id == id)
+    }
+
+    /// Mutable access to an added shape (the local drag preview mutates geometry
+    /// in place; the authoritative CRDT write happens on release).
+    pub fn find_added_mut(&mut self, id: AddId) -> Option<&mut AddedShape> {
+        self.added.iter_mut().find(|a| a.id == id)
+    }
+
     fn suppress(&mut self, id: BaseShapeId) {
         self.edited_cells.insert(id.0);
         self.suppressed.entry(id.0).or_default().insert(id.1);
@@ -147,7 +207,7 @@ impl EditOverlay {
         }
         let touched = !idxs.is_empty()
             || self.edited.keys().any(|&(c, _)| c == cell)
-            || self.added.iter().any(|(c, _)| *c == cell);
+            || self.added.iter().any(|a| a.cell == cell);
         if idxs.is_empty() {
             self.suppressed.remove(&cell);
         } else {
@@ -226,6 +286,43 @@ mod tests {
         o.restore((2, 4));
         assert!(!o.edits_cell(2), "no edits left → cell back on pristine path");
         assert!(o.suppressed_in(2).is_none());
+    }
+
+    #[test]
+    fn add_flags_cell_and_remove_unflags() {
+        let mut o = EditOverlay::new();
+        let id: AddId = (42, 0);
+        o.add(id, 3, poly());
+        assert!(!o.is_empty());
+        assert!(o.edits_cell(3), "added shape must flag its cell for compositing");
+        assert!(o.suppressed_in(3).is_none(), "an add suppresses no base shape");
+        assert_eq!(o.find_added(id).map(|a| &a.shape), Some(&poly()));
+
+        o.remove_added(id);
+        assert!(o.is_empty());
+        assert!(!o.edits_cell(3), "cell back on the pristine path");
+    }
+
+    #[test]
+    fn add_same_id_is_last_writer_wins() {
+        // A move/vertex-edit of an added shape rewrites its geometry wholesale.
+        let mut o = EditOverlay::new();
+        let id: AddId = (7, 1);
+        o.add(id, 0, poly());
+        let moved = translate(poly().layer, &poly().points, 50, 50);
+        o.add(id, 0, moved.clone());
+        assert_eq!(o.added.len(), 1, "same id must replace, not duplicate");
+        assert_eq!(o.find_added(id).map(|a| &a.shape), Some(&moved));
+    }
+
+    #[test]
+    fn concurrent_ids_from_different_clients_coexist() {
+        // The convergence property the id scheme exists for: distinct creators ⇒
+        // distinct ids ⇒ both shapes survive.
+        let mut o = EditOverlay::new();
+        o.add((1, 0), 0, poly());
+        o.add((2, 0), 0, poly());
+        assert_eq!(o.added.len(), 2);
     }
 
     #[test]
