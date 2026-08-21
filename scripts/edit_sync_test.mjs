@@ -126,6 +126,46 @@ async function main() {
     const a8 = await waitFor(A, (s) => s.adds === 3, "A sees B's undo restore the add");
     const b8 = await waitFor(B, (s) => s.adds === 3, 'B restored the add locally');
     check(a8.adds === 3 && b8.adds === 3, 'undo of an added-shape delete restores it everywhere');
+
+    // --- Phase 5 SLICE 2: vertex editing --------------------------------------
+
+    // 9. A vertex-edits a fresh TOP shape (4): the record ships the full ring
+    //    ("P ..."), so B must converge (geom_edits counts SetPoints records).
+    await cmd(A, 'select 4'); await sleep(150);
+    await cmd(A, 'vertex 1 900 700');
+    const a9 = await waitFor(A, (s) => s.geom_edits === 1, 'A recorded the vertex edit');
+    const b9 = await waitFor(B, (s) => s.geom_edits === 1, "B sees A's vertex edit");
+    check(a9.geom_edits === 1 && b9.geom_edits === 1, 'vertex edit (SetPoints) converges A→B');
+
+    // 10. NON-TOP vertex edit: LEAF (cell 0) shape 1 — master semantics, same
+    //     cell-scoped key, must converge identically.
+    await cmd(A, 'select 0 1'); await sleep(150);
+    await cmd(A, 'vertex 0 40 30');
+    const a10 = await waitFor(A, (s) => s.geom_edits === 2, 'A recorded the non-TOP vertex edit');
+    const b10 = await waitFor(B, (s) => s.geom_edits === 2, 'B sees the non-TOP vertex edit');
+    check(a10.geom_edits === 2 && b10.geom_edits === 2, 'non-TOP vertex edit converges (master semantics)');
+
+    // 11. CONCURRENT vertex edits of the SAME shape (TOP 4): last-writer-wins —
+    //     both sides must settle on identical state (one record; counts equal).
+    await cmd(A, 'select 4'); await cmd(B, 'select 4'); await sleep(200);
+    await cmd(A, 'vertex 1 -500 0');
+    await cmd(B, 'vertex 2 0 -500');
+    await sleep(1200); // let LWW settle both ways
+    const a11 = await state(A); const b11 = await state(B);
+    check(
+      a11.geom_edits === 2 && b11.geom_edits === 2 && a11.edited === b11.edited,
+      'concurrent same-shape vertex edits converge LWW (one record, equal state)'
+    );
+
+    // 12. Moving a vertex-edited shape must keep its geometry record (a Move op
+    //     would LWW the whole record back to translated-base, losing the edit).
+    await cmd(A, 'nudge');
+    await sleep(800);
+    const a12 = await state(A); const b12 = await state(B);
+    check(
+      a12.geom_edits === 2 && b12.geom_edits === 2,
+      'move-after-vertex-edit stays a geometry record (edit preserved)'
+    );
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

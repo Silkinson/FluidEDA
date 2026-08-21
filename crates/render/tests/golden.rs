@@ -232,11 +232,13 @@ fn edit_overlay_goldens() {
     check_one("edit_moved", get("moved"));
     check_one("edit_deleted", get("deleted"));
     check_one("edit_added", get("added"));
+    check_one("edit_vertex", get("vertex"));
 
     // Sanity: the edits must actually move pixels, or the goldens prove nothing.
     let (moved_changed, _) = diff(get("moved"), get("base"));
     let (deleted_changed, _) = diff(get("deleted"), get("base"));
     let (added_changed, _) = diff(get("added"), get("base"));
+    let (vertex_changed, _) = diff(get("vertex"), get("base"));
     assert!(
         moved_changed as f64 / (W * H) as f64 > 0.01,
         "move changed only {moved_changed} px — suspiciously close to a no-op"
@@ -248,6 +250,10 @@ fn edit_overlay_goldens() {
     assert!(
         added_changed as f64 / (W * H) as f64 > 0.005,
         "drawn shape changed only {added_changed} px — suspiciously close to a no-op"
+    );
+    assert!(
+        vertex_changed as f64 / (W * H) as f64 > 0.002,
+        "vertex edit changed only {vertex_changed} px — suspiciously close to a no-op"
     );
 }
 
@@ -271,6 +277,11 @@ async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
     // closed ring, snapped coords) — big enough to be a couple hundred pixels.
     let mut added = EditOverlay::new();
     added.add((1, 0), top, added_rect(&db));
+    // Vertex-edit shape 1 (Phase 5 SLICE 2): drag one vertex far enough to
+    // visibly deform it — the same tombstone+copy path a move takes, but with a
+    // per-vertex ring change.
+    let mut vertex = EditOverlay::new();
+    vertex.move_shape((top, 1), vertex_tweaked(&db, top, 1));
     let empty = EditOverlay::new();
 
     let instance = wgpu::Instance::default();
@@ -283,12 +294,13 @@ async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
         .await
         .expect("request_device");
 
-    let overlays: [(&'static str, Option<&EditOverlay>); 5] = [
+    let overlays: [(&'static str, Option<&EditOverlay>); 6] = [
         ("base", None),
         ("empty", Some(&empty)),
         ("moved", Some(&moved)),
         ("deleted", Some(&deleted)),
         ("added", Some(&added)),
+        ("vertex", Some(&vertex)),
     ];
     let mut out = Vec::new();
     for (name, overlay) in overlays {
@@ -302,6 +314,22 @@ async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
 fn base_shape(db: &fluideda_core::CellDb, cell: usize, idx: usize) -> Polygon {
     let s = &db.cell(cell).shapes;
     Polygon { layer: s.layer(idx), points: s.points(idx).to_vec() }
+}
+
+/// Base shape `idx` with vertex 0 dragged by ~a quarter of the design's width —
+/// what the SLICE 2 vertex tool produces (closing duplicate kept in step).
+fn vertex_tweaked(db: &fluideda_core::CellDb, cell: usize, idx: usize) -> Polygon {
+    let wb = db.world_bbox();
+    let (dx, dy) = ((wb.width() * 0.22) as i32, (wb.height() * 0.13) as i32);
+    let mut s = base_shape(db, cell, idx);
+    let moved = fluideda_core::Point::new(s.points[0].x + dx, s.points[0].y + dy);
+    let closed = s.points.len() > 3 && s.points.first() == s.points.last();
+    s.points[0] = moved;
+    if closed {
+        let last = s.points.len() - 1;
+        s.points[last] = moved;
+    }
+    s
 }
 
 /// A deterministic drawn rectangle placed in the fixture's lower-left quadrant —

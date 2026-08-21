@@ -52,12 +52,23 @@ pub struct Presence {
 /// reconstructs the moved shape from its own copy of the base (both peers loaded
 /// the same GDS, so base ids + geometry match). Keeps edits tiny and independent
 /// of tessellation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// `SetPoints` is the second documented AMENDMENT to that rule (Phase 5 SLICE 2,
+/// after adds): a vertex edit must ship the shape's full new point list — the
+/// receiver cannot reconstruct an arbitrary per-vertex change from a compact op.
+/// Concurrent vertex-edits of the SAME shape converge last-writer-wins via the
+/// yrs map (one entry per shape id): both peers end on the same single record,
+/// whichever wrote last. That is accepted, and documented in STATUS.
+#[derive(Debug, Clone, PartialEq)]
 pub enum EditKind {
     /// Translate the base shape by `(dx, dy)` nm.
     Move { dx: i32, dy: i32 },
     /// Tombstone the base shape.
     Delete,
+    /// Replace the base shape's ring with these points (cell-local nm, closing
+    /// duplicate preserved verbatim). The layer never changes in a vertex edit,
+    /// so it is not carried — the receiver reads it from its base.
+    SetPoints(Vec<Point>),
 }
 
 /// The CRDT-side record of an **added** shape (Phase 5 SLICE 1).
@@ -224,6 +235,13 @@ impl Session {
         let value = match kind {
             EditKind::Move { dx, dy } => format!("M {dx} {dy}"),
             EditKind::Delete => "D".to_string(),
+            EditKind::SetPoints(pts) => {
+                let mut v = String::from("P");
+                for p in &pts {
+                    v.push_str(&format!(" {} {}", p.x, p.y));
+                }
+                v
+            }
         };
         {
             let mut txn = self.doc.transact_mut_with(self.origin.clone());
@@ -447,6 +465,14 @@ fn parse_kind(s: &str) -> Option<EditKind> {
             let dy = it.next()?.parse().ok()?;
             Some(EditKind::Move { dx, dy })
         }
+        "P" => {
+            let coords: Vec<i32> = it.map(|t| t.parse().ok()).collect::<Option<Vec<_>>>()?;
+            if coords.len() < 6 || coords.len() % 2 != 0 {
+                return None; // need at least 3 points, in pairs
+            }
+            let points = coords.chunks_exact(2).map(|c| Point::new(c[0], c[1])).collect();
+            Some(EditKind::SetPoints(points))
+        }
         _ => None,
     }
 }
@@ -507,6 +533,56 @@ mod tests {
         assert_eq!(parse_kind("D"), Some(EditKind::Delete));
         assert_eq!(parse_kind("M -100 200"), Some(EditKind::Move { dx: -100, dy: 200 }));
         assert_eq!(parse_kind("M 1"), None);
+        assert_eq!(
+            parse_kind("P 0 0 10 0 10 10 0 0"),
+            Some(EditKind::SetPoints(vec![
+                Point::new(0, 0),
+                Point::new(10, 0),
+                Point::new(10, 10),
+                Point::new(0, 0),
+            ])),
+            "SetPoints round-trips with the closing duplicate preserved"
+        );
+        assert_eq!(parse_kind("P 0 0 10 0"), None, "< 3 points rejected");
+    }
+
+    /// Concurrent vertex-edits of the SAME shape converge last-writer-wins: after
+    /// exchange both peers hold the identical single record — one of the two
+    /// writes, not a merge and not a divergence. (Documented acceptance.)
+    #[test]
+    fn concurrent_setpoints_same_shape_lww_converges() {
+        let mut a = Session::new(Presence { cursor: Vec2::ZERO, name: "a".into(), color: [0.0; 4] });
+        let mut b = Session::new(Presence { cursor: Vec2::ZERO, name: "b".into(), color: [0.0; 4] });
+
+        let pa = vec![Point::new(0, 0), Point::new(10, 0), Point::new(10, 99), Point::new(0, 0)];
+        let pb = vec![Point::new(0, 0), Point::new(77, 0), Point::new(10, 10), Point::new(0, 0)];
+        a.set_edit((0, 5), EditKind::SetPoints(pa.clone()));
+        b.set_edit((0, 5), EditKind::SetPoints(pb.clone()));
+
+        exchange(&mut a, &mut b);
+
+        let (ea, eb) = (a.edits(), b.edits());
+        assert_eq!(ea, eb, "both peers hold the same record after exchange");
+        assert_eq!(ea.len(), 1, "one entry per shape id (LWW, not a merge)");
+        match &ea[0].1 {
+            EditKind::SetPoints(p) => {
+                assert!(*p == pa || *p == pb, "the survivor is one of the two writes")
+            }
+            k => panic!("expected SetPoints, got {k:?}"),
+        }
+    }
+
+    /// A vertex edit is one undo step for its author, like every other edit.
+    #[test]
+    fn undo_covers_setpoints() {
+        let mut a = Session::new(Presence { cursor: Vec2::ZERO, name: "a".into(), color: [0.0; 4] });
+        let pts = vec![Point::new(0, 0), Point::new(10, 0), Point::new(10, 10), Point::new(0, 0)];
+        a.set_edit((0, 1), EditKind::SetPoints(pts));
+        assert_eq!(a.edits().len(), 1);
+        assert!(a.undo());
+        assert!(a.edits().is_empty(), "vertex edit reverted");
+        assert!(a.redo());
+        assert_eq!(a.edits().len(), 1, "and restored");
     }
 
     /// Two independent sessions editing *different* shapes converge to both edits

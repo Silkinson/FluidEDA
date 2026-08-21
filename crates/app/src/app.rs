@@ -170,9 +170,19 @@ pub struct FluidApp {
     drag_move_from: Option<Vec2>,
     /// `move_delta` at the moment a move-drag began.
     drag_move_base: (i32, i32),
-    /// Geometry of the selected ADDED shape when its move-drag began — previews
-    /// translate this snapshot; the CRDT record is rewritten once, on release.
-    drag_added_start: Option<Vec<Point>>,
+    /// Geometry snapshot at drag start, for drags whose CRDT record carries
+    /// geometry rather than an op: an added shape's move, a vertex-edited base
+    /// shape's move, and any vertex drag. Previews transform this snapshot; the
+    /// record is rewritten once, on release.
+    drag_geom_start: Option<Vec<Point>>,
+    /// A vertex drag in progress: index of the grabbed vertex (into the ring,
+    /// closing duplicate excluded — moving vertex 0 moves the duplicate too).
+    vertex_drag: Option<usize>,
+    /// Base shapes whose current CRDT record is `SetPoints` (a vertex edit).
+    /// Their later translations must rewrite the point list (a new `SetPoints`),
+    /// not commit a `Move` op — a `Move` rebuilds from the BASE on every peer and
+    /// would silently discard the vertex edit (LWW takes the whole record).
+    geom_edited: HashSet<BaseShapeId>,
     /// Base chunks whose geometry an edit invalidated — re-tessellated (with
     /// suppressions) on the next `ensure_uploaded`. Only these rebuild, not the
     /// whole cell: the incremental-edit property.
@@ -266,7 +276,9 @@ impl FluidApp {
             move_delta: (0, 0),
             drag_move_from: None,
             drag_move_base: (0, 0),
-            drag_added_start: None,
+            drag_geom_start: None,
+            vertex_drag: None,
+            geom_edited: HashSet::new(),
             dirty_keys: HashSet::new(),
             renderer_drop_cells: HashSet::new(),
             overlay_dirty: false,
@@ -311,7 +323,9 @@ impl FluidApp {
         self.selected_tf = Transform::IDENTITY;
         self.move_delta = (0, 0);
         self.drag_move_from = None;
-        self.drag_added_start = None;
+        self.drag_geom_start = None;
+        self.vertex_drag = None;
+        self.geom_edited.clear();
         self.tool = Tool::Select;
         self.active_layer = 0;
         self.rect_anchor = None;
@@ -374,7 +388,8 @@ impl FluidApp {
             Some(h) => {
                 self.selected = Some(Selection::Base(h.id));
                 self.selected_tf = h.world_tf;
-                self.move_delta = self.existing_delta(h.id);
+                self.move_delta =
+                    if self.geom_edited.contains(&h.id) { (0, 0) } else { self.existing_delta(h.id) };
             }
             None => {
                 self.selected = None;
@@ -400,6 +415,114 @@ impl FluidApp {
                 Some(moved) => fluideda_core::point_in_polygon(&moved.points, p),
                 None => fluideda_core::point_in_polygon(self.db.cell(id.0).shapes.points(id.1 as usize), p),
             },
+        }
+    }
+
+    /// The selection's *current* geometry (layer + ring): the overlay copy when
+    /// one exists, else the base. Cell-local nm.
+    fn selection_geometry(&self, sel: Selection) -> Option<(Layer, Vec<Point>)> {
+        match sel {
+            Selection::Added(id) => self.overlay.find_added(id).map(|a| (a.shape.layer, a.shape.points.clone())),
+            Selection::Base(id) => match self.overlay.edited.get(&id) {
+                Some(s) => Some((s.layer, s.points.clone())),
+                None => {
+                    let c = self.db.cell(id.0);
+                    if (id.1 as usize) < c.shapes.len() {
+                        Some((c.shapes.layer(id.1 as usize), c.shapes.points(id.1 as usize).to_vec()))
+                    } else {
+                        None
+                    }
+                }
+            },
+        }
+    }
+
+    // --- Phase 5 SLICE 2: vertex editing -------------------------------------
+
+    /// Screen-space pixel radius within which a pointer grabs a vertex handle.
+    const HANDLE_GRAB_PX: f32 = 8.0;
+
+    /// How many draggable vertices the ring has: the closing duplicate (GDS
+    /// convention: last == first) is not its own handle — dragging vertex 0
+    /// moves both ends.
+    fn handle_count(pts: &[Point]) -> usize {
+        match (pts.first(), pts.last()) {
+            (Some(f), Some(l)) if pts.len() > 3 && f == l => pts.len() - 1,
+            _ => pts.len(),
+        }
+    }
+
+    /// The handle (vertex index) under screen point `p`, if any — a cheap
+    /// screen-space proximity scan of the selection's ring (no index needed).
+    fn vertex_at(&self, sel: Selection, p: egui::Pos2, rect: egui::Rect) -> Option<usize> {
+        let (_, pts) = self.selection_geometry(sel)?;
+        let n = Self::handle_count(&pts);
+        let mut best: Option<(usize, f32)> = None;
+        for (i, q) in pts.iter().take(n).enumerate() {
+            let (wx, wy) = self.selected_tf.apply_point(*q);
+            let s = self.world_to_screen(Vec2::new(wx as f32, wy as f32), rect);
+            let d2 = (s.x - p.x).powi(2) + (s.y - p.y).powi(2);
+            if d2 <= Self::HANDLE_GRAB_PX * Self::HANDLE_GRAB_PX && best.map_or(true, |(_, b)| d2 < b) {
+                best = Some((i, d2));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Move vertex `vi` of the drag-start snapshot to `local` (the pointer,
+    /// inverse-mapped into the cell frame and snapped), keeping the closing
+    /// duplicate in step. Returns the full new ring.
+    fn ring_with_vertex(start: &[Point], vi: usize, local: Point) -> Vec<Point> {
+        let mut pts = start.to_vec();
+        let closed = pts.len() > 3 && pts.first() == pts.last();
+        if vi < pts.len() {
+            pts[vi] = local;
+            if closed && vi == 0 {
+                let last = pts.len() - 1;
+                pts[last] = local;
+            }
+        }
+        pts
+    }
+
+    /// Live vertex-drag preview: write the new ring into the overlay (the same
+    /// copy-on-write path a move uses — tombstone base + edited copy), without a
+    /// CRDT write per frame.
+    fn preview_ring(&mut self, sel: Selection, pts: Vec<Point>) {
+        match sel {
+            Selection::Base(id) => {
+                let layer = self.db.cell(id.0).shapes.layer(id.1 as usize);
+                self.overlay.move_shape(id, fluideda_core::Shape { layer, points: pts });
+                self.invalidate(id);
+            }
+            Selection::Added(id) => {
+                if let Some(a) = self.overlay.find_added_mut(id) {
+                    a.shape.points = pts;
+                    self.overlay_dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Commit the selection's current (previewed) ring to the CRDT once, on
+    /// release: a base shape ships `SetPoints` (the second geometry amendment);
+    /// an added shape rewrites its geometry record.
+    fn commit_ring(&mut self, sel: Selection) {
+        match sel {
+            Selection::Base(id) => {
+                if let Some(s) = self.overlay.edited.get(&id) {
+                    let pts = s.points.clone();
+                    self.session.set_edit(id, EditKind::SetPoints(pts));
+                    self.reconcile_edits();
+                }
+            }
+            Selection::Added(id) => {
+                if let Some(a) = self.overlay.find_added(id) {
+                    let (cell, layer, pts) = (a.cell, a.shape.layer, a.shape.points.clone());
+                    self.session.set_added_geometry(id, cell, layer, &pts);
+                    self.reconcile_edits();
+                }
+            }
         }
     }
 
@@ -469,8 +592,20 @@ impl FluidApp {
     fn nudge(&mut self, sel: Selection, dx: i32, dy: i32) {
         match sel {
             Selection::Base(id) => {
-                let (cx, cy) = self.move_delta;
-                self.commit_move(id, cx + dx, cy + dy);
+                if self.geom_edited.contains(&id) {
+                    // A vertex-edited shape: its record carries geometry, so a
+                    // translation rewrites the point list (a Move op would LWW
+                    // the whole record back to translated-BASE, silently undoing
+                    // the vertex edit).
+                    if let Some(s) = self.overlay.edited.get(&id) {
+                        let moved = fluideda_core::edit::translate(s.layer, &s.points, dx, dy);
+                        self.session.set_edit(id, EditKind::SetPoints(moved.points));
+                        self.reconcile_edits();
+                    }
+                } else {
+                    let (cx, cy) = self.move_delta;
+                    self.commit_move(id, cx + dx, cy + dy);
+                }
             }
             Selection::Added(id) => {
                 let Some(a) = self.overlay.find_added(id) else { return };
@@ -913,6 +1048,14 @@ impl FluidApp {
     /// local, remote, or undo — and invalidate the chunks whose edit-state
     /// changed. Skipped mid-drag so a live move preview isn't clobbered.
     fn reconcile_edits(&mut self) {
+        // Which base shapes currently carry a geometry record (SetPoints) — their
+        // later translations must rewrite geometry, not commit a Move op.
+        self.geom_edited = self
+            .session
+            .edits()
+            .into_iter()
+            .filter_map(|(id, k)| matches!(k, fluideda_sync::EditKind::SetPoints(_)).then_some(id))
+            .collect();
         let new = self.overlay_from_crdt();
         let added_changed = new.added != self.overlay.added;
         if !added_changed && new.deleted == self.overlay.deleted && new.edited == self.overlay.edited {
@@ -931,9 +1074,13 @@ impl FluidApp {
         if added_changed {
             self.overlay_dirty = true;
         }
-        // Keep the nudge accumulator + highlight in step with the authoritative state.
+        // Keep the nudge accumulator + highlight in step with the authoritative
+        // state. A geometry-record (vertex-edited) shape has no meaningful delta.
         match self.selected {
-            Some(Selection::Base(id)) => self.move_delta = self.existing_delta(id),
+            Some(Selection::Base(id)) => {
+                self.move_delta =
+                    if self.geom_edited.contains(&id) { (0, 0) } else { self.existing_delta(id) }
+            }
             Some(Selection::Added(id)) => {
                 // The selection may have been deleted remotely (or by undo).
                 if self.overlay.find_added(id).is_none() {
@@ -962,6 +1109,12 @@ impl FluidApp {
                     let moved =
                         fluideda_core::edit::translate(c.shapes.layer(idx as usize), c.shapes.points(idx as usize), dx, dy);
                     o.move_shape(id, moved);
+                }
+                // A vertex edit ships the full ring (SLICE 2 amendment); the layer
+                // comes from the receiver's own base — it never changes.
+                fluideda_sync::EditKind::SetPoints(points) => {
+                    let layer = self.db.cell(cell).shapes.layer(idx as usize);
+                    o.move_shape(id, fluideda_core::Shape { layer, points });
                 }
             }
         }
@@ -1078,13 +1231,14 @@ impl FluidApp {
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
             moves,
             edited - moves,
             self.overlay.added.len(),
+            self.geom_edited.len(),
             sel,
             sel_cell,
             sel_added,
@@ -1175,6 +1329,23 @@ impl FluidApp {
                 let y = parts.next().and_then(|s| s.parse::<f32>().ok());
                 if let (Some(x), Some(y)) = (x, y) {
                     self.pick_at(Vec2::new(x, y));
+                }
+            }
+            Some("vertex") => {
+                // `vertex <i> <dx> <dy>` — move vertex i of the selection by a
+                // cell-local delta and commit (the headless vertex-edit driver,
+                // SLICE 2). Works for base (SetPoints) and added (geometry LWW).
+                let i = parts.next().and_then(|s| s.parse::<usize>().ok());
+                let dx = parts.next().and_then(|s| s.parse::<i32>().ok());
+                let dy = parts.next().and_then(|s| s.parse::<i32>().ok());
+                if let (Some(vi), Some(dx), Some(dy), Some(sel)) = (i, dx, dy, self.selected) {
+                    if let Some((_, pts)) = self.selection_geometry(sel) {
+                        if vi < Self::handle_count(&pts) {
+                            let np = Point::new(pts[vi].x + dx, pts[vi].y + dy);
+                            self.preview_ring(sel, Self::ring_with_vertex(&pts, vi, np));
+                            self.commit_ring(sel);
+                        }
+                    }
                 }
             }
             Some("select_biggest") => {
@@ -1470,24 +1641,46 @@ impl FluidApp {
                 }
             }
 
-            // Edit mode (Select tool): a drag that begins on the selected shape
-            // moves it (copy-on-write); any other drag pans as usual.
+            // Edit mode (Select tool): a drag that begins on a vertex handle of
+            // the selection drags that vertex (SLICE 2); a drag that begins inside
+            // the selected shape moves it (copy-on-write); any other drag pans.
             if resp.drag_started() && self.edit_mode && !drawing && !shift {
                 if let (Some(sel), Some(p)) = (self.selected, resp.interact_pointer_pos()) {
-                    if self.point_hits(sel, world_at(p, &self.camera)) {
+                    if let Some(vi) = self.vertex_at(sel, p, rect) {
+                        // Vertex drag takes precedence over a body move (handles
+                        // sit on the outline, inside the grab radius).
+                        self.vertex_drag = Some(vi);
+                        self.drag_geom_start = self.selection_geometry(sel).map(|(_, pts)| pts);
+                    } else if self.point_hits(sel, world_at(p, &self.camera)) {
                         self.drag_move_from = Some(world_at(p, &self.camera));
                         self.drag_move_base = self.move_delta;
-                        // An added shape has no base to rebuild from — snapshot its
-                        // geometry so the preview translates from a fixed origin.
-                        self.drag_added_start = match sel {
+                        // Geometry-record shapes (adds, vertex-edited bases) have no
+                        // base to rebuild from — snapshot so the preview translates
+                        // from a fixed origin and the commit rewrites geometry.
+                        self.drag_geom_start = match sel {
                             Selection::Added(id) => self.overlay.find_added(id).map(|a| a.shape.points.clone()),
-                            Selection::Base(_) => None,
+                            Selection::Base(id) => self
+                                .geom_edited
+                                .contains(&id)
+                                .then(|| self.overlay.edited.get(&id).map(|s| s.points.clone()))
+                                .flatten(),
                         };
                     }
                 }
             }
             if resp.dragged() {
-                if let (Some(from), Some(sel), Some(p)) =
+                if let (Some(vi), Some(sel), Some(p)) =
+                    (self.vertex_drag, self.selected, resp.interact_pointer_pos())
+                {
+                    // Vertex drag: pointer → world → the cell's LOCAL frame → snap.
+                    // Identity for TOP; exact under any placement transform.
+                    let w = world_at(p, &self.camera);
+                    let (lx, ly) = self.selected_tf.inverse().apply(w.x as f64, w.y as f64);
+                    let local = Point::new(snap_nm(lx as f32), snap_nm(ly as f32));
+                    if let Some(start) = self.drag_geom_start.clone() {
+                        self.preview_ring(sel, Self::ring_with_vertex(&start, vi, local));
+                    }
+                } else if let (Some(from), Some(sel), Some(p)) =
                     (self.drag_move_from, self.selected, resp.interact_pointer_pos())
                 {
                     let d = world_at(p, &self.camera) - from;
@@ -1497,14 +1690,23 @@ impl FluidApp {
                             // move is stored cell-local), so at the clicked placement
                             // the shape follows the cursor even under rotation/scale.
                             let (ldx, ldy) = self.world_delta_to_local(d.x as f64, d.y as f64);
-                            self.preview_move(id, self.drag_move_base.0 + ldx, self.drag_move_base.1 + ldy);
+                            if let Some(start) = self.drag_geom_start.clone() {
+                                // Vertex-edited shape: translate the whole snapshot
+                                // (the commit rewrites its geometry record).
+                                let pts =
+                                    start.iter().map(|q| Point::new(q.x + ldx, q.y + ldy)).collect();
+                                self.preview_ring(sel, pts);
+                                self.move_delta = (ldx, ldy);
+                            } else {
+                                self.preview_move(id, self.drag_move_base.0 + ldx, self.drag_move_base.1 + ldy);
+                            }
                         }
                         Selection::Added(id) => {
                             // TOP-cell adds: world == local. Preview by translating
                             // the drag-start snapshot; the CRDT write happens once,
                             // on release.
                             let (ddx, ddy) = (d.x.round() as i32, d.y.round() as i32);
-                            if let Some(start) = self.drag_added_start.clone() {
+                            if let Some(start) = self.drag_geom_start.clone() {
                                 if let Some(a) = self.overlay.find_added_mut(id) {
                                     a.shape.points =
                                         start.iter().map(|q| Point::new(q.x + ddx, q.y + ddy)).collect();
@@ -1521,22 +1723,27 @@ impl FluidApp {
                 }
             }
             if resp.drag_stopped() {
-                // Commit the previewed move to the CRDT once (broadcast + undoable).
-                if self.drag_move_from.is_some() {
+                // Commit the previewed edit to the CRDT once (broadcast + undoable).
+                if self.vertex_drag.take().is_some() {
+                    if let Some(sel) = self.selected {
+                        self.commit_ring(sel);
+                    }
+                } else if self.drag_move_from.is_some() {
                     match self.selected {
-                        Some(Selection::Base(id)) => self.commit_move(id, self.move_delta.0, self.move_delta.1),
-                        Some(Selection::Added(id)) => {
-                            if let Some(a) = self.overlay.find_added(id) {
-                                let (cell, layer, pts) = (a.cell, a.shape.layer, a.shape.points.clone());
-                                self.session.set_added_geometry(id, cell, layer, &pts);
-                                self.reconcile_edits();
+                        Some(Selection::Base(id)) => {
+                            if self.drag_geom_start.is_some() {
+                                // Geometry-record shape: the move ships new points.
+                                self.commit_ring(Selection::Base(id));
+                            } else {
+                                self.commit_move(id, self.move_delta.0, self.move_delta.1);
                             }
                         }
+                        Some(sel @ Selection::Added(_)) => self.commit_ring(sel),
                         None => {}
                     }
                 }
                 self.drag_move_from = None;
-                self.drag_added_start = None;
+                self.drag_geom_start = None;
             }
 
             // Delete key removes the selection.
@@ -1617,6 +1824,26 @@ impl FluidApp {
                 if screen.len() >= 2 {
                     let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 230, 0));
                     painter.add(egui::Shape::closed_line(screen, stroke));
+                }
+            }
+
+            // Vertex handles (SLICE 2): small squares on the selection's ring,
+            // draggable one at a time. Only in the Select tool, where a drag near
+            // a handle means "move this vertex", not "move the shape".
+            if self.edit_mode && self.tool == Tool::Select {
+                if let Some(sel) = self.selected {
+                    if let Some((_, hpts)) = self.selection_geometry(sel) {
+                        let n = Self::handle_count(&hpts);
+                        for q in hpts.iter().take(n) {
+                            let (wx, wy) = self.selected_tf.apply_point(*q);
+                            let s = self.world_to_screen(Vec2::new(wx as f32, wy as f32), rect);
+                            painter.rect_filled(
+                                egui::Rect::from_center_size(s, egui::vec2(6.0, 6.0)),
+                                1.0,
+                                egui::Color32::from_rgb(255, 230, 0),
+                            );
+                        }
+                    }
                 }
             }
 
