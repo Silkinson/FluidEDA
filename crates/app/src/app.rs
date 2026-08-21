@@ -77,6 +77,19 @@ const TESS_JOBS_PER_FRAME: usize = 8;
 /// the inline case (`≤ this × ~9 ms/chunk`) is well under the 100 ms frame target.
 const TESS_INLINE_MAX: usize = 6;
 
+/// Per-frame DRC budget (ms) — a check never blocks a frame beyond this; a huge
+/// cell spreads across frames via `drc_queue` cursors (Phase 5 SLICE 3). The one
+/// exception is the cell's first R-tree query, whose lazy index build is atomic
+/// (~0.9 s for caravel_core) — measured, and named in STATUS as the reason a
+/// DRC-in-worker offload is the follow-up.
+const DRC_BUDGET_MS: f64 = 8.0;
+
+/// Base shapes per `check_cell_range` slice between budget re-checks.
+const DRC_STEP_SHAPES: usize = 10_000;
+
+/// Cap on violation markers drawn per frame (the panel shows the counts).
+const DRC_MARKER_CAP: usize = 300;
+
 pub struct FluidApp {
     camera: Camera,
     db: CellDb,
@@ -198,6 +211,23 @@ pub struct FluidApp {
     last_edit_chunks: usize,
     last_edit_ms: f64,
 
+    // --- Phase 5 SLICE 3: DRC ---
+    /// DRC on/off. Off ⇒ zero cost (no checks queued, nothing drawn).
+    drc_enabled: bool,
+    /// The rule table (the small blanket default; a PDK table would load here).
+    drc_rules: fluideda_core::DrcRules,
+    /// Completed per-cell results (violations in that cell's local nm).
+    drc_results: std::collections::HashMap<CellId, Vec<fluideda_core::Violation>>,
+    /// Budgeted work queue: (cell, next base-shape cursor). Front = current cell;
+    /// a huge cell advances its cursor across frames instead of blocking one.
+    drc_queue: std::collections::VecDeque<(CellId, usize)>,
+    /// Accumulator for the cell at the queue front: (violations so far, ms so far).
+    drc_partial: std::collections::HashMap<CellId, (Vec<fluideda_core::Violation>, f64)>,
+    /// Last completed cell: (id, total check ms, violations) — the panel readout.
+    drc_last: Option<(CellId, f64, usize)>,
+    /// `drc_bench` results: (cell, shapes, cold ms, warm ms, violations).
+    drc_bench: Option<(CellId, usize, f64, f64, usize)>,
+
     /// Always present: an offline edit session (shared doc + per-user undo) that
     /// `join` upgrades to a live connection. Editing and undo work before any
     /// connection; joining a room then syncs.
@@ -279,6 +309,13 @@ impl FluidApp {
             drag_geom_start: None,
             vertex_drag: None,
             geom_edited: HashSet::new(),
+            drc_enabled: false,
+            drc_rules: fluideda_core::DrcRules::default_table(),
+            drc_results: std::collections::HashMap::new(),
+            drc_queue: std::collections::VecDeque::new(),
+            drc_partial: std::collections::HashMap::new(),
+            drc_last: None,
+            drc_bench: None,
             dirty_keys: HashSet::new(),
             renderer_drop_cells: HashSet::new(),
             overlay_dirty: false,
@@ -326,6 +363,11 @@ impl FluidApp {
         self.drag_geom_start = None;
         self.vertex_drag = None;
         self.geom_edited.clear();
+        self.drc_results.clear();
+        self.drc_queue.clear();
+        self.drc_partial.clear();
+        self.drc_last = None;
+        self.drc_bench = None;
         self.tool = Tool::Select;
         self.active_layer = 0;
         self.rect_anchor = None;
@@ -740,6 +782,75 @@ impl FluidApp {
         self.overlay_dirty = true;
     }
 
+    // --- Phase 5 SLICE 3: DRC driver -----------------------------------------
+
+    /// Re-check `cell` from scratch on the next frames: drop its results and put
+    /// it at the FRONT of the queue (an edited cell's feedback beats a background
+    /// sweep). The incremental unit is the cell — exactly the granularity the
+    /// edit paths already track.
+    fn drc_invalidate(&mut self, cell: CellId) {
+        if !self.drc_enabled {
+            return;
+        }
+        self.drc_results.remove(&cell);
+        self.drc_partial.remove(&cell);
+        self.drc_queue.retain(|&(c, _)| c != cell);
+        self.drc_queue.push_front((cell, 0));
+    }
+
+    /// Queue every currently-visible cell (plus TOP, where drawn shapes live)
+    /// that has no result yet — the "check visible" button.
+    fn drc_enqueue_visible(&mut self) {
+        let mut want: Vec<CellId> = self.visible.draws.iter().map(|d| d.cell).collect();
+        want.push(self.db.top);
+        want.sort_unstable();
+        want.dedup();
+        for cell in want {
+            let queued = self.drc_queue.iter().any(|&(c, _)| c == cell);
+            if !self.drc_results.contains_key(&cell) && !queued {
+                self.drc_queue.push_back((cell, 0));
+            }
+        }
+    }
+
+    /// Run queued DRC work within the per-frame budget. Never blocks a frame
+    /// beyond `DRC_BUDGET_MS` (modulo one atomic lazy index build — see the
+    /// constant's note): a big cell advances its shape cursor and resumes next
+    /// frame; results land per cell when its last range completes.
+    fn run_drc_budget(&mut self) {
+        if !self.drc_enabled || self.drc_queue.is_empty() {
+            return;
+        }
+        let t0 = web_time::Instant::now();
+        while t0.elapsed().as_secs_f64() * 1e3 < DRC_BUDGET_MS {
+            let Some((cell_id, cursor)) = self.drc_queue.pop_front() else { break };
+            let n = self.db.cell(cell_id).shapes.len();
+            let end = (cursor + DRC_STEP_SHAPES).min(n);
+            let st = web_time::Instant::now();
+            let mut found = Vec::new();
+            fluideda_core::check_cell_range(
+                self.db.cell(cell_id),
+                cell_id,
+                &self.overlay,
+                &self.drc_rules,
+                cursor,
+                end,
+                &mut found,
+            );
+            let ms = st.elapsed().as_secs_f64() * 1e3;
+            let entry = self.drc_partial.entry(cell_id).or_insert_with(|| (Vec::new(), 0.0));
+            entry.0.extend(found);
+            entry.1 += ms;
+            if end >= n {
+                let (v, total) = self.drc_partial.remove(&cell_id).unwrap_or((Vec::new(), 0.0));
+                self.drc_last = Some((cell_id, total, v.len()));
+                self.drc_results.insert(cell_id, v);
+            } else {
+                self.drc_queue.push_front((cell_id, end));
+            }
+        }
+    }
+
     /// Invalidate the tessellation-worker pipeline: drop the worker (terminating
     /// it discards in-flight jobs and reclaims its wasm memory), clear the pending
     /// set + result queue, and bump the generation so any reply already queued is
@@ -977,10 +1088,15 @@ impl FluidApp {
     #[cfg(target_arch = "wasm32")]
     fn publish_perf(&self) {
         let Some(w) = web_sys::window() else { return };
+        let (drc_cell, drc_shapes, drc_cold, drc_warm, drc_viol) =
+            self.drc_bench.map_or((-1i64, 0usize, -1.0f64, -1.0f64, 0usize), |(c, s, a, b, v)| {
+                (c as i64, s, a, b, v)
+            });
         let json = format!(
             "{{\"max_frame_ms\":{:.1},\"frames\":{},\"worker_chunks\":{},\"in_flight\":{},\
              \"inline_tess_ms\":{:.1},\"uploaded\":{},\"force_inline\":{},\
-             \"last_edit_ms\":{:.2},\"last_edit_chunks\":{}}}",
+             \"last_edit_ms\":{:.2},\"last_edit_chunks\":{},\
+             \"drc_cell\":{},\"drc_shapes\":{},\"drc_cold_ms\":{:.1},\"drc_warm_ms\":{:.1},\"drc_violations\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -990,6 +1106,11 @@ impl FluidApp {
             self.force_inline,
             self.last_edit_ms,
             self.last_edit_chunks,
+            drc_cell,
+            drc_shapes,
+            drc_cold,
+            drc_warm,
+            drc_viol,
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -1062,6 +1183,15 @@ impl FluidApp {
             return; // nothing edit-related changed (e.g. a marker-only update)
         }
         let changed: Vec<BaseShapeId> = changed_ids(&self.overlay, &new).into_iter().collect();
+        // Cells whose composite just changed — the DRC re-check set (SLICE 3):
+        // the cell of every changed base id, plus every cell that gained or lost
+        // an added shape (old and new lists, so a removed add re-checks too).
+        let mut drc_cells: HashSet<CellId> = changed.iter().map(|id| id.0).collect();
+        if added_changed {
+            for a in self.overlay.added.iter().chain(new.added.iter()) {
+                drc_cells.insert(a.cell);
+            }
+        }
         self.overlay = new;
         // Route through the same invalidate() the direct-edit path uses, so a
         // committed or remote edit of a big cell also triggers the finer-chunking
@@ -1073,6 +1203,12 @@ impl FluidApp {
         // the (tiny) overlay buffer to re-upload.
         if added_changed {
             self.overlay_dirty = true;
+        }
+        // DRC is incremental at cell granularity: re-check ONLY the edited cells.
+        // Runs on commit/remote convergence, not per preview frame — violations
+        // update on release, keeping drags at full frame rate.
+        for cell in drc_cells {
+            self.drc_invalidate(cell);
         }
         // Keep the nudge accumulator + highlight in step with the authoritative
         // state. A geometry-record (vertex-edited) shape has no meaningful delta.
@@ -1181,6 +1317,7 @@ impl eframe::App for FluidApp {
         self.canvas(ctx);
         self.recull();
         self.ensure_uploaded(frame);
+        self.run_drc_budget();
 
         ctx.request_repaint();
 
@@ -1231,7 +1368,7 @@ impl FluidApp {
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -1243,6 +1380,8 @@ impl FluidApp {
             sel_cell,
             sel_added,
             self.db.cell(top).shapes.len(),
+            self.drc_results.values().map(|v| v.len()).sum::<usize>(),
+            self.drc_queue.len(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -1358,6 +1497,35 @@ impl FluidApp {
                     self.selected = Some(Selection::Base((cell, 0)));
                     self.selected_tf = Transform::IDENTITY;
                     self.move_delta = self.existing_delta((cell, 0));
+                }
+            }
+            Some("drc_on") => self.drc_enabled = true,
+            Some("drc_check") => self.drc_enqueue_visible(),
+            Some("drc_bench") => {
+                // Measure the DRC skeleton on the biggest cell (caravel_core on
+                // caravel), synchronously: COLD = full check including the one-
+                // time lazy R-tree build; WARM = the same full check again — the
+                // honest re-check-after-one-edit cost (an edit never mutates the
+                // base, so the index stays valid and the incremental unit is a
+                // whole-cell re-check with a cached index). Published to
+                // __fluideda_perf for the harness.
+                let biggest = (0..self.db.cells.len())
+                    .max_by_key(|&c| self.db.cell(c).shapes.len())
+                    .filter(|&c| self.db.cell(c).shapes.len() > 0);
+                if let Some(cell) = biggest {
+                    let rules = fluideda_core::DrcRules::default_table();
+                    let t0 = web_time::Instant::now();
+                    let v1 = fluideda_core::check_cell(self.db.cell(cell), cell, &self.overlay, &rules);
+                    let cold = t0.elapsed().as_secs_f64() * 1e3;
+                    let t1 = web_time::Instant::now();
+                    let v2 = fluideda_core::check_cell(self.db.cell(cell), cell, &self.overlay, &rules);
+                    let warm = t1.elapsed().as_secs_f64() * 1e3;
+                    let shapes = self.db.cell(cell).shapes.len();
+                    log::info!(
+                        "DRC bench cell {cell} ({shapes} shapes): cold {cold:.0} ms, warm {warm:.0} ms, {} violations",
+                        v1.len()
+                    );
+                    self.drc_bench = Some((cell, shapes, cold, warm, v1.len().max(v2.len())));
                 }
             }
             Some("edit_bench") => {
@@ -1573,6 +1741,45 @@ impl FluidApp {
             });
             if ui.button("💾 Save GDS").clicked() {
                 self.save_gds();
+            }
+
+            ui.separator();
+            ui.label("DRC (intra-cell)");
+            ui.checkbox(&mut self.drc_enabled, "enable");
+            if self.drc_enabled {
+                if ui.button("Check visible cells").clicked() {
+                    self.drc_enqueue_visible();
+                }
+                let total: usize = self.drc_results.values().map(|v| v.len()).sum();
+                ui.small(format!("violations: {total} across {} cell(s) checked", self.drc_results.len()));
+                if !self.drc_queue.is_empty() {
+                    ui.small(format!("checking… {} cell(s) queued", self.drc_queue.len()));
+                }
+                if let Some((c, ms, n)) = self.drc_last {
+                    ui.small(format!("last: cell {c} in {ms:.1} ms → {n} violation(s)"));
+                }
+                // First few violations, cell-sorted for a stable list.
+                let mut cells: Vec<&CellId> = self.drc_results.keys().collect();
+                cells.sort_unstable();
+                let mut shown = 0;
+                'list: for cell in cells {
+                    for v in &self.drc_results[cell] {
+                        if shown >= 8 {
+                            ui.small("…");
+                            break 'list;
+                        }
+                        ui.small(format!(
+                            "{:?} L{}/{} cell {} @ ({:.2}, {:.2}) µm",
+                            v.kind,
+                            v.layer.layer,
+                            v.layer.datatype,
+                            cell,
+                            v.bbox.min.x as f64 / 1000.0,
+                            v.bbox.min.y as f64 / 1000.0
+                        ));
+                        shown += 1;
+                    }
+                }
             }
 
             ui.separator();
@@ -1842,6 +2049,48 @@ impl FluidApp {
                                 1.0,
                                 egui::Color32::from_rgb(255, 230, 0),
                             );
+                        }
+                    }
+                }
+            }
+
+            // DRC violation markers (SLICE 3): red boxes over the gap/shape, at
+            // every visible placement of the violating cell (TOP at identity —
+            // where drawn shapes live — is always included). Capped; the panel
+            // carries the full counts.
+            if self.drc_enabled && !self.drc_results.is_empty() {
+                let vis = self.visible.clone();
+                let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 64, 64));
+                let mut placements: std::collections::HashMap<CellId, &Vec<Transform>> =
+                    std::collections::HashMap::new();
+                for d in vis.draws.iter() {
+                    placements.entry(d.cell).or_insert(&d.transforms);
+                }
+                let identity = vec![Transform::IDENTITY];
+                let mut drawn = 0usize;
+                'markers: for (cell, vs) in &self.drc_results {
+                    let tfs: &Vec<Transform> = if *cell == self.db.top {
+                        &identity
+                    } else if let Some(t) = placements.get(cell) {
+                        t
+                    } else {
+                        continue; // cell not on screen this frame
+                    };
+                    for v in vs {
+                        for tf in tfs.iter() {
+                            if drawn >= DRC_MARKER_CAP {
+                                break 'markers;
+                            }
+                            let (x0, y0) = tf.apply_point(v.bbox.min);
+                            let (x1, y1) = tf.apply_point(v.bbox.max);
+                            let r = egui::Rect::from_two_pos(
+                                self.world_to_screen(Vec2::new(x0 as f32, y0 as f32), rect),
+                                self.world_to_screen(Vec2::new(x1 as f32, y1 as f32), rect),
+                            );
+                            if r.intersects(rect) {
+                                painter.rect_stroke(r.expand(2.0), 0.0, stroke);
+                                drawn += 1;
+                            }
                         }
                     }
                 }

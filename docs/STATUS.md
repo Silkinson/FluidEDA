@@ -1,13 +1,14 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-07-29 · current branch: `phase4` (integration trunk)_
+_Last updated: 2026-08-21 · current branch: `phase5-authoring-drc` (off `phase4`)_
 
-> `phase4` is the integration trunk. It merges the two finished feature branches
-> that had sat independently on top of `phase3-editing` — `phase2b-worker` (parse
-> worker) and `phase3-real-editing` (hierarchy pick/edit + GDS export) — into one
-> line. Both branched from `b619532`; they are semantically orthogonal (worker owns
-> the load path, editing owns pick/edit state), so the merge keeps both in full.
-> `main` is untouched (owner's choice); all Phase 4 work continues here.
+> The trunk line: `phase4` (integration trunk — parse worker + real editing +
+> fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
+> `main` is untouched (owner's choice).
+>
+> **Ledger reshape (2026-08-21):** Phase 5 is now **authoring + DRC** (this
+> branch's three slices); the backend/CAS/tile-CDN/OASIS work formerly labelled
+> Phase 5 moves to **Phase 6**.
 
 Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 (WebGPU, WebGL2 fallback), compiled to wasm. Full design in
@@ -15,19 +16,36 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 
 ## Where we are
 
-**Phase 4 is the integration trunk.** STEP 1 merged the two finished feature
-branches — `phase2b-worker` (off-main-thread parse) and `phase3-real-editing`
-(hierarchy pick/edit + GDS export) — into one line. STEP 2 took the **last load
-wart** off the main thread: fit-view used to tessellate the giant flat cells inline
-(~1.1 s freeze measured, ~2.5 s prior estimate); it now offloads chunk tessellation
-to a Web Worker, drawing a coarse bbox proxy per chunk until real geometry streams
-back (progressive refinement). Longest fit-view frame is now **62–64 ms** (caravel /
-caravan-signoff), no frame > 100 ms.
+**Phase 5 shipped: FluidEDA authors geometry and checks it.** Three slices on
+`phase5-authoring-drc`:
 
-Behind that: Phase 2b (chunking + streaming parser + parse worker) and Phase 3
-editing (copy-on-write overlay, hierarchy select/move/delete, incremental re-tess,
-CRDT sync + per-user undo, GDS export) all shipped. A committed golden-image test
-guards the render pipeline across all of it.
+* **SLICE 1 — draw-new-shape.** Rect (drag) + polygon (click vertices) tools on
+  an active layer, 5 nm snap, TOP-cell. Adds ship **geometry** through the CRDT
+  (first documented amendment — no base to rebuild from) under stable
+  `(client_id, seq)` ids: two peers drawing simultaneously both survive
+  (unit + two-browser proven). Undo, incremental upload, and GDS export all
+  cover adds (round-trip pixel-match 0 px).
+* **SLICE 2 — vertex editing.** Handles on the selected shape (screen-space
+  proximity), drag one vertex, same copy-on-write path; works on non-TOP
+  masters through the transform stack. Ships the full point list
+  (`SetPoints` — second amendment); concurrent same-shape edits converge
+  last-writer-wins (accepted, tested). Translating a vertex-edited shape
+  rewrites its geometry record so the edit is never silently lost.
+* **SLICE 3 — DRC skeleton.** `crates/core/drc.rs` (pure, no new deps):
+  rule table (blanket 100/100 nm placeholder), per-shape width (exact for
+  rects), **exact** edge-pair spacing with R-tree candidates, integer math,
+  touching/overlap = merged. **Intra-cell only — honestly scoped**; checks
+  composite with the overlay (a drawn 40 nm sliver flags immediately, verified
+  in-browser). Incremental at cell granularity on edit; "check visible" runs
+  through an 8 ms/frame budgeted queue. caravel_core (2.5 M shapes): 10.3 s
+  cold / 9.6 s warm re-check in wasm — the numbers that make DRC-in-worker the
+  named follow-up.
+
+Behind that: Phase 4 (integration + fit-view tessellation offload), Phase 2b
+(chunking + streaming parser + parse worker), Phase 3 editing (overlay, hierarchy
+select/move/delete, CRDT + per-user undo, GDS export). The committed golden-image
+test now also guards draw + vertex-edit rendering (11 references, empty overlay
+still byte-identical).
 
 ## Phase ledger
 
@@ -43,7 +61,8 @@ guards the render pipeline across all of it.
 | 3 — editing (skeleton) | `phase3-editing` | ✅ done | Copy-on-write overlay, select/move/delete of TOP-cell shapes, incremental re-tess (1 chunk), CRDT sync + per-user undo. Two-browser + golden verified |
 | 3 — real editing | `phase3-real-editing` | ✅ done | SLICE 1: GDS export (round-trip + pixel-match). SLICE 2: non-TOP editing under the transform stack (landmine eliminated), master-edit semantics, finer chunking (edit 22→0.8 ms), two-browser non-TOP convergence |
 | 4 — integrate + fit-view offload | `phase4` | ✅ done | STEP 1: merged parse-worker + real-editing onto the trunk (build + 39 core + golden green). STEP 2: fit-view tessellation offloaded to a worker (bbox proxy → stream). Longest fit frame ~1.1–1.35 s → **62–64 ms** (caravel / caravan-signoff), leaf unchanged, edit < 2 ms |
-| 5 — backend/OASIS/DRC | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS |
+| 5 — authoring + DRC | `phase5-authoring-drc` | ✅ done | SLICE 1: rect/poly draw tools, geometry-carrying CRDT adds with stable `(client, seq)` ids — concurrent adds converge; export covers adds (0 px round-trip). SLICE 2: vertex editing via `SetPoints` (LWW on same shape), non-TOP masters. SLICE 3: intra-cell DRC (exact spacing, per-shape width), overlay-composited, 8 ms/frame budget; caravel_core 10.3 s cold / 9.6 s warm (wasm) |
+| 6 — backend/OASIS | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS (moved from the old "Phase 5" label — see the ledger-reshape note) |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -58,6 +77,9 @@ guards the render pipeline across all of it.
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |
 | fit-view TTFF | **2.1 s** | was ~3.0 s inline (first paint no longer waits for tessellation — proxies show immediately). caravan-signoff 3.3 s → 2.2 s |
 | edit re-tess frame | < 2 ms | dirty chunks stay inline (finer-chunking, SLICE 2 path unchanged); offload never touches the edit path. caravel 1.8 ms, caravan-signoff 0.4 ms |
+| DRC: biggest cell full check | **10.3 s cold / 9.6 s warm** (wasm) | caravel_core, 2.5 M shapes; native 7.5 / 7.0 s. Cold includes the one-time R-tree build. Warm = the re-check-after-one-edit cost (base never mutates ⇒ index stays valid). Runs through the 8 ms/frame budget queue — never blocks a frame; the wall-clock latency is why DRC-in-worker is the follow-up |
+| DRC: typical cell check | ~5 ms | chip_io (5.7 k shapes, native) — an edit to a normal cell re-verifies within a frame |
+| DRC: drawn-sliver feedback | ~immediate | a 40 nm-wide drawn rect flags via the budgeted queue on the next frames (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 
 ## Decisions locked (do not relitigate without a measurement)
@@ -92,6 +114,29 @@ guards the render pipeline across all of it.
 - **CRDT edits ship the op, not geometry** — "cell:idx" -> "M dx dy"|"D"; each peer
   rebuilds the moved shape from its own base. Per-user undo = UndoManager tracks
   only the local origin; remote edits apply with no origin. (phase3)
+- **AMENDMENT 1 (adds ship geometry).** A drawn shape has no base on the peer to
+  rebuild from, so its CRDT record carries the full ring: key `a<client>:<seq>`,
+  value `A <cell> <layer> <dt> <coords…>` in the SAME yrs map as base edits (one
+  map ⇒ one undo scope covers adds for free). `(client_id, seq)` AddIds are minted
+  by the creator, so concurrent adds land under distinct keys and BOTH survive;
+  later moves/deletes/vertex-edits of an added shape reference the AddId and
+  rewrite/tombstone the record LWW. (phase5 SLICE 1)
+- **AMENDMENT 2 (vertex edits ship geometry).** `SetPoints` carries the shape's
+  full new point list ("P x0 y0 …") — an arbitrary per-vertex change has no
+  compact op. Concurrent vertex-edits of the SAME shape converge last-writer-wins
+  (one record per shape id) — accepted. Corollary: translating a vertex-edited
+  shape REWRITES its point list (a Move op would LWW the record back to
+  translated-base, silently discarding the edit) — enforced in the app
+  (`geom_edited`). Pure translates of pristine base shapes still ship the tiny
+  "M dx dy" op — the amendments are scoped to where geometry is unavoidable.
+  (phase5 SLICE 2)
+- **DRC is intra-cell, composite-aware, budgeted.** Checks run per cell in
+  cell-local space over base∖tombstones ∪ moved/vertex copies ∪ adds, using the
+  existing per-cell R-tree for spacing candidates (base never mutates ⇒ the index
+  survives edits). Incremental unit = the edited cell, re-queued on commit (not
+  per preview frame). An 8 ms/frame budget queue spreads big cells across frames.
+  Touching/overlapping same-layer shapes are merged (legal) — real-DRC semantics.
+  (phase5 SLICE 3)
 - **Hit-test builds only the clicked cell's index** (chunk-bbox prefilter first),
   not a background build of all 1014. TOP first-click = 50 µs on caravel. (phase3)
 
@@ -111,8 +156,9 @@ guards the render pipeline across all of it.
   reject WebGPU, so all browser numbers are WebGL2/ANGLE (pessimistic for fps). A
   wgpu upgrade would unblock real WebGPU measurement.
 - ~~Golden PNGs are not committed~~ **RESOLVED** — `crates/render/tests/golden.rs`
-  + 9 committed 512² reference PNGs (hier/sky130 fit/mid/leaf + 3 edit-overlay),
-  diffed with a documented tolerance in `cargo test`. Regenerate with `UPDATE_GOLDEN=1`.
+  + 11 committed 512² reference PNGs (hier/sky130 fit/mid/leaf + 5 edit-overlay:
+  base/moved/deleted/added/vertex), diffed with a documented tolerance in
+  `cargo test`. Regenerate with `UPDATE_GOLDEN=1`.
 - ~~Worker combined-peak not demonstrated end-to-end~~ **RESOLVED** — the worker
   ships (`phase2b-worker`). Measured combined peak across worker+main during load:
   caravel ~1.46 GB, caravan-signoff ~1.39 GB, both << 4 GB; worker memory reclaimed
@@ -147,7 +193,30 @@ guards the render pipeline across all of it.
   reader + gds21 + a pixel-match render test. "Save GDS" button.
 - **Late-joiner edit sync** relies on a full-state broadcast on `join`; there is
   no y-sync handshake, so a peer must join before others edit (skeleton limitation,
-  same as Phase 0 markers).
+  same as Phase 0 markers). Related operational note: the relay accumulates dead
+  sockets across runs — a room reused after peers vanish can drop rebroadcasts
+  (bit us in testing; restart the relay). Worth a cleanup pass with the y-sync work.
+- **DRC deferrals (phase5 SLICE 3 — scoped honestly, in the code too):**
+  - **Cross-instance / hierarchical spacing is NOT checked.** Checks are
+    intra-cell; a shape in cell A near an instance of cell B is invisible to
+    them. Flattened-context interaction regions along instance boundaries are
+    the hard real-DRC problem — deferred deliberately.
+  - **Width is per-shape, PRE-merge — over-flags fractured production GDS.**
+    Measured: 593 k of caravel_core's 611 k flags are per-shape width on met1
+    fracture slivers (P&R output arrives fractured; the merged region is wide).
+    Real min-width needs boolean union first (the deferred booleans feature) —
+    and non-rect polygons use a bbox min-dim approximation besides. Per-shape
+    width IS correct for isolated/authored shapes — the interactive case this
+    slice ships.
+  - **The rule table is a blanket 100/100 nm placeholder**, checking every
+    layer/datatype including markers and pins. A per-layer PDK table (with
+    datatype filtering) is data work, not architecture — slot it in `DrcRules`.
+  - **Big-cell latency wants the worker.** caravel_core's 9.6 s warm re-check
+    never blocks a frame (8 ms budget) but takes ~20 s wall to re-verify after
+    an edit. `drc.rs` is core-only (no wgpu/network) precisely so a
+    DRC-in-worker offload links it unchanged — the named follow-up.
+  - The one atomic block: a cell's first R-tree query builds its index
+    (~0.3–0.9 s for caravel_core) inside one budget slice.
 
 ## Git hygiene
 
@@ -161,12 +230,13 @@ guards the render pipeline across all of it.
 
 ## Next step
 
-**Phase 4 STEP 2 shipped** (fit-view tessellation offload — see the ledger + debts).
-The load path is now off the main thread end to end: parse in a worker, fit-view
-tessellation in a worker, progressive bbox-proxy refinement. The largest single
-main-thread block on load is the ~200 ms reconstruct (design-swap) frame.
+**Phase 5 shipped** (authoring + DRC — see the ledger). FluidEDA now draws,
+vertex-edits, syncs, undoes, exports, and checks — the first full author→verify
+loop. The DRC skeleton's own measurements point at its follow-ups (see debts):
+**booleans** (merge-first width — the single biggest correctness win on real
+GDS), a **PDK rule table**, and **DRC-in-worker** (the 9.6 s big-cell re-check).
 
-Nearest wins, in rough order:
+Also still queued from Phase 4, unchanged:
 - **Single-copy worker reconstruction** — the last big main-thread load block
   (~200 ms → < 100 ms); per-cell `subarray`, no concatenated intermediate.
 - **wgpu upgrade** — unblocks real WebGPU measurement (all browser numbers are
@@ -174,8 +244,9 @@ Nearest wins, in rough order:
 - **Progressive render during parse** (proxy the whole design before the first
   chunk lands).
 
-Remaining Phase 3 editing follow-ons (deferred, named in code): edit one AREF
-placement vs. the master; vertex editing; draw-new-shape; booleans; DRC.
+Remaining editing follow-ons (deferred, named in code): edit one AREF placement
+vs. the master; drawing into an instanced master (draw is TOP-only); insert /
+delete vertex (count-preserving edits only); booleans.
 
-Then Phase 5: content-addressed store, tile CDN, streaming OASIS (the out-of-core
+Then Phase 6: content-addressed store, tile CDN, streaming OASIS (the out-of-core
 story the production-SoC scale ceiling needs).

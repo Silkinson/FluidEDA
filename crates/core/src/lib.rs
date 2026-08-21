@@ -21,6 +21,7 @@
 pub mod chunk;
 pub mod cull;
 pub mod db;
+pub mod drc;
 pub mod edit;
 pub mod gds;
 pub mod gds_stream;
@@ -36,6 +37,7 @@ pub mod types;
 pub use chunk::{Chunk, ChunkId};
 pub use cull::{cull, cull_counted, cull_with_overlay, CellDraw, CullStats, VisibleSet};
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
+pub use drc::{check_cell, check_cell_range, DrcKind, DrcRules, LayerRule, Violation};
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, Shape};
 pub use gds_write::write_gds;
 pub use index::ShapeIndex;
