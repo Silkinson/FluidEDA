@@ -533,3 +533,174 @@ impl TessWorker {
     }
     pub fn post(&self, _cell: usize, _chunk: u32, _gen: u32, _coords: &[i32], _starts: &[u32], _layers: &[u32]) {}
 }
+
+// --- Phase 5b SLICE 3: DRC worker pool ---------------------------------------
+//
+// A pool of persistent, stateless DRC workers (assets/worker/drc_worker.js over
+// the shared core-only wasm). The app's `DrcDriver` produces tile jobs; each is
+// posted round-robin with its Pod columns transferred in, and the reply — flat
+// violation records — lands in a `DrcSlot` for the app to feed back to the
+// driver next frame.
+
+/// A finished DRC tile from the pool.
+pub struct DrcReply {
+    pub epoch: u32,
+    pub cell: usize,
+    pub tile: fluideda_core::TileKey,
+    pub gen: u32,
+    pub violations: Vec<fluideda_core::Violation>,
+    /// The worker threw (logged); the tile is accepted as clean so the pass
+    /// completes, and the panel counts the errors.
+    pub error: bool,
+}
+
+/// Completed DRC jobs, drained each frame by the app.
+pub type DrcSlot = Rc<RefCell<Vec<DrcReply>>>;
+
+/// Logical cores the browser reports (1 natively — the pool is web-only).
+#[cfg(target_arch = "wasm32")]
+pub fn hardware_concurrency() -> usize {
+    web_sys::window().map(|w| w.navigator().hardware_concurrency() as usize).unwrap_or(1).max(1)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn hardware_concurrency() -> usize {
+    1
+}
+
+#[cfg(target_arch = "wasm32")]
+const DRC_WORKER_URL: &str = "assets/worker/drc_worker.js";
+
+/// The DRC worker pool. Dropping it terminates every worker (in-flight jobs are
+/// discarded; the app re-queues them through the driver).
+#[cfg(target_arch = "wasm32")]
+pub struct DrcPool {
+    workers: Vec<web_sys::Worker>,
+    _onmessage: Vec<wasm_bindgen::closure::Closure<dyn FnMut(web_sys::MessageEvent)>>,
+    next: std::cell::Cell<usize>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl DrcPool {
+    /// Spawn `n` DRC workers; replies push into `slot`.
+    pub fn new(n: usize, slot: DrcSlot) -> Result<Self, String> {
+        use wasm_bindgen::closure::Closure;
+        use wasm_bindgen::JsCast;
+        let mut workers = Vec::with_capacity(n);
+        let mut handlers = Vec::with_capacity(n);
+        for _ in 0..n.max(1) {
+            let w = web_sys::Worker::new(DRC_WORKER_URL).map_err(|e| format!("drc worker spawn: {e:?}"))?;
+            let slot = slot.clone();
+            let h = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
+                let data = e.data();
+                let kind = get_str(&data, "type");
+                let error = match kind.as_deref() {
+                    Some("drc_done") => false,
+                    Some("drc_error") => {
+                        log::error!("drc worker: {}", get_str(&data, "message").unwrap_or_default());
+                        true
+                    }
+                    _ => return,
+                };
+                let tile = fluideda_core::TileKey::new(
+                    get_f64(&data, "tx") as i32,
+                    get_f64(&data, "ty") as i32,
+                    get_f64(&data, "sx") as u16,
+                    get_f64(&data, "sy") as u16,
+                );
+                let violations = if error { Vec::new() } else { decode_violations(&get_i32_vec(&data, "viol")) };
+                slot.borrow_mut().push(DrcReply {
+                    epoch: get_f64(&data, "epoch") as u32,
+                    cell: get_f64(&data, "cell") as usize,
+                    tile,
+                    gen: get_f64(&data, "gen") as u32,
+                    violations,
+                    error,
+                });
+            });
+            w.set_onmessage(Some(h.as_ref().unchecked_ref()));
+            workers.push(w);
+            handlers.push(h);
+        }
+        Ok(Self { workers, _onmessage: handlers, next: std::cell::Cell::new(0) })
+    }
+
+    pub fn size(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Post one tile job to the next worker. The three columns are copied once
+    /// into JS buffers and transferred; `rules` is the packed deck.
+    pub fn post(&self, epoch: u32, job: &fluideda_core::TileJob, rules: &[i32]) {
+        use wasm_bindgen::JsValue;
+        let core = js_sys::Int32Array::from(
+            &[job.core.min.x, job.core.min.y, job.core.max.x, job.core.max.y][..],
+        );
+        let rules = js_sys::Int32Array::from(rules);
+        let carr = js_sys::Int32Array::from(&job.input.coords[..]);
+        let sarr = js_sys::Uint32Array::from(&job.input.starts[..]);
+        let larr = js_sys::Uint32Array::from(&job.input.layers[..]);
+        let payload = js_sys::Object::new();
+        let set = |k: &str, v: &JsValue| {
+            let _ = js_sys::Reflect::set(&payload, &k.into(), v);
+        };
+        set("type", &"drc".into());
+        set("epoch", &JsValue::from_f64(epoch as f64));
+        set("cell", &JsValue::from_f64(job.cell as f64));
+        set("tx", &JsValue::from_f64(job.tile.tx as f64));
+        set("ty", &JsValue::from_f64(job.tile.ty as f64));
+        set("sx", &JsValue::from_f64(job.tile.sx as f64));
+        set("sy", &JsValue::from_f64(job.tile.sy as f64));
+        set("gen", &JsValue::from_f64(job.gen as f64));
+        set("core", &core);
+        set("rules", &rules);
+        set("coords", &carr.buffer());
+        set("starts", &sarr.buffer());
+        set("layers", &larr.buffer());
+        let transfer = js_sys::Array::of3(&carr.buffer(), &sarr.buffer(), &larr.buffer());
+        let i = self.next.get();
+        self.next.set((i + 1) % self.workers.len());
+        if let Err(e) = self.workers[i].post_message_with_transfer(&payload, &transfer) {
+            log::error!("drc post failed: {e:?}");
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for DrcPool {
+    fn drop(&mut self) {
+        for w in &self.workers {
+            w.terminate();
+        }
+    }
+}
+
+/// Decode the worker's flat violation records (see `fluideda_worker::drc_tile`).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn decode_violations(v: &[i32]) -> Vec<fluideda_core::Violation> {
+    v.chunks_exact(6)
+        .map(|r| fluideda_core::Violation {
+            kind: if r[0] == 0 { fluideda_core::DrcKind::Width } else { fluideda_core::DrcKind::Spacing },
+            layer: fluideda_core::drc::unpack_layer(r[1] as u32),
+            bbox: fluideda_core::Bbox {
+                min: fluideda_core::Point::new(r[2], r[3]),
+                max: fluideda_core::Point::new(r[4], r[5]),
+            },
+        })
+        .collect()
+}
+
+/// Native stub — the DRC pool is web-only (the app runs DRC inline natively).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct DrcPool;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl DrcPool {
+    pub fn new(_n: usize, _slot: DrcSlot) -> Result<Self, String> {
+        Err("DRC worker pool is web-only".into())
+    }
+    pub fn size(&self) -> usize {
+        0
+    }
+    pub fn post(&self, _epoch: u32, _job: &fluideda_core::TileJob, _rules: &[i32]) {}
+}

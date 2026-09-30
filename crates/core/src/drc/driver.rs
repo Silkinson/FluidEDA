@@ -141,6 +141,11 @@ pub struct DrcDriver {
     pub last_pass: Option<PassStats>,
     /// Target shapes per tile for grids built from now on.
     pub tile_target: usize,
+    /// Bumped by every [`clear`](Self::clear). An asynchronous executor stamps
+    /// each job with the epoch it was dispatched under and drops replies from an
+    /// older one: after a clear, a new design's tile can reuse an old key AND
+    /// generation, so `gen` alone cannot tell a stale reply apart.
+    epoch: u32,
 }
 
 impl DrcDriver {
@@ -153,7 +158,13 @@ impl DrcDriver {
             in_flight_total: 0,
             last_pass: None,
             tile_target: super::TILE_TARGET_SHAPES,
+            epoch: 0,
         }
+    }
+
+    /// The current epoch (see the field note).
+    pub fn epoch(&self) -> u32 {
+        self.epoch
     }
 
     pub fn rules(&self) -> &DrcRules {
@@ -174,6 +185,7 @@ impl DrcDriver {
         self.queue.clear();
         self.in_flight_total = 0;
         self.last_pass = None;
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
     fn ensure(&mut self, db: &CellDb, cell: CellId) -> &mut CellDrc {

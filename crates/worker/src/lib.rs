@@ -1,4 +1,5 @@
-//! FluidEDA parse worker — the Phase 2b STEP 2 off-main-thread parser.
+//! FluidEDA worker module — the Phase 2b STEP 2 off-main-thread parser, the
+//! Phase 4 tessellation worker, and (Phase 5b) the DRC tile checker.
 //!
 //! This crate compiles to a **separate** wasm module (its own linear memory) that
 //! runs in a Web Worker. It links `fluideda-core` ONLY — no wgpu, no egui — so it
@@ -216,6 +217,38 @@ mod wasm {
             verts: Float32Array::from(&verts[..]),
             indices: Uint32Array::from(&indices[..]),
         }
+    }
+
+    /// Check one DRC tile (Phase 5b SLICE 3 — DRC in a worker pool). Inputs are
+    /// exactly a `fluideda_core::TileJob`'s Pod columns plus the packed rule
+    /// deck; the pure `check_tile_columns` is the same function the main thread
+    /// runs inline, so worker and inline results are identical. Output is flat:
+    /// `[kind, layer | datatype << 16, min_x, min_y, max_x, max_y]` per violation
+    /// (`kind` 0 = width, 1 = space).
+    #[wasm_bindgen]
+    pub fn drc_tile(core: Vec<i32>, rules: Vec<i32>, coords: Vec<i32>, starts: Vec<u32>, layers: Vec<u32>) -> Int32Array {
+        console_error_panic_hook::set_once();
+        let core = fluideda_core::Bbox {
+            min: fluideda_core::Point::new(core[0], core[1]),
+            max: fluideda_core::Point::new(core[2], core[3]),
+        };
+        let rules = fluideda_core::DrcRules::unpack(&rules);
+        let v = fluideda_core::check_tile_columns(core, &rules, &coords, &starts, &layers);
+        let mut out = Vec::with_capacity(v.len() * 6);
+        for x in &v {
+            out.extend([
+                match x.kind {
+                    fluideda_core::DrcKind::Width => 0,
+                    fluideda_core::DrcKind::Spacing => 1,
+                },
+                fluideda_core::drc::pack_layer(x.layer) as i32,
+                x.bbox.min.x,
+                x.bbox.min.y,
+                x.bbox.max.x,
+                x.bbox.max.y,
+            ]);
+        }
+        Int32Array::from(&out[..])
     }
 
     /// Current wasm linear-memory size in bytes.

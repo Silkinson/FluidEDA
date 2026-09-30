@@ -99,6 +99,14 @@ const TESS_INLINE_MAX: usize = 6;
 /// index build left (the lazy R-tree is replaced by the budgeted tile grid).
 const DRC_BUDGET_MS: f64 = 8.0;
 
+/// DRC worker pool (Phase 5b SLICE 3): at most this many workers, and this many
+/// jobs queued per worker — enough that a worker never idles between the main
+/// thread's once-per-frame refills (a tile is ~1–5 ms; a frame is ~16 ms),
+/// small enough that an edit's tiles, which jump the driver's queue, wait
+/// behind only a few already-posted jobs.
+const DRC_POOL_MAX: usize = 8;
+const DRC_JOBS_PER_WORKER: usize = 8;
+
 /// Cap on violation markers drawn per frame (the panel shows the counts).
 const DRC_MARKER_CAP: usize = 300;
 
@@ -236,6 +244,18 @@ pub struct FluidApp {
     drc_deck: fluideda_core::Deck,
     /// `drc_bench` results (see `run_test_command`).
     drc_bench: Option<DrcBench>,
+    /// Phase 5b SLICE 3: the DRC worker pool (web; spawned on first work).
+    /// `None` natively / without workers / under `?drcinline=1` — jobs then run
+    /// inline under the frame budget, through the same driver.
+    drc_pool: Option<webio::DrcPool>,
+    /// Pool replies, drained into the driver each frame.
+    drc_replies: webio::DrcSlot,
+    /// `?drcinline=1`: never use the pool (before/after measurement).
+    drc_force_inline: bool,
+    /// The deck packed for worker jobs (refreshed on deck change).
+    drc_rules_packed: Vec<i32>,
+    /// Tiles a worker failed on (accepted as clean; shown in the panel).
+    drc_tile_errors: usize,
     /// Monotonic origin for the driver's pass timing.
     app_t0: web_time::Instant,
 
@@ -325,6 +345,11 @@ impl FluidApp {
             drc: fluideda_core::DrcDriver::new(deck.rules()),
             drc_deck: deck,
             drc_bench: None,
+            drc_pool: None,
+            drc_replies: Rc::new(RefCell::new(Vec::new())),
+            drc_force_inline: webio::query_flag("drcinline"),
+            drc_rules_packed: deck.rules().pack(),
+            drc_tile_errors: 0,
             app_t0: web_time::Instant::now(),
             dirty_keys: HashSet::new(),
             renderer_drop_cells: HashSet::new(),
@@ -376,7 +401,9 @@ impl FluidApp {
         // A new design picks its own deck (sky130 layers ⇒ the PDK table).
         self.drc_deck = fluideda_core::Deck::detect(&self.layers);
         self.drc.set_rules(self.drc_deck.rules());
+        self.drc_rules_packed = self.drc.rules().pack();
         self.drc_bench = None;
+        self.drc_tile_errors = 0;
         self.tool = Tool::Select;
         self.active_layer = 0;
         self.rect_anchor = None;
@@ -798,6 +825,7 @@ impl FluidApp {
     fn set_deck(&mut self, deck: fluideda_core::Deck) {
         self.drc_deck = deck;
         self.drc.set_rules(deck.rules());
+        self.drc_rules_packed = self.drc.rules().pack();
         self.drc_bench = None;
     }
 
@@ -832,22 +860,60 @@ impl FluidApp {
         }
     }
 
-    /// Run queued DRC work within the per-frame budget: grid-build slices and
-    /// tile jobs, each a few ms at most, executed inline.
+    /// Run queued DRC work within the per-frame budget: feed pool replies back
+    /// to the driver, then advance grid-build slices and hand out tile jobs —
+    /// posted to the worker pool when there is one, else checked inline. Either
+    /// way the main thread only gathers (~0.1 ms/tile) and never blocks past
+    /// about one job of `DRC_BUDGET_MS`.
     fn run_drc_budget(&mut self) {
-        if !self.drc_enabled || !self.drc.is_busy() {
+        if !self.drc_enabled {
             return;
         }
+        // 1. Replies from the pool. A reply from before a clear (new design,
+        //    deck change, DRC toggled) carries an old epoch: drop it — its
+        //    (cell, tile, gen) may collide with the new state's.
+        let replies: Vec<webio::DrcReply> = std::mem::take(&mut *self.drc_replies.borrow_mut());
+        let now = self.now_ms();
+        for r in replies {
+            if r.epoch != self.drc.epoch() {
+                continue;
+            }
+            self.drc_tile_errors += r.error as usize;
+            self.drc.accept(r.cell, r.tile, r.gen, r.violations, now);
+        }
+        if !self.drc.is_busy() {
+            return;
+        }
+        // 2. The pool: spawned on first work (web, workers supported, not forced
+        //    inline). One worker per spare core, capped.
+        if self.drc_pool.is_none() && !self.drc_force_inline && webio::worker_supported() {
+            let n = webio::hardware_concurrency().saturating_sub(1).clamp(1, DRC_POOL_MAX);
+            match webio::DrcPool::new(n, self.drc_replies.clone()) {
+                Ok(p) => {
+                    log::info!("DRC worker pool: {n} worker(s)");
+                    self.drc.max_in_flight = n * DRC_JOBS_PER_WORKER;
+                    self.drc_pool = Some(p);
+                }
+                Err(e) => {
+                    log::error!("DRC pool unavailable, running inline: {e}");
+                    self.drc_force_inline = true;
+                }
+            }
+        }
+        // 3. Grid slices + jobs within the budget.
         let t0 = web_time::Instant::now();
         while t0.elapsed().as_secs_f64() * 1e3 < DRC_BUDGET_MS {
             let now = self.now_ms();
             match self.drc.step(&self.db, &self.overlay, now) {
                 fluideda_core::DrcStep::Progress => {}
-                fluideda_core::DrcStep::Job(job) => {
-                    let v = fluideda_core::check_tile(job.core, self.drc.rules(), &job.input);
-                    let now = self.now_ms();
-                    self.drc.accept(job.cell, job.tile, job.gen, v, now);
-                }
+                fluideda_core::DrcStep::Job(job) => match &self.drc_pool {
+                    Some(pool) => pool.post(self.drc.epoch(), &job, &self.drc_rules_packed),
+                    None => {
+                        let v = fluideda_core::check_tile(job.core, self.drc.rules(), &job.input);
+                        let now = self.now_ms();
+                        self.drc.accept(job.cell, job.tile, job.gen, v, now);
+                    }
+                },
                 fluideda_core::DrcStep::Idle => break,
             }
         }
@@ -1099,7 +1165,8 @@ impl FluidApp {
              \"drc_cell\":{},\"drc_shapes\":{},\"drc_grid_ms\":{:.1},\"drc_cold_ms\":{:.1},\
              \"drc_warm_ms\":{:.2},\"drc_warm_tiles\":{},\"drc_tiles\":{},\"drc_tile_max_ms\":{:.2},\
              \"drc_violations\":{},\"drc_busy\":{},\"drc_pending\":{},\"drc_total\":{},\
-             \"drc_last_pass_ms\":{:.1},\"drc_last_pass_tiles\":{},\"drc_deck\":\"{:?}\"}}",
+             \"drc_last_pass_ms\":{:.1},\"drc_last_pass_tiles\":{},\"drc_deck\":\"{:?}\",\
+             \"drc_workers\":{},\"drc_errors\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -1124,6 +1191,8 @@ impl FluidApp {
             drc_last_ms,
             drc_last_tiles,
             self.drc_deck,
+            self.drc_pool.as_ref().map_or(0, |p| p.size()),
+            self.drc_tile_errors,
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -1559,6 +1628,17 @@ impl FluidApp {
                 }
             }
             Some("drc_on") => self.drc_enabled = true,
+            Some("drc_full_biggest") => {
+                // Full check of the biggest cell through the live driver (pool
+                // or inline) — the harness times it via `drc_last_pass_ms`.
+                let biggest = (0..self.db.cells.len())
+                    .max_by_key(|&c| self.db.cell(c).shapes.len())
+                    .filter(|&c| self.db.cell(c).shapes.len() > 0);
+                if let Some(cell) = biggest {
+                    let now = self.now_ms();
+                    self.drc.request_full(&self.db, &self.overlay, cell, now);
+                }
+            }
             Some("drc_deck") => {
                 // `drc_deck sky130|blanket` — switch the rule deck.
                 if let Some(d) = parts.next().and_then(fluideda_core::Deck::from_name) {
@@ -1867,6 +1947,13 @@ impl FluidApp {
                 }
                 if self.drc.pending_tiles() > 0 {
                     ui.small(format!("checking… {} tile(s) queued", self.drc.pending_tiles()));
+                }
+                match &self.drc_pool {
+                    Some(p) => ui.small(format!("{} worker(s), {} tile(s) in flight", p.size(), self.drc.in_flight())),
+                    None => ui.small("inline (no worker pool)"),
+                };
+                if self.drc_tile_errors > 0 {
+                    ui.colored_label(egui::Color32::YELLOW, format!("{} tile error(s) — see console", self.drc_tile_errors));
                 }
                 if let Some(p) = self.drc.last_pass {
                     ui.small(format!(

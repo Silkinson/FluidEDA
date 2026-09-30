@@ -16,8 +16,9 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 
 ## Where we are
 
-**Phase 5b in progress: DRC hardening** on `phase5b-drc-hardening` — the three
-follow-ups Phase 5's own DRC measurements named.
+**Phase 5b shipped: DRC hardening** on `phase5b-drc-hardening` — the three
+follow-ups Phase 5's own DRC measurements named, each built and measured (full
+write-up: `docs/phase5b-findings.md`).
 
 * **SLICE 1 — booleans + merge-first, tiled DRC.** New integer boolean kernel
   (`crates/core/boolean.rs`, `i_overlay` 9, pure Rust / no_std / wasm-clean).
@@ -51,6 +52,12 @@ follow-ups Phase 5's own DRC measurements named.
   1,014 cells, concentrated in `sky130_fd_io` pad cells whose 45° corner-fill
   triangles and stubs only merge in hierarchical context — the measured case
   for in-context (flattened-window) checking.
+* **SLICE 3 — DRC in a worker pool.** Persistent stateless workers
+  (`assets/worker/drc_worker.js`, one per spare core, ≤ 8) run the same pure
+  `check_tile_columns` the inline path runs; the main thread only gathers and
+  posts within the frame budget; replies are epoch-guarded against design/deck
+  changes. "Check visible" on caravel: **1.7 s wall with 8 workers vs 10.6 s
+  inline**, identical violation totals, longest frame 15.3 ms.
 
 **Phase 5 shipped: FluidEDA authors geometry and checks it.** Three slices on
 `phase5-authoring-drc`:
@@ -98,7 +105,7 @@ still byte-identical).
 | 3 — real editing | `phase3-real-editing` | ✅ done | SLICE 1: GDS export (round-trip + pixel-match). SLICE 2: non-TOP editing under the transform stack (landmine eliminated), master-edit semantics, finer chunking (edit 22→0.8 ms), two-browser non-TOP convergence |
 | 4 — integrate + fit-view offload | `phase4` | ✅ done | STEP 1: merged parse-worker + real-editing onto the trunk (build + 39 core + golden green). STEP 2: fit-view tessellation offloaded to a worker (bbox proxy → stream). Longest fit frame ~1.1–1.35 s → **62–64 ms** (caravel / caravan-signoff), leaf unchanged, edit < 2 ms |
 | 5 — authoring + DRC | `phase5-authoring-drc` | ✅ done | SLICE 1: rect/poly draw tools, geometry-carrying CRDT adds with stable `(client, seq)` ids — concurrent adds converge; export covers adds (0 px round-trip). SLICE 2: vertex editing via `SetPoints` (LWW on same shape), non-TOP masters. SLICE 3: intra-cell DRC (exact spacing, per-shape width), overlay-composited, 8 ms/frame budget; caravel_core 10.3 s cold / 9.6 s warm (wasm) |
-| 5b — DRC hardening | `phase5b-drc-hardening` | ◑ SLICE 1–2 done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine) |
+| 5b — DRC hardening | `phase5b-drc-hardening` | ✅ done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine). SLICE 3: worker pool — check-visible 10.6 s → **1.7 s** (8 workers), identical results |
 | 6 — backend/OASIS | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS (moved from the old "Phase 5" label — see the ledger-reshape note) |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
@@ -116,7 +123,7 @@ still byte-identical).
 | edit re-tess frame | < 2 ms | dirty chunks stay inline (finer-chunking, SLICE 2 path unchanged); offload never touches the edit path. caravel 1.8 ms, caravan-signoff 0.4 ms |
 | DRC: biggest cell full check | **2.9 s** (wasm, single-threaded) | caravel_core, 2.5 M shapes, merge-first (Phase 5b); was 10.3 s cold / 9.6 s warm per-shape. Native 2.3 s. Includes the 95 ms tile-grid build (budgeted, replaces the atomic R-tree). 2923 tiles, slowest 5.1 ms |
 | DRC: re-check after one edit | **1.1 ms** (wasm) | tiles within reach of the edit (1 tile for a typical shape); was a 9.6 s whole-cell re-check |
-| DRC: background pass | 8.0 s wall, longest frame **19.1 ms** | "check visible" over caravel_core at leaf, 8 ms/frame budget, inline (no worker yet) |
+| DRC: background pass | **1.7 s** wall (8 workers), longest frame **15.3 ms** | "check visible" at leaf on caravel (caravel_core + visible cells); inline fallback (`?drcinline=1`) 10.6 s / 17.2 ms, same totals |
 | DRC: flags on caravel_core | **0** (sky130 and blanket) | was 611,680 (per-shape, blanket). SLICE 1's merge-first left 61 staircase-bend diagonals; SLICE 2's projection width (sky130 signoff semantics) clears them |
 | DRC: whole caravel, every cell (sky130) | 3,305 flags / 252 of 1,014 cells, 3.6 s native | intra-cell sweep (`drc_bench … sky130 --all`); dominated by `sky130_fd_io` pad cells (45° corner-fill triangles and stubs that merge only in hierarchical context). Stdcell library: 4 flags / 2 of 440 cells |
 | DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
@@ -195,6 +202,13 @@ still byte-identical).
   edit-independent (base never mutates). Dense buckets split k×k by shape
   count: caravel_core's 110 µm tiles ranged 0–35 k shapes (135 ms); split, the
   slowest is 5.1 ms (wasm).
+- **DRC runs in a stateless worker pool, fed by the pure driver (Phase 5b
+  SLICE 3).** One persistent worker per spare core (≤ 8), each job = one tile's
+  Pod columns + the packed deck, ≤ 8 jobs queued per worker. Consistent with
+  the Phase 4 tessellation decision: no CellDb resident in any worker (8 × a
+  big cell would not fit), the base never mutates so there is nothing to keep
+  in sync, and results are byte-for-byte the inline function's. Replies carry
+  the driver's epoch (bumped on clear) *and* the tile generation.
 - **DRC is intra-cell, composite-aware, budgeted.** Checks run per cell in
   cell-local space over base∖tombstones ∪ moved/vertex copies ∪ adds, using the
   existing per-cell R-tree for spacing candidates (base never mutates ⇒ the index
@@ -265,9 +279,9 @@ still byte-identical).
   (the 593 k fracture flags are gone); the atomic index build is DONE (grid,
   budgeted); non-rect width is exact now (edge pairs). Still open below:
   cross-instance context (measured: on the whole chip it is what remains —
-  pad-cell corner fills and stubs), and DRC-in-worker. The rule table is DONE
-  (SLICE 2: sky130 subset; wide-metal / EOL / enclosure / density rules are not
-  modeled).
+  pad-cell corner fills and stubs). The rule table is DONE (SLICE 2: sky130
+  subset; wide-metal / EOL / enclosure / density rules are not modeled);
+  DRC-in-worker is DONE (SLICE 3).
 - **DRC deferrals (phase5 SLICE 3 — scoped honestly, in the code too):**
   - **Cross-instance / hierarchical spacing is NOT checked.** Checks are
     intra-cell; a shape in cell A near an instance of cell B is invisible to
@@ -302,13 +316,13 @@ still byte-identical).
 
 ## Next step
 
-**Phase 5 shipped** (authoring + DRC — see the ledger). FluidEDA now draws,
-vertex-edits, syncs, undoes, exports, and checks — the first full author→verify
-loop. The DRC skeleton's own measurements point at its follow-ups (see debts):
-**booleans** (merge-first width — the single biggest correctness win on real
-GDS), a **PDK rule table**, and **DRC-in-worker** (the 9.6 s big-cell re-check).
+**Phase 5b shipped** — FluidEDA's DRC now merges before it measures, carries a
+real (sky130) deck, re-checks an edit in ~1 ms, and fans a full check out over a
+worker pool. Its own measurements name what is next for DRC: **in-context
+(flattened-window) checking** — the whole-chip residue is pad-cell geometry that
+only merges across the hierarchy.
 
-Also still queued from Phase 4, unchanged:
+Queued from Phase 4, unchanged:
 - **Single-copy worker reconstruction** — the last big main-thread load block
   (~200 ms → < 100 ms); per-cell `subarray`, no concatenated intermediate.
 - **wgpu upgrade** — unblocks real WebGPU measurement (all browser numbers are
@@ -318,7 +332,8 @@ Also still queued from Phase 4, unchanged:
 
 Remaining editing follow-ons (deferred, named in code): edit one AREF placement
 vs. the master; drawing into an instanced master (draw is TOP-only); insert /
-delete vertex (count-preserving edits only); booleans.
+delete vertex (count-preserving edits only); boolean edit ops (the kernel now
+exists: `crates/core/boolean.rs`).
 
 Then Phase 6: content-addressed store, tile CDN, streaming OASIS (the out-of-core
 story the production-SoC scale ceiling needs).

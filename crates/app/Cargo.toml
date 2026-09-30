@@ -50,6 +50,8 @@ web-sys = { version = "0.3", features = [
     "Response",
     # Phase 2b STEP 2 — off-main-thread parse worker.
     "Worker",
+    # Phase 5b — size the DRC worker pool (navigator.hardwareConcurrency).
+    "Navigator",
     "WorkerType",
     "WorkerOptions",
     "MessageEvent",
