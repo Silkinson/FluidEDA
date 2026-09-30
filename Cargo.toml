@@ -28,11 +28,11 @@ thiserror = "1"
 # --- rendering ---
 # `webgl` enables wgpu's WebGL2 backend so the viewer still runs in browsers
 # without WebGPU (notably Safari). eframe falls back to it automatically.
-wgpu = { version = "22", features = ["webgl"] }
+wgpu = { version = "30", features = ["webgl"] }
 winit = "0.30"
-egui = "0.29"
-eframe = { version = "0.29", default-features = false, features = ["wgpu"] }
-egui-wgpu = "0.29"
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["wgpu"] }
+egui-wgpu = "0.36"
 
 # --- geometry / io ---
 gds21 = "0.2"

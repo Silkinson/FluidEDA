@@ -169,8 +169,8 @@ impl HierRenderer {
 
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("fill-layout"),
-            bind_group_layouts: &[&globals_bgl, &layer_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&globals_bgl), Some(&layer_bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -178,26 +178,26 @@ impl HierRenderer {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[
                     // slot 0: per-vertex cell-local position
-                    wgpu::VertexBufferLayout {
+                    Some(wgpu::VertexBufferLayout {
                         array_stride: 8, // vec2<f32>
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &wgpu::vertex_attr_array![0 => Float32x2],
-                    },
+                    }),
                     // slot 1: per-instance affine transform (two vec4)
-                    wgpu::VertexBufferLayout {
+                    Some(wgpu::VertexBufferLayout {
                         array_stride: INST_SIZE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![1 => Float32x4, 2 => Float32x4],
-                    },
+                    }),
                 ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -208,7 +208,7 @@ impl HierRenderer {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -263,6 +263,13 @@ impl HierRenderer {
     /// Is this cell chunk's geometry already tessellated + uploaded?
     pub fn has_chunk(&self, key: ChunkKey) -> bool {
         self.cells.contains_key(&key)
+    }
+
+    /// Draw calls the last `prepare` planned (one per visible (chunk, layer)
+    /// mesh, plus the proxy and overlay draws) — the per-frame command count
+    /// that dominates WebGPU's CPU cost at fit view (Phase 5c measurement).
+    pub fn draw_calls(&self) -> usize {
+        self.draw_seq.len() + (self.proxy_count > 0) as usize + (!self.overlay.is_empty()) as usize
     }
 
     /// Total vertex+index bytes uploaded so far (grows with lazy tessellation).

@@ -87,6 +87,27 @@ pub fn query_flag(_name: &str) -> bool {
     false
 }
 
+/// Read a drag-and-dropped file into `slot` (egui 0.36 hands out a file handle):
+/// asynchronously on the web, synchronously natively. A read error is reported
+/// through `status`.
+#[cfg(target_arch = "wasm32")]
+pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot, _status: &mut String) {
+    wasm_bindgen_futures::spawn_local(async move {
+        match file.bytes_async().await {
+            Ok(bytes) => *slot.borrow_mut() = Some((name, bytes)),
+            Err(e) => log::error!("read dropped {name} failed: {e}"),
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot, status: &mut String) {
+    match file.bytes() {
+        Ok(bytes) => *slot.borrow_mut() = Some((name, bytes)),
+        Err(e) => *status = format!("read failed: {e}"),
+    }
+}
+
 /// Fetch a URL and deposit the bytes into `slot` when done (wasm).
 #[cfg(target_arch = "wasm32")]
 pub fn spawn_fetch(url: String, slot: LoadSlot) {

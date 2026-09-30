@@ -10,7 +10,7 @@
 // Prereq: dist built (trunk build --release) and served with testdata:
 //   python3 scripts/serve_bench.py 8090 &
 // Run: node scripts/worker_test.mjs [/testdata/....gds]
-import { chromium } from 'playwright';
+import { launch } from './launch.mjs';
 
 const PORT = process.env.PORT || 8090;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -25,7 +25,7 @@ const TIMEOUT = 240_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
-  const browser = await chromium.launch();
+  const browser = await launch();
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 

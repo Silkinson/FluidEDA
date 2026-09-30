@@ -126,6 +126,8 @@ pub struct FluidApp {
     cull_stats: CullStats,
     total_shapes: u64,
     metrics: Metrics,
+    /// The wgpu backend in use (stamped into every design's metrics).
+    gpu_backend: String,
 
     // runtime loading
     load_slot: LoadSlot,
@@ -157,6 +159,8 @@ pub struct FluidApp {
     tess_accum_ms: f64,
     /// Cumulative uploaded GPU geometry bytes so far.
     gpu_bytes: usize,
+    /// Draw calls in the last planned frame (panel + perf readout).
+    draw_calls: usize,
 
     // --- Phase 4 STEP 2: off-main-thread (worker) tessellation ---
     /// Persistent tessellation worker. `None` on native / no-worker / before the
@@ -285,6 +289,11 @@ impl FluidApp {
         let design = design::load_design("hier.gds (embedded)", HIER_GDS)
             .expect("embedded hier.gds should parse");
 
+        let backend = cc
+            .wgpu_render_state
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |s| format!("{:?}", s.adapter.get_info().backend));
+        log::warn!("FluidEDA GPU backend: {backend}");
         if let Some(state) = cc.wgpu_render_state.as_ref() {
             init_renderer(state);
         }
@@ -318,7 +327,8 @@ impl FluidApp {
             visible: Arc::new(VisibleSet::default()),
             cull_stats: CullStats::default(),
             total_shapes: design.total_shapes,
-            metrics: design.metrics,
+            metrics: Metrics { backend: backend.clone(), ..design.metrics },
+            gpu_backend: backend,
             load_slot,
             design_slot,
             loading: None,
@@ -330,6 +340,7 @@ impl FluidApp {
             uploaded: HashSet::new(),
             tess_accum_ms: 0.0,
             gpu_bytes: 0,
+            draw_calls: 0,
             tess: None,
             tess_results: Rc::new(RefCell::new(Vec::new())),
             tess_pending: HashSet::new(),
@@ -395,7 +406,7 @@ impl FluidApp {
         self.bbox_min = design.bbox_min;
         self.bbox_max = design.bbox_max;
         self.total_shapes = design.total_shapes;
-        self.metrics = design.metrics;
+        self.metrics = Metrics { backend: self.gpu_backend.clone(), ..design.metrics };
         self.camera.fit(self.bbox_min, self.bbox_max);
         self.apply_forced_zoom();
         self.uploaded.clear();
@@ -1094,6 +1105,7 @@ impl FluidApp {
             self.last_edit_ms = edit_t.elapsed().as_secs_f64() * 1e3;
         }
         self.gpu_bytes = renderer.uploaded_bytes();
+        self.draw_calls = renderer.draw_calls();
     }
 
     /// Consume any pending drag-drop / fetched / picked file.
@@ -1111,21 +1123,19 @@ impl FluidApp {
         }
         self.advance_load(frame);
 
-        // egui drag-and-drop (bytes on web, path on native).
+        // egui drag-and-drop: a file handle (egui 0.36) — read asynchronously
+        // on the web (browsers only read files async), synchronously natively;
+        // the bytes land in the load slot either way.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for f in dropped {
-            if let Some(bytes) = f.bytes {
-                let name = if f.name.is_empty() { "dropped.gds".into() } else { f.name.clone() };
-                *self.load_slot.borrow_mut() = Some((name, bytes.to_vec()));
-            } else if let Some(path) = &f.path {
-                match std::fs::read(path) {
-                    Ok(bytes) => {
-                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file.gds").to_string();
-                        *self.load_slot.borrow_mut() = Some((name, bytes));
-                    }
-                    Err(e) => self.status = format!("read failed: {e}"),
-                }
-            }
+            let name = f
+                .path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("dropped.gds")
+                .to_string();
+            webio::read_dropped(name, f, self.load_slot.clone(), &mut self.status);
         }
 
         // Byte slot (drag-drop / picker). Take at most one per frame. On web with
@@ -1262,7 +1272,7 @@ impl FluidApp {
              \"drc_warm_ms\":{:.2},\"drc_warm_tiles\":{},\"drc_tiles\":{},\"drc_tile_max_ms\":{:.2},\
              \"drc_violations\":{},\"drc_busy\":{},\"drc_pending\":{},\"drc_total\":{},\
              \"drc_last_pass_ms\":{:.1},\"drc_last_pass_tiles\":{},\"drc_deck\":\"{:?}\",\
-             \"drc_workers\":{},\"drc_errors\":{}}}",
+             \"drc_workers\":{},\"drc_errors\":{},\"draw_calls\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -1289,6 +1299,7 @@ impl FluidApp {
             self.drc_deck,
             self.drc_pool.as_ref().map_or(0, |p| p.size()),
             self.drc_tile_errors,
+            self.draw_calls,
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -1503,7 +1514,8 @@ fn changed_ids(old: &EditOverlay, new: &EditOverlay) -> std::collections::HashSe
 }
 
 impl eframe::App for FluidApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         // Time the whole main-thread frame (the fit-view freeze lives inside
         // `ensure_uploaded` below). `max_frame_ms` is the STEP 2 headline number.
         let frame_t = web_time::Instant::now();
@@ -1530,8 +1542,8 @@ impl eframe::App for FluidApp {
 
         self.drive_test_hook();
 
-        self.side_panel(ctx, frame);
-        self.canvas(ctx);
+        self.side_panel(ui, frame);
+        self.canvas(ui);
         self.recull();
         self.ensure_uploaded(frame);
         self.run_drc_budget();
@@ -1848,8 +1860,8 @@ impl FluidApp {
 }
 
 impl FluidApp {
-    fn side_panel(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        egui::SidePanel::left("panel").default_width(250.0).show(ctx, |ui| {
+    fn side_panel(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        egui::Panel::left("panel").default_size(250.0).show(ui, |ui| {
             ui.heading("FluidEDA");
             ui.label(format!("{:.0} fps", self.fps));
             if !self.status.is_empty() {
@@ -1885,6 +1897,7 @@ impl FluidApp {
                     ));
                 }
                 ui.small(format!("GPU geo:     {} MB (visible only)", self.gpu_bytes / 1_048_576));
+                ui.small(format!("draw calls:  {} / frame ({})", self.draw_calls, self.metrics.backend));
                 if m.parse_heap_bytes > 0 {
                     ui.small(format!("parse heap:  {} MB (high-water)", m.parse_heap_bytes / 1_048_576));
                 }
@@ -2090,8 +2103,8 @@ impl FluidApp {
         });
     }
 
-    fn canvas(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn canvas(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             let size = ui.available_size();
             self.camera.viewport = Vec2::new(size.x, size.y);
             let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
@@ -2261,7 +2274,7 @@ impl FluidApp {
                 self.delete_shape(self.selected.unwrap());
             }
 
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.0 {
                 if let Some(p) = resp.hover_pos() {
                     let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
@@ -2388,7 +2401,7 @@ impl FluidApp {
                                 self.world_to_screen(Vec2::new(x1 as f32, y1 as f32), rect),
                             );
                             if r.intersects(rect) {
-                                painter.rect_stroke(r.expand(2.0), 0.0, stroke);
+                                painter.rect_stroke(r.expand(2.0), 0.0, stroke, egui::StrokeKind::Outside);
                                 drawn += 1;
                             }
                         }
@@ -2407,7 +2420,7 @@ impl FluidApp {
                         self.world_to_screen(Vec2::new(a.x as f32, a.y as f32), rect),
                         self.world_to_screen(Vec2::new(b.x as f32, b.y as f32), rect),
                     );
-                    painter.rect_stroke(r, 0.0, preview_stroke);
+                    painter.rect_stroke(r, 0.0, preview_stroke, egui::StrokeKind::Outside);
                 }
             }
             if !self.poly_pts.is_empty() {

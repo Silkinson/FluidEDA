@@ -118,6 +118,7 @@ still byte-identical).
 | parse wall | 1.0–1.2 s | now off the main thread (in the worker) |
 | combined peak heap (worker+main) | **~1.28 GB** | was 1.46 GB: single-copy reconstruction drops the concatenated wasm-side columns (main heap 434 → 254 MB). Worker memory reclaimed on terminate |
 | fit fps | 47–78 | browser WebGL2 / native Metal; chunking cost ~6% at fit |
+| fit fps, **real WebGPU** (Metal) | sky130 **60** / caravel 44 | Phase 5c (wgpu 30): first real WebGPU numbers — WebGL2-on-Metal for the same views is 22 / 51 (3 runs each, headless, 120 Hz cap). sky130's fit (5,144 draws/frame, CPU-bound) is 2.7× faster: WebGPU's per-draw cost is lower than ANGLE's. caravel's fit (1,822 draws over millions of triangles, GPU-bound) is 14% slower on Dawn-Metal than ANGLE-Metal. mid/leaf identical (93–94 fps) |
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |
 | fit-view TTFF | **1.7 s** (first frame of the new design) | Phase 5c: the skeleton (hierarchy + chunk boxes) installs before any geometry, so first paint no longer waits for the column copy either; all geometry in ~150 ms later (`geometry_ms`). Same session before/after: caravel 2.7 → 1.7 s, caravan-signoff 3.0 → 2.0 s; longest fit frame 112 → 84 ms / 119 → 82 ms (machine under load; absolute numbers above this table's older 62 ms were measured on a quiet machine) |
 | edit re-tess frame | < 2 ms | dirty chunks stay inline (finer-chunking, SLICE 2 path unchanged); offload never touches the edit path. caravel 1.8 ms, caravan-signoff 0.4 ms |
@@ -231,9 +232,13 @@ still byte-identical).
 - **WebGL2 storage-buffer constraint** is still live (the `webgl` fallback). Costs
   nothing today; becomes a real fork at any GPU-compute work. Safari 26 now ships
   WebGPU by default — worth re-checking whether the fallback is still needed.
-- **wgpu 22 is behind** and its `requestDevice` limits make headless Chromium
-  reject WebGPU, so all browser numbers are WebGL2/ANGLE (pessimistic for fps). A
-  wgpu upgrade would unblock real WebGPU measurement.
+- ~~wgpu 22 is behind~~ **RESOLVED** (`phase5c-load-perf` SLICE 3): wgpu 30 +
+  egui/eframe 0.36. The app now runs on real WebGPU wherever the browser offers
+  it (eframe prefers it; WebGL2 stays the fallback) — in headless Chromium with
+  `--enable-unsafe-webgpu --use-angle=metal` that is the Apple GPU (`GPU=webgpu`
+  in every harness; `scripts/launch.mjs`). The golden images pass unchanged.
+  The measured split (fit fps row above) is the next renderer question: the
+  GPU-bound caravel fit is ~14% slower on Dawn than on ANGLE.
 - ~~Golden PNGs are not committed~~ **RESOLVED** — `crates/render/tests/golden.rs`
   + 11 committed 512² reference PNGs (hier/sky130 fit/mid/leaf + 5 edit-overlay:
   base/moved/deleted/added/vertex), diffed with a documented tolerance in
@@ -335,9 +340,10 @@ worker pool. Its own measurements name what is next for DRC: **in-context
 (flattened-window) checking** — the whole-chip residue is pad-cell geometry that
 only merges across the hierarchy.
 
-Queued from Phase 4, unchanged:
-- **wgpu upgrade** — unblocks real WebGPU measurement (all browser numbers are
-  WebGL2/ANGLE today) and reclaims the ~6% fit-view chunking cost.
+The Phase 4 performance queue is done (`phase5c-load-perf`: single-copy
+budgeted design swap, progressive skeleton-first load, wgpu 30 with real
+WebGPU). The renderer's next measured question: why the GPU-bound caravel fit is
+~14% slower on Dawn-Metal than on ANGLE-Metal.
 
 Remaining editing follow-ons (deferred, named in code): edit one AREF placement
 vs. the master; drawing into an instanced master (draw is TOP-only); insert /

@@ -16,7 +16,7 @@
 // Prereq: trunk build --release && python3 scripts/serve_bench.py 8090
 // Run:    node scripts/drc_bench.mjs
 
-import { chromium } from 'playwright';
+import { launch } from './launch.mjs';
 
 const PORT = process.env.PORT || 8090;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -58,7 +58,7 @@ async function backgroundPass(page) {
 }
 
 async function main() {
-  const browser = await chromium.launch();
+  const browser = await launch();
   const page = await browser.newPage();
   page.on('console', (m) => { const t = m.text(); if (/DRC bench|panic/i.test(t)) console.log('  [page]', t); });
 

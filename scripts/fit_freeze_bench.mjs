@@ -14,7 +14,7 @@
 // (CPU tessellation) block, which `max_frame_ms` measures faithfully regardless of
 // the GPU. Run:  python3 scripts/serve_bench.py 8090 &  then  node scripts/fit_freeze_bench.mjs
 
-import { chromium } from 'playwright';
+import { launch } from './launch.mjs';
 
 const PORT = process.env.PORT || 8090;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -82,7 +82,7 @@ async function editRun(page, file) {
 }
 
 async function main() {
-  const browser = await chromium.launch();
+  const browser = await launch();
   const page = await browser.newPage();
   page.on('console', (m) => { const t = m.text(); if (/panic|error|OOM/i.test(t)) console.log('  [page]', t); });
 

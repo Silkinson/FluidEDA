@@ -103,7 +103,7 @@ async fn render_file_async(_label: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)>
         .await
         .expect("no wgpu adapter");
     let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default(), None)
+        .request_device(&wgpu::DeviceDescriptor::default())
         .await
         .expect("request_device");
 
@@ -158,6 +158,7 @@ async fn render_file_async(_label: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)>
                 label: Some("golden"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &tview,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.06, b: 0.08, a: 1.0 }),
@@ -167,19 +168,20 @@ async fn render_file_async(_label: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)>
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             renderer.draw(&mut pass);
         }
         enc.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &target,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bytes_per_row),
                     rows_per_image: Some(H),
@@ -192,9 +194,9 @@ async fn render_file_async(_label: &str, bytes: &[u8]) -> Vec<(String, Vec<u8>)>
         let slice = readback.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-        device.poll(wgpu::Maintain::Wait);
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
         rx.recv().unwrap().unwrap();
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().expect("mapped range");
         let mut pixels = Vec::with_capacity((W * H * 4) as usize);
         for y in 0..H {
             let row = (y * bytes_per_row) as usize;
@@ -290,7 +292,7 @@ async fn render_edit_frames() -> Vec<(&'static str, Vec<u8>)> {
         .await
         .expect("no wgpu adapter");
     let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor::default(), None)
+        .request_device(&wgpu::DeviceDescriptor::default())
         .await
         .expect("request_device");
 
@@ -378,7 +380,7 @@ fn export_round_trip_renders_identically() {
         let instance = wgpu::Instance::default();
         let adapter = instance.request_adapter(&Default::default()).await.expect("adapter");
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .expect("device");
 
@@ -476,6 +478,7 @@ fn read_frame(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &HierRendere
             label: Some("edit"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &tview,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.06, b: 0.08, a: 1.0 }),
@@ -485,19 +488,20 @@ fn read_frame(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &HierRendere
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         renderer.draw(&mut pass);
     }
     enc.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
+        wgpu::TexelCopyTextureInfo {
             texture: &target,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        wgpu::ImageCopyBuffer {
+        wgpu::TexelCopyBufferInfo {
             buffer: &readback,
-            layout: wgpu::ImageDataLayout {
+            layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(H),
@@ -510,9 +514,9 @@ fn read_frame(device: &wgpu::Device, queue: &wgpu::Queue, renderer: &HierRendere
     let slice = readback.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::PollType::wait_indefinitely()).expect("device poll");
     rx.recv().unwrap().unwrap();
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("mapped range");
     let mut pixels = Vec::with_capacity((W * H * 4) as usize);
     for y in 0..H {
         let row = (y * bytes_per_row) as usize;

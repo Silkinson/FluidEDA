@@ -13,6 +13,7 @@
 // Requires a running server (scripts/serve_bench.py) on PORT below.
 
 import { chromium } from 'playwright';
+import { launchArgs } from './launch.mjs';
 
 const PORT = process.env.PORT || 8090;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -63,10 +64,13 @@ async function runCase(browser, c) {
   const results = [];
   for (const zoom of c.zooms) {
     const context = await browser.newContext();
-    // Hide navigator.gpu before any page script runs so wgpu selects WebGL2.
-    await context.addInitScript(() => {
-      try { Object.defineProperty(navigator, 'gpu', { get: () => undefined, configurable: true }); } catch (e) {}
-    });
+    // WebGL modes: hide navigator.gpu before any page script runs so wgpu
+    // selects WebGL2 (the historical baseline). WebGPU modes leave it alone.
+    if (!(process.env.GPU || 'webgl-metal').startsWith('webgpu')) {
+      await context.addInitScript(() => {
+        try { Object.defineProperty(navigator, 'gpu', { get: () => undefined, configurable: true }); } catch (e) {}
+      });
+    }
     const page = await context.newPage();
     const errors = [];
     let crashed = false;
@@ -122,16 +126,20 @@ async function runCase(browser, c) {
 }
 
 (async () => {
-  // Force wgpu's WebGL2 backend (ANGLE-Metal): this Chromium's WebGPU rejects
-  // wgpu 22's requestDevice limits, and eframe doesn't fall back. WebGL2 is the
-  // workspace's Safari fallback path anyway. CPU/memory/TTFF are backend-neutral;
-  // fps over WebGL2/ANGLE is a floor, not the WebGPU number (native has that).
+  // GPU mode (scripts/launch.mjs): default here is WebGL2 on ANGLE-Metal, the
+  // historical baseline (wgpu 22's device limits made this Chromium reject
+  // WebGPU). Since wgpu 30, GPU=webgpu measures real WebGPU on Metal; the app
+  // reports what it got in metrics.backend.
+  const mode = process.env.GPU || 'webgl-metal';
+  process.stderr.write(`GPU mode: ${mode}\n`);
   const browser = await chromium.launch({
     headless: true,
-    args: ['--use-angle=metal', '--ignore-gpu-blocklist', '--js-flags=--max-old-space-size=8192'],
+    args: [...launchArgs(mode), '--js-flags=--max-old-space-size=8192'],
   });
   const all = [];
-  for (const c of CASES) {
+  // CASE=<name>[,<name>…] runs a subset (e.g. CASE=caravel for repeat runs).
+  const only = process.env.CASE ? process.env.CASE.split(',') : null;
+  for (const c of CASES.filter((c) => !only || only.includes(c.name))) {
     process.stderr.write(`\n### ${c.name} (${c.file || 'embedded'})\n`);
     const r = await runCase(browser, c);
     for (const res of r.results) {
@@ -139,7 +147,7 @@ async function runCase(browser, c) {
       if (res.ok) {
         process.stderr.write(
           `  ${res.zoom.padEnd(5)} ok  ttff=${m.ttff_ms.toFixed(0)}ms parse=${m.parse_ms.toFixed(0)} ` +
-          `tess=${m.tess_ms.toFixed(0)} heap=${(m.wasm_heap_bytes/1048576).toFixed(0)}MB fps=${res.fps}\n`
+          `tess=${m.tess_ms.toFixed(0)} heap=${(m.wasm_heap_bytes/1048576).toFixed(0)}MB fps=${res.fps} backend=${m.backend}\n`
         );
       } else {
         process.stderr.write(`  ${res.zoom.padEnd(5)} FAIL (${res.crashed ? 'crash' : 'timeout'}) ${res.errors.slice(0,1).join(' | ')}\n`);

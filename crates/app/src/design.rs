@@ -45,6 +45,9 @@ pub struct Metrics {
     pub parse_heap_bytes: usize,
     /// True when the design was parsed in a Web Worker off the main thread.
     pub worker_used: bool,
+    /// The GPU backend actually in use (e.g. `BrowserWebGpu`, `Gl`, `Metal`) —
+    /// every browser number before the wgpu 30 upgrade was `Gl` (WebGL2).
+    pub backend: String,
     /// Main-thread wall time to rebuild the CellDb from the worker's buffers
     /// (worker path only) — the one load-time frame the main thread still spends.
     /// Phase 5c: this now covers the column copies too (they happen inside the
@@ -333,7 +336,7 @@ impl Metrics {
              \"cell_defs\":{},\"distinct_polys\":{},\"flattened\":{},\"triangles\":{},\
              \"vertex_bytes\":{},\"index_bytes\":{},\"wasm_heap_bytes\":{},\
              \"parse_heap_bytes\":{},\"worker_used\":{},\"reconstruct_ms\":{:.1},\
-             \"reconstruct_frames\":{},\"geometry_ms\":{:.1}}}",
+             \"reconstruct_frames\":{},\"geometry_ms\":{:.1},\"backend\":\"{}\"}}",
             self.name.replace('"', "'"),
             self.file_bytes,
             self.parse_ms,
@@ -354,6 +357,7 @@ impl Metrics {
             self.reconstruct_ms,
             self.reconstruct_frames,
             self.geometry_ms,
+            self.backend,
         )
     }
 

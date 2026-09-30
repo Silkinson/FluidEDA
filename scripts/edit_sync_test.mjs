@@ -13,7 +13,7 @@
 //   trunk serve --release &               # app on :8080, proxies /ws
 //
 // Run: node scripts/edit_sync_test.mjs
-import { chromium } from 'playwright';
+import { launch } from './launch.mjs';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8080';
 const URL = `${BASE}/?file=/assets/edit_fixture.gds`; // TOP has direct editable shapes
@@ -40,7 +40,7 @@ async function waitFor(page, pred, what, timeout = 15000) {
 }
 
 async function main() {
-  const browser = await chromium.launch();
+  const browser = await launch();
   const ctxA = await browser.newContext();
   const ctxB = await browser.newContext();
   const A = await ctxA.newPage();
