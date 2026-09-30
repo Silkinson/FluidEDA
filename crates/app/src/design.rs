@@ -27,6 +27,23 @@ pub struct Design {
     pub source: DesignSource,
     /// Worker loads: where the design's hash will land (it follows the parse).
     pub pending_hash: Option<HashSlot>,
+    /// A streamed design (Phase 6 SLICE 3): its cells hold no geometry; each
+    /// chunk's is fetched from the server when it is on screen.
+    pub stream: Option<StreamInfo>,
+}
+
+/// Where a streamed design's geometry lives (Phase 6 SLICE 3): chunk `k`'s
+/// record is bytes `offsets[k]..offsets[k+1]` of the blob at `geometry_url`
+/// (`k` numbered by `fluideda_core::pack::chunk_base`).
+#[derive(Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the stats are published on the web
+pub struct StreamInfo {
+    pub geometry_url: String,
+    pub offsets: Vec<u64>,
+    pub geometry_bytes: u64,
+    pub skeleton_bytes: u64,
+    /// Manifest + skeleton + index fetch, wall ms.
+    pub fetch_ms: f64,
 }
 
 /// Where a design's bytes came from — what the app reads again when a room
@@ -119,6 +136,8 @@ pub struct WorkerMsg {
     /// Where the file's SHA-256 lands once the worker has computed it.
     pub hash: HashSlot,
     pub source: DesignSource,
+    /// Streaming: the skeleton came from a pack; geometry stays on the server.
+    pub stream: Option<StreamInfo>,
 }
 
 /// Main-thread bytes copied (columns) or parsed (metadata) per step call
@@ -195,7 +214,9 @@ impl Reconstruction {
                         unreachable!()
                     };
                     let (db, load) = p.finish()?;
-                    self.phase = Phase::Loading(load);
+                    // A streamed design loads no geometry: it is done once installed.
+                    let streamed = self.summary.as_ref().is_some_and(|m| m.stream.is_some());
+                    self.phase = Phase::Loading(if streamed { fluideda_core::ProgressiveLoad::empty() } else { load });
                     ReconStep::SkeletonReady(self.design(db))
                 } else {
                     ReconStep::Progress
@@ -237,6 +258,7 @@ impl Reconstruction {
             metrics,
             source: m.source,
             pending_hash: Some(m.hash),
+            stream: m.stream,
         }
     }
 
@@ -269,7 +291,8 @@ impl Reconstruction {
 
 /// Placeholder left in a consumed `WorkerMsg` (its columns moved out).
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
-struct NoColumns;
+/// A column source with nothing in it (a streamed design keeps no columns).
+pub struct NoColumns;
 impl ColumnSource for NoColumns {
     fn coords_into(&mut self, _: usize, _: usize, _: &mut Vec<i32>) -> anyhow::Result<()> {
         anyhow::bail!("columns already taken")
@@ -321,6 +344,7 @@ pub fn load_design(name: &str, bytes: &[u8]) -> anyhow::Result<Design> {
         metrics,
         source: DesignSource::Unknown,
         pending_hash: None,
+        stream: None,
     })
 }
 

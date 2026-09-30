@@ -16,7 +16,8 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 
 ## Where we are
 
-**Phase 6 in progress: formats, backend, out-of-core** on `phase6-backend-oasis`.
+**Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
+(findings: `docs/phase6-findings.md`).
 
 * **SLICE 1 — OASIS in and out, and paths.** A streaming OASIS (SEMI P39)
   reader (`crates/core/oasis.rs`: every element kind incl. all 26 CTRAPEZOID
@@ -52,6 +53,20 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
     parse reply; hashing first cost +129 ms first frame). A reconnect after a
     server restart takes ~0.5 s. Rooms cost ~33 B/edit (100 k edits = 3.4 MB,
     restore 23 ms).
+* **SLICE 3 — out of core.**
+  - The server parses a stored design once into a **pack**: the skeleton, one
+    self-contained record per chunk, and a byte-offset index — all immutable,
+    CDN-cacheable blobs.
+  - `?stream=<sha256>` installs the skeleton, then the tessellation worker
+    fetches each on-screen chunk as a byte range. A chunk is fetched only
+    once each of its shapes gets a pixel (resident geometry ≤ ~1 shape per
+    screen pixel). The least recently drawn chunks are evicted over a GPU
+    budget.
+  - A **2 GB, 32 M-polygon design that cannot load in-core** (the parse
+    worker panics) opens streamed: first frame 45 ms, 8 MB main heap.
+  - caravel streamed: first frame 79 ms (in-core 873 ms), pixel-identical to
+    in-core wherever chunks are fetched.
+  - Streamed designs are view-only.
 
 **Phase 5d shipped: the editing follow-ons** on `phase5d-editing` — every
 deferred editing item named in code since Phase 3.
@@ -188,7 +203,7 @@ still byte-identical).
 | 5b — DRC hardening | `phase5b-drc-hardening` | ✅ done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine). SLICE 3: worker pool — check-visible 10.6 s → **1.7 s** (8 workers), identical results |
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
-| 6 — backend/OASIS | `phase6-backend-oasis` | ◑ SLICES 1–2 done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). Next: out-of-core chunk streaming |
+| 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -212,6 +227,8 @@ still byte-identical).
 | DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 | room link → design + edits (late joiner) | **1.41 s** | Phase 6 SLICE 2: `?room=` only — room lookup, caravel (291 MB) from the blob store, the room state from the server (first frame 998 ms; WebGPU, headless) |
+| largest design that opens | **2 GB / 32 M polygons, streamed** (in-core: fails) | Phase 6 SLICE 3: streamed, browser memory scales with the screen + hierarchy, not geometry — flat_32M main heap 8 MB, flat_11M 6 MB (in-core 534 MB + 2.2 GB worker peak) |
+| first frame, streamed | caravel **79 ms** / flat_32M 45 ms | skeleton + chunk index from the server's pack, then on-screen chunks by byte range (in-core caravel: 873 ms) |
 | reconnect after a server restart | ~0.5 s | first retry at 0.5 s (backoff doubles to 8 s); the room comes back from its WAL or snapshot and offline edits merge |
 
 ## Decisions locked (do not relitigate without a measurement)
@@ -320,6 +337,12 @@ still byte-identical).
 - **Hit-test builds only the clicked cell's index** (chunk-bbox prefilter first),
   not a background build of all 1014. TOP first-click = 50 µs on caravel. (phase3)
 
+- **Out-of-core = packs + a density rule.** A design streams as a skeleton
+  plus per-chunk records fetched by byte range (immutable blobs); a chunk is
+  fetched only when each shape gets ≥ 1 px, so resident geometry is bounded
+  by the screen; on-screen chunks are never evicted. Records are exactly
+  `chunk_columns`, so streamed and in-core render identically (0 px measured).
+  (phase6-findings, SLICE 3)
 - **The server holds each room's document; the wire stays opaque-compatible.**
   Updates are applied + WAL-logged before relay; a joiner gets the whole state
   first; persistence is snapshot blobs + WAL (updates are idempotent, so every
@@ -384,9 +407,16 @@ still byte-identical).
   `?tessinline=1` — a 17–21× shorter longest frame, no frame > 100 ms; leaf
   unchanged (stays inline); edit re-tess < 2 ms. Measured by
   `scripts/fit_freeze_bench.mjs`.
-- **Scale ceiling:** caravel is hobby-class (half the ~10 M-poly ceiling).
-  Production SoCs need out-of-core / server-side tiling — a different memory story
-  to decide before committing to that market.
+- ~~Scale ceiling~~ **RESOLVED for viewing** (`phase6-backend-oasis` SLICE 3):
+  out-of-core streaming from server-built packs — browser memory follows the
+  screen and the hierarchy, not the geometry (a 2 GB / 32 M-polygon design that
+  fails in-core opens with an 8 MB main heap). What remains is measured:
+  - the **skeleton is the new floor**: caravel's 460 k placements are 180 MB
+    of streamed heap, so a production SoC needs the hierarchy streamed too;
+  - streamed designs are **view-only** (no pick/edit/DRC/export/rooms);
+    editing out of core needs chunk-level residency in the `ShapeStore`;
+  - dense chunks draw as neutral proxies (a per-chunk layer summary could
+    color them).
 - ~~Phase 3: editing is TOP-cell-only~~ **RESOLVED** (`phase3-real-editing` SLICE 2):
   hit-test walks the instance tree under the transform stack (chunk-scan, no R-tree
   build — landmine *eliminated*, caravel first-click ~2.7 ms). Editing a shape edits
@@ -470,9 +500,15 @@ shape drawn past a cell's original extent grows that cell's cull/pick bbox but
 not its ancestors' precomputed ones; picking a flattened placement's copy
 needs a fresh click after the flatten (the app re-picks at the same point).
 
-Phase 6 is under way (`phase6-backend-oasis`): OASIS in/out and GDS paths
-(SLICE 1), server-kept rooms on a content-addressed store (SLICE 2). Next,
-SLICE 3 — **out-of-core**: the server parses a stored design once and serves
-its skeleton and per-chunk geometry as immutable, CDN-cacheable blobs; the
-client streams only the chunks on screen (`ProgressiveLoad` over a remote
-`ColumnSource`, LRU residency), so a design larger than browser memory opens.
+**Phase 6 shipped** (`phase6-backend-oasis`):
+- SLICE 1: OASIS in/out and GDS paths.
+- SLICE 2: server-kept rooms on a content-addressed store.
+- SLICE 3: out-of-core streaming.
+
+Its measurements name the next steps:
+- **Stream the hierarchy itself.** The skeleton is the new memory floor.
+- **Edit out of core.** Chunk-level residency in the `ShapeStore`, picking
+  and the overlay.
+- **Coalesce chunk range requests** for real network latency.
+- **In-context DRC.** Still the DRC frontier from Phase 5b.
+- **The Dawn-vs-ANGLE fit-view gap.**

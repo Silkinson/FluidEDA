@@ -10,8 +10,11 @@
 //!   `Cache-Control: immutable`, `ETag` = the hash, single byte `Range`s.
 //! * `PUT /blobs/<sha256>` — upload; refused unless the body hashes to the name.
 //! * `GET /rooms/<name>` — the room's design binding and version history.
+//! * `GET /packs/<sha256>` — a stored design's streaming pack manifest, built
+//!   on first request ([`packs`]); its blobs are served from `/blobs/`.
 //! * `GET /health`.
 
+pub mod packs;
 pub mod room;
 pub mod store;
 
@@ -46,6 +49,7 @@ pub fn app(hub: Arc<Hub>) -> Router {
         .route("/ws", get(ws_handler))
         .route("/blobs/:hash", get(get_blob).put(put_blob))
         .route("/rooms/:room", get(room_info))
+        .route("/packs/:design", get(pack_manifest))
         .route("/health", get(|| async { "ok" }))
         .with_state(hub)
 }
@@ -362,6 +366,29 @@ async fn room_info(State(hub): State<Arc<Hub>>, Path(name): Path<String>) -> Res
     .unwrap_or_else(|e| Err(io::Error::other(e)));
     match info {
         Ok(info) => ([(header::CACHE_CONTROL, "no-cache")], Json(info)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// --- packs ------------------------------------------------------------------
+
+/// One pack build at a time (a build parses a whole design).
+static PACK_BUILDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+async fn pack_manifest(State(hub): State<Arc<Hub>>, Path(design): Path<String>) -> Response {
+    if !store::is_hash(&design) {
+        return bad_request("not a sha256 hex digest");
+    }
+    let store = hub.store.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        let _one = PACK_BUILDS.lock().unwrap_or_else(|e| e.into_inner());
+        packs::ensure(&store, &design)
+    })
+    .await
+    .unwrap_or_else(|e| Err(io::Error::other(e)));
+    match built {
+        Ok(Some(m)) => ([(header::CACHE_CONTROL, "no-cache")], Json(m)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such design blob").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

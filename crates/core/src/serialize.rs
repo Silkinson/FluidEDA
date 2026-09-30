@@ -60,6 +60,25 @@ pub fn serialize(db: &CellDb) -> DbColumns {
     let mut coords = Vec::new();
     let mut starts = Vec::new();
     let mut layers = Vec::new();
+    let meta = write_meta(db, |cell| {
+        let (c, s, l) = cell.shapes.columns();
+        coords.extend_from_slice(c);
+        starts.extend(s.iter().copied());
+        layers.extend(l.iter().map(|&lay| pack_layer(lay)));
+    });
+    DbColumns { coords, starts, layers, meta }
+}
+
+/// Just the metadata blob — the skeleton — without copying any geometry
+/// (Phase 6 SLICE 3: a design pack's skeleton; its geometry is laid out per
+/// chunk instead, see [`crate::pack`]).
+pub fn skeleton_meta(db: &CellDb) -> Vec<u8> {
+    write_meta(db, |_| {})
+}
+
+/// The metadata blob, calling `columns` on each cell in order (where
+/// [`serialize`] concatenates the geometry columns).
+fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell)) -> Vec<u8> {
     let mut meta = Writer::new();
 
     meta.u32(MAGIC);
@@ -68,13 +87,11 @@ pub fn serialize(db: &CellDb) -> DbColumns {
     meta.u32(db.cells.len() as u32);
 
     for cell in &db.cells {
-        let (c, s, l) = cell.shapes.columns();
+        let (c, _, l) = cell.shapes.columns();
         // Per-cell column lengths — the splitter needs these on the way back.
         meta.u32(c.len() as u32); // coord count (= 2 * point count)
         meta.u32(l.len() as u32); // shape count (starts has this + 1)
-        coords.extend_from_slice(c);
-        starts.extend(s.iter().copied());
-        layers.extend(l.iter().map(|&lay| pack_layer(lay)));
+        columns(cell);
 
         // Name.
         meta.u32(cell.name.len() as u32);
@@ -113,7 +130,7 @@ pub fn serialize(db: &CellDb) -> DbColumns {
         meta.bbox(bb);
     }
 
-    DbColumns { coords, starts, layers, meta: meta.into_vec() }
+    meta.into_vec()
 }
 
 /// Where the deserializer gets each cell's slice of the three columns. The

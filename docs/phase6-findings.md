@@ -1,8 +1,8 @@
 # Phase 6 — formats, backend, out-of-core: findings
 
-**Status: in progress on `phase6-backend-oasis`** — SLICE 1 (OASIS + paths)
-and SLICE 2 (persistent rooms + content-addressed store) shipped; SLICE 3
-(out-of-core chunk streaming) next.
+**Status: shipped (3 slices on `phase6-backend-oasis`)** — SLICE 1: OASIS +
+paths; SLICE 2: persistent rooms on a content-addressed store; SLICE 3:
+out-of-core streaming.
 
 **TL;DR**
 
@@ -16,6 +16,8 @@ and SLICE 2 (persistent rooms + content-addressed store) shipped; SLICE 3
 | edits made before joining (web) | lost — pushed while the socket was still connecting | merged when the socket opens |
 | getting the design to a collaborator | they need the file | `?room=R` fetches it by hash from an immutable blob store |
 | caravel room link → design + edits, late joiner | — | **1.41 s** (first frame 998 ms; WebGPU, headless) |
+| a 2 GB, 32 M-polygon design in the browser | fails (parse worker panics: wasm32 allocation limit) | **opens streamed**: first frame 45 ms, main heap 8 MB |
+| caravel, first frame | 873 ms (in-core) | **79 ms** streamed (pixel-identical wherever chunks are fetched) |
 
 ## Method
 
@@ -25,7 +27,8 @@ a real store directory; a server is "crashed" by dropping its runtime) and
 `cargo run --release -p fluideda-server --example room_scale`. Browser:
 `node scripts/edit_sync_test.mjs` (checks 21–22), `node scripts/persist_test.mjs`
 (runs its own server, SIGKILLs and restarts it), `node scripts/hash_bench.mjs`
-(`?nohash` A/B). Headless Chromium; GPU mode per `scripts/launch.mjs`. The
+(`?nohash` A/B), `GPU=webgpu node scripts/stream_test.mjs` (streamed vs
+in-core pixels; residency) and `GPU=webgpu node scripts/outofcore_bench.mjs`. Headless Chromium; GPU mode per `scripts/launch.mjs`. The
 machine carried ~1.7 cores of other apps' load throughout, so every A/B
 alternates its two variants in one session.
 
@@ -236,3 +239,104 @@ frame even when idle**, so an open, untouched tab keeps a core busy.
 - **A design is its exact file.** The same layout exported as OASIS is another
   room's design: its shape numbering can differ, so this is correct, not a
   shortcut.
+
+## SLICE 3 — out of core
+
+In-core loading moves a design's whole geometry into the browser before any
+of it is used, so the browser's memory caps the design size. On wasm32 that
+cap is hard: a 4 GB address space and 2 GB per allocation. Phase 2a measured
+it at ~11 M flat polygons; the streaming parser has since raised it (flat_11M
+now loads, with a 2.2 GB worker peak). A 2 GB, 32 M-polygon flat design still
+cannot load: the parse worker panics with `capacity overflow` after 5 s.
+
+### Design
+
+**Packs** (`crates/core/src/pack.rs`). A parsed design becomes three blobs in
+the SLICE 2 store:
+
+- the **skeleton** — the existing metadata blob: hierarchy, chunk tables and
+  bboxes, no geometry;
+- the **geometry** — one self-contained record per chunk:
+  `[n][nc][starts][layers][coords]`, 4-byte aligned, so a fetched range is used
+  in place through typed-array views;
+- an **index** of byte offsets.
+
+A record holds exactly the columns `ShapeStore::chunk_columns` gives in-core,
+so a streamed chunk tessellates identically (tested per chunk on hier, the
+fixture and the sky130 library).
+
+**The server builds them** (`server/src/packs.rs`). `GET /packs/<design>`
+parses the stored design natively on first request (no wasm ceiling), writes
+the three blobs — geometry streamed through a hashing writer, never whole in
+memory — and caches a manifest. Everything a client then fetches is an
+immutable blob, so a CDN can cache it, byte ranges included.
+
+**The client streams** (`?stream=<sha256>`):
+
+- It fetches the manifest, skeleton and index, and installs the skeleton
+  through the Phase 5c path unchanged. The first frame shows every chunk as a
+  proxy.
+- Each frame, for each chunk on screen it asks the tessellation worker to
+  fetch that chunk's byte range and tessellate it. The geometry never touches
+  the main thread.
+- **Density rule:** a chunk is fetched only once its screen footprint gives
+  each of its shapes at least one pixel. Denser chunks stay proxies. So
+  resident geometry is bounded by the *screen* — about one shape per pixel —
+  whatever the design's size.
+- **Residency:** over a GPU budget (384 MB; `?stream_budget=`), the least
+  recently drawn chunks are dropped. What is on screen is never dropped. A
+  revisited view is fetched again, usually from the HTTP cache (immutable).
+- Failed fetches are reported back and retried after 2 s.
+- A streamed design is **view-only**. Picking, editing, DRC, export and rooms
+  are all off: they need base geometry, which the cells do not hold.
+
+### Measurements (`outofcore_bench.mjs`, WebGPU, headless; blobs served by the local server)
+
+| design | GDS | in-core: first frame · all geometry · worker parse peak · main heap | streamed: first frame · fetched at fit · at leaf · main heap |
+|---|--:|---|---|
+| caravel (3.9 M polygons, 460 k placements) | 291 MB | 873 ms · 994 ms · 1,081 MB · 313 MB | **79 ms** · 2 MB (31 chunks; 235 dense) · +0 · 180 MB |
+| flat_11M | 671 MB | 2,342 ms · 2,452 ms · 2,220 MB · 534 MB | **51 ms** · 0 (729 dense) · +1 MB · **6 MB** |
+| flat_32M | 2,048 MB | **fails** (worker panic after 5 s) | **45 ms** · 0 (1,024 dense) · +6 MB · **8 MB** |
+
+Pack builds (server, native, once per design): caravel 1.19 s (parse 366 ms)
+→ skeleton 24.6 MB, geometry 189 MB, 1,135 chunks; flat_11M 2.79 s, 729
+chunks; flat_32M 9.2 s (parse 3.3 s) → geometry 1.54 GB, 1,024 chunks, server
+peak RSS 5.4 GB. Uploading flat_32M: 7.7 s (`curl -T`; `--data-binary`
+buffers the file and gives up at 2 GB).
+
+**Correctness** (`stream_test.mjs`). caravel streamed vs in-core at the four
+busiest 30 µm windows of a scan (pad-ring IO cells, 364–766 placements each):
+**0 pixels differ** of 688,000, every time. The die's middle is caravel's
+empty user-project area; the first test views landed there and proved
+nothing, hence the scan. At fit, the dense chunks draw as neutral proxies:
+the overall picture matches in-core, but the pad ring's fine structure shows
+as boxes.
+
+**Residency.** Panning 25 views around caravel's pad ring under a 16 MB
+budget: 1,260 chunks fetched, 948 evicted. At no step did the GPU exceed the
+budget while holding an off-screen chunk. The peak, 45.9 MB, is one 120 µm
+view's own geometry. A view revisited after eviction was fetched again and
+matched pixel for pixel.
+
+**Latency.** First visits to busy views fill in within 53–186 ms streamed
+(in-core: 7–379 ms; its first view tessellates inline). The longest
+main-thread frame across the run was 9.8 ms streamed vs 15.9 ms in-core. One
+tessellation worker keeps up. A pool (the DRC pool's pattern) is the lever if
+views get busier.
+
+### What this settles, and what it names next
+
+- **The size ceiling is gone for viewing.** Browser memory now scales with
+  the screen and the hierarchy, not the geometry. flat_32M runs in an 8 MB
+  main heap, and nothing fetched at fit depends on design size.
+- **The skeleton is the new floor.** caravel's 460 k placements are a 25 MB
+  blob and dominate its 180 MB streamed heap high-water. A production SoC with
+  tens of millions of placements needs the hierarchy streamed too: per-cell
+  instance lists fetched as the cull descends.
+- **Proxies could carry color.** A per-chunk layer summary in the index would
+  let a dense chunk draw in its dominant layer's color rather than neutral.
+- **Editing out of core** needs chunk-level residency in the `ShapeStore` (and
+  in picking and the overlay) — the step after view-only.
+- **One request per chunk** is fine on localhost. Over a real network,
+  coalescing adjacent chunks' ranges (and HTTP/2 multiplexing through a CDN)
+  is the obvious next step.

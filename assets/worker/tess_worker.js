@@ -13,21 +13,59 @@
 //          index_counts, verts, indices }                            (buffers transferred back)
 // `cell`/`chunk`/`gen` are echoed so the main thread can key the reply and drop
 // stale ones (old design or old chunk partition).
+//
+// Phase 6 SLICE 3 — streaming: the chunk's geometry is not on the main thread
+// at all. The worker fetches the chunk's record, one byte range of the design
+// pack's immutable geometry blob, and tessellates that:
+//   in : { type:'tess_fetch', cell, chunk, gen, url, start, end }
+//   out: tess_done (as above) + fetch_bytes, fetch_ms
+// Record layout (crates/core/src/pack.rs), little-endian, 4-byte aligned:
+//   [n u32][nc u32][starts (n+1) u32][layers n u32][coords nc i32]
 
 importScripts('worker.js');
 
 // Kick off wasm instantiation immediately; jobs await it (early jobs just queue).
 const ready = wasm_bindgen('worker_bg.wasm');
 
+// A chunk record → the three columns, as views into the fetched buffer.
+function recordColumns(buf) {
+  const head = new Uint32Array(buf, 0, 2);
+  const n = head[0], nc = head[1];
+  if (buf.byteLength !== 4 * (2 + (n + 1) + n + nc)) {
+    throw new Error(`chunk record: ${buf.byteLength} bytes, header says ${4 * (3 + 2 * n + nc)}`);
+  }
+  return {
+    starts: new Uint32Array(buf, 8, n + 1),
+    layers: new Uint32Array(buf, 8 + 4 * (n + 1), n),
+    coords: new Int32Array(buf, 8 + 4 * (2 * n + 1), nc),
+  };
+}
+
+async function fetchRecord(msg) {
+  const t0 = performance.now();
+  const r = await fetch(msg.url, { headers: { Range: `bytes=${msg.start}-${msg.end - 1}` } });
+  if (r.status !== 206 && r.status !== 200) throw new Error(`fetch ${msg.url}: HTTP ${r.status}`);
+  let buf = await r.arrayBuffer();
+  // A server that ignores Range sends the whole blob: cut the record out.
+  if (r.status === 200) buf = buf.slice(msg.start, msg.end);
+  return { buf, fetch_ms: performance.now() - t0 };
+}
+
 self.onmessage = async (e) => {
   const msg = e.data || {};
-  if (msg.type !== 'tess') return;
+  if (msg.type !== 'tess' && msg.type !== 'tess_fetch') return;
   try {
+    let coords, starts, layers, fetched = null;
+    if (msg.type === 'tess_fetch') {
+      fetched = await fetchRecord(msg);
+      ({ coords, starts, layers } = recordColumns(fetched.buf));
+    } else {
+      // coords/starts/layers are transferred ArrayBuffers (moved from main).
+      coords = new Int32Array(msg.coords);
+      starts = new Uint32Array(msg.starts);
+      layers = new Uint32Array(msg.layers);
+    }
     await ready;
-    // coords/starts/layers are transferred ArrayBuffers (moved from main).
-    const coords = new Int32Array(msg.coords);
-    const starts = new Uint32Array(msg.starts);
-    const layers = new Uint32Array(msg.layers);
     const r = wasm_bindgen.tessellate(coords, starts, layers); // the heavy work, off-main
 
     const mesh_layers = r.mesh_layers;
@@ -46,6 +84,8 @@ self.onmessage = async (e) => {
         index_counts: index_counts.buffer,
         verts: verts.buffer,
         indices: indices.buffer,
+        fetch_bytes: fetched ? fetched.buf.byteLength : 0,
+        fetch_ms: fetched ? fetched.fetch_ms : 0,
       },
       [mesh_layers.buffer, vert_counts.buffer, index_counts.buffer, verts.buffer, indices.buffer]
     );

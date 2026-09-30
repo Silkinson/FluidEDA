@@ -16,7 +16,7 @@ use fluideda_render::Camera;
 use fluideda_sync::{color_from_id, BatchOp, EditKind, Marker, Presence, Session};
 use glam::Vec2;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -35,6 +35,20 @@ const REJOIN_MAX_S: f64 = 8.0;
 /// A cell projecting smaller than this many pixels becomes an LOD proxy.
 const MIN_PIXEL: f64 = 4.0;
 
+/// Streaming (Phase 6 SLICE 3): a chunk's geometry is fetched only once its
+/// screen footprint gives each of its shapes at least this many pixels;
+/// denser chunks draw as proxies. Resident geometry is then bounded by the
+/// screen — about one shape per pixel — whatever the design's size.
+const STREAM_PX_PER_SHAPE: f64 = 1.0;
+/// Streaming: chunk fetches in flight at once.
+const STREAM_MAX_IN_FLIGHT: usize = 32;
+/// Streaming: GPU geometry kept before the least recently drawn chunks are
+/// evicted (they are fetched again — from the HTTP cache — when needed).
+/// `?stream_budget=<MB>` overrides it.
+const STREAM_BUDGET_BYTES: usize = 384 << 20;
+/// Streaming: seconds before a failed chunk fetch is retried.
+const STREAM_RETRY_S: f64 = 2.0;
+
 /// Drawing grid (Phase 5 SLICE 1): every authored coordinate snaps to this many
 /// nm. Small enough to be invisible at any sane zoom, big enough that a drawn
 /// vertex is reproducible across peers and sessions. Coordinates stay i32 nm.
@@ -43,6 +57,61 @@ const SNAP_NM: i32 = 5;
 /// Snap a world coordinate (nm, f32 out of the camera) onto the drawing grid.
 fn snap_nm(v: f32) -> i32 {
     ((v / SNAP_NM as f32).round() as i64 * SNAP_NM as i64) as i32
+}
+
+/// A streamed design's geometry residency (Phase 6 SLICE 3). The cells hold
+/// no shapes: a chunk on screen and not too dense for its size is fetched
+/// (by the tessellation worker, as a byte range of the pack's geometry blob),
+/// tessellated and uploaded; over [`STREAM_BUDGET_BYTES`] the least recently
+/// drawn chunks are dropped again.
+struct Stream {
+    info: design::StreamInfo,
+    /// First pack chunk number of each cell (`fluideda_core::pack::chunk_base`).
+    base: Vec<u32>,
+    frame: u64,
+    /// Frame each resident chunk was last drawn in.
+    last_drawn: HashMap<(CellId, u32), u64>,
+    /// Chunks whose fetch failed, and when to try again (app time, s).
+    retry_at: HashMap<(CellId, u32), f64>,
+    fetched: usize,
+    fetched_bytes: usize,
+    fetch_ms: f64,
+    evicted: usize,
+    failures: usize,
+    /// Chunks on screen this frame left as proxies for density.
+    dense: usize,
+    /// Resident chunks not drawn this frame (what eviction may drop).
+    stale: usize,
+    /// GPU bytes kept before evicting.
+    budget: usize,
+}
+
+impl Stream {
+    fn new(info: design::StreamInfo, db: &CellDb) -> Self {
+        Stream {
+            base: fluideda_core::pack::chunk_base(db),
+            info,
+            frame: 0,
+            last_drawn: HashMap::new(),
+            retry_at: HashMap::new(),
+            fetched: 0,
+            fetched_bytes: 0,
+            fetch_ms: 0.0,
+            evicted: 0,
+            failures: 0,
+            dense: 0,
+            stale: 0,
+            budget: webio::query_param("stream_budget")
+                .and_then(|mb| mb.parse::<usize>().ok())
+                .map_or(STREAM_BUDGET_BYTES, |mb| mb << 20),
+        }
+    }
+
+    /// Chunk `(cell, chunk)`'s byte range in the geometry blob.
+    fn range(&self, cell: CellId, chunk: u32) -> (u64, u64) {
+        let k = (self.base[cell] + chunk) as usize;
+        (self.info.offsets[k], self.info.offsets[k + 1])
+    }
 }
 
 /// What a left-click selects / a drag edits (Phase 5: base shapes and drawn
@@ -150,6 +219,8 @@ pub struct FluidApp {
     load_in_flight: bool,
     /// The installed design's hash, still being computed by its worker.
     pending_hash: Option<design::HashSlot>,
+    /// The installed design is streamed (Phase 6 SLICE 3): its residency.
+    stream: Option<Stream>,
     /// A worker-parsed design arriving progressively (Phase 5c): first its
     /// skeleton is parsed (the old design keeps rendering), then installed
     /// (it renders as proxies), then its geometry fills in, visible cells
@@ -369,6 +440,14 @@ impl FluidApp {
                 webio::spawn_fetch(url, load_slot.clone());
             }
         }
+        // ?stream=<sha256> (Phase 6 SLICE 3): open a stored design out of core —
+        // the server's pack of it, geometry fetched per chunk as it comes on screen.
+        let stream_hash = webio::query_param("stream").filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        if let Some(h) = stream_hash.clone() {
+            log::info!("streaming design {h}");
+            let name = webio::query_param("name").unwrap_or_else(|| format!("{}… (streamed)", &h[..12]));
+            webio::fetch_pack(h, name, design_slot.clone());
+        }
         // ?room=<name> (Phase 6): join it once the design is in. Without a
         // ?file=, the design is the room's own — look it up first.
         let room_query = webio::query_room().filter(|r| valid_room(r));
@@ -396,8 +475,9 @@ impl FluidApp {
             source_slot: Rc::new(RefCell::new(None)),
             design_slot,
             design_source: design::DesignSource::Embedded,
-            load_in_flight: file.is_some(),
+            load_in_flight: file.is_some() || stream_hash.is_some(),
             pending_hash: None,
+            stream: None,
             loading: None,
             load_instant: web_time::Instant::now(),
             awaiting_first_frame: true, // measure TTFF for the default too
@@ -539,6 +619,13 @@ impl FluidApp {
         // pending `?room=` join still happens once this design is in.
         self.design_source = design.source.clone();
         self.pending_hash = design.pending_hash;
+        self.stream = design.stream.map(|info| Stream::new(info, &self.db));
+        if self.stream.is_some() {
+            // View-only: nothing geometry-backed (picking, edits, DRC, export)
+            // can work on cells that hold no shapes.
+            self.edit_mode = false;
+            self.drc_enabled = false;
+        }
         self.joined_url = None;
         self.auto_rejoin = false;
         self.upload_checked = false;
@@ -1280,7 +1367,7 @@ impl FluidApp {
     /// way the main thread only gathers (~0.1 ms/tile) and never blocks past
     /// about one job of `DRC_BUDGET_MS`.
     fn run_drc_budget(&mut self) {
-        if !self.drc_enabled || self.geometry_pending() {
+        if !self.drc_enabled || self.geometry_pending() || self.stream.is_some() {
             return; // (a progressive load's cells have no geometry to check yet)
         }
         // 1. Replies from the pool. A reply from before a clear (new design,
@@ -1397,13 +1484,35 @@ impl FluidApp {
         for reply in &ready {
             let key = (reply.cell, reply.chunk);
             self.tess_pending.remove(&key);
+            if reply.failed {
+                // Leave it a proxy; a streamed chunk is fetched again later.
+                if let Some(st) = &mut self.stream {
+                    st.failures += 1;
+                    st.retry_at.insert(key, self.last_frame + STREAM_RETRY_S);
+                }
+                continue;
+            }
             renderer.upload_chunk(&device, key, &reply.meshes);
             self.uploaded.insert(key);
             self.tess_worker_chunks += 1;
+            if let Some(st) = &mut self.stream {
+                st.fetched += 1;
+                st.fetched_bytes += reply.fetch_bytes;
+                st.fetch_ms += reply.fetch_ms;
+                st.last_drawn.insert(key, st.frame);
+                st.retry_at.remove(&key);
+            }
         }
 
         let empty = std::collections::HashSet::new();
         let visible = self.visible.clone();
+
+        if self.stream.is_some() {
+            self.stream_chunks(renderer, &visible);
+            self.gpu_bytes = renderer.uploaded_bytes();
+            self.draw_calls = renderer.draw_calls();
+            return;
+        }
 
         // Decide per frame whether to offload. Only when MANY big chunks are
         // unresolved at once — the fit-view freeze, where the whole die's geometry
@@ -1488,6 +1597,70 @@ impl FluidApp {
         }
         self.gpu_bytes = renderer.uploaded_bytes();
         self.draw_calls = renderer.draw_calls();
+    }
+
+    /// Streaming residency, once per frame (Phase 6 SLICE 3): fetch the chunks
+    /// on screen that are not too dense for their size, and evict the least
+    /// recently drawn ones once the GPU budget is exceeded.
+    fn stream_chunks(&mut self, renderer: &mut fluideda_render::HierRenderer, visible: &VisibleSet) {
+        let Some(st) = self.stream.as_mut() else { return };
+        st.frame += 1;
+        st.dense = 0;
+        let scale = self.camera.scale as f64; // px per nm
+        let now = self.last_frame;
+        let mut dispatched = 0usize;
+        for d in &visible.draws {
+            let key = (d.cell, d.chunk);
+            if self.uploaded.contains(&key) {
+                st.last_drawn.insert(key, st.frame);
+                continue;
+            }
+            if self.tess_pending.contains(&key) || st.retry_at.get(&key).is_some_and(|&t| now < t) {
+                continue;
+            }
+            // Density: fetch only once every shape gets a pixel or more.
+            let chunk = &self.db.cells[d.cell].chunks[d.chunk as usize];
+            let (w, h) = chunk.bbox.size();
+            let px = (w * scale).max(1.0) * (h * scale).max(1.0);
+            if px < chunk.len() as f64 * STREAM_PX_PER_SHAPE {
+                st.dense += 1;
+                continue;
+            }
+            if self.tess_pending.len() >= STREAM_MAX_IN_FLIGHT || dispatched >= TESS_JOBS_PER_FRAME {
+                continue; // stays a proxy this frame
+            }
+            if self.tess.is_none() {
+                match webio::TessWorker::new(self.tess_results.clone()) {
+                    Ok(w) => self.tess = Some(w),
+                    Err(e) => {
+                        log::error!("tess worker unavailable: {e}");
+                        return;
+                    }
+                }
+            }
+            let (start, end) = st.range(d.cell, d.chunk);
+            if let Some(w) = &self.tess {
+                w.post_fetch(d.cell, d.chunk, self.tess_gen, &st.info.geometry_url, start, end);
+                self.tess_pending.insert(key);
+                dispatched += 1;
+            }
+        }
+        // Over budget: drop the least recently drawn chunks (never this frame's).
+        if renderer.uploaded_bytes() > st.budget {
+            let mut old: Vec<(u64, (CellId, u32))> =
+                st.last_drawn.iter().filter(|(_, &f)| f < st.frame).map(|(&k, &f)| (f, k)).collect();
+            old.sort_unstable();
+            for (_, key) in old {
+                if renderer.uploaded_bytes() <= st.budget * 9 / 10 {
+                    break;
+                }
+                renderer.drop_chunk(key);
+                self.uploaded.remove(&key);
+                st.last_drawn.remove(&key);
+                st.evicted += 1;
+            }
+        }
+        st.stale = st.last_drawn.values().filter(|&&f| f < st.frame).count();
     }
 
     /// Consume any pending drag-drop / fetched / picked file.
@@ -1671,7 +1844,11 @@ impl FluidApp {
              \"drc_warm_ms\":{:.2},\"drc_warm_tiles\":{},\"drc_tiles\":{},\"drc_tile_max_ms\":{:.2},\
              \"drc_violations\":{},\"drc_busy\":{},\"drc_pending\":{},\"drc_total\":{},\
              \"drc_last_pass_ms\":{:.1},\"drc_last_pass_tiles\":{},\"drc_deck\":\"{:?}\",\
-             \"drc_workers\":{},\"drc_errors\":{},\"draw_calls\":{}}}",
+             \"drc_workers\":{},\"drc_errors\":{},\"draw_calls\":{},\
+             \"gpu_bytes\":{},\"streaming\":{},\"stream_fetched\":{},\"stream_fetched_bytes\":{},\
+             \"stream_fetch_ms\":{:.1},\"stream_evicted\":{},\"stream_failures\":{},\"stream_dense\":{},\
+             \"stream_skeleton_bytes\":{},\"stream_geometry_bytes\":{},\"stream_pack_ms\":{:.1},\"wasm_heap\":{},\
+             \"stream_stale\":{},\"instances\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -1699,6 +1876,20 @@ impl FluidApp {
             self.drc_pool.as_ref().map_or(0, |p| p.size()),
             self.drc_tile_errors,
             self.draw_calls,
+            self.gpu_bytes,
+            self.stream.is_some(),
+            self.stream.as_ref().map_or(0, |s| s.fetched),
+            self.stream.as_ref().map_or(0, |s| s.fetched_bytes),
+            self.stream.as_ref().map_or(0.0, |s| s.fetch_ms),
+            self.stream.as_ref().map_or(0, |s| s.evicted),
+            self.stream.as_ref().map_or(0, |s| s.failures),
+            self.stream.as_ref().map_or(0, |s| s.dense),
+            self.stream.as_ref().map_or(0, |s| s.info.skeleton_bytes),
+            self.stream.as_ref().map_or(0, |s| s.info.geometry_bytes),
+            self.stream.as_ref().map_or(0.0, |s| s.info.fetch_ms),
+            design::wasm_heap_bytes(),
+            self.stream.as_ref().map_or(0, |s| s.stale),
+            self.cull_stats.instances_emitted,
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -1763,7 +1954,7 @@ impl FluidApp {
             if self.auto_rejoin {
                 ui.small(format!("reconnecting… (attempt {})", self.reconnects));
             }
-            if ui.button("Join room").clicked() {
+            if ui.add_enabled(self.stream.is_none(), egui::Button::new("Join room")).clicked() {
                 self.request_join();
             }
             // Refused for having another design: offer the room's own.
@@ -1795,6 +1986,12 @@ impl FluidApp {
     /// Join now — or, while a design is loading or its hash is still being
     /// computed, as soon as it is in (the join must name the design).
     fn request_join(&mut self) {
+        if self.stream.is_some() {
+            // A streamed design holds no base geometry, so peers' edits of
+            // base shapes could not be shown: rooms need the design in-core.
+            self.status = "rooms need the design loaded in-core (this one is streamed)".to_string();
+            return;
+        }
         if self.load_in_flight || self.loading.is_some() || self.pending_hash.is_some() {
             self.pending_join = true;
         } else {
@@ -2221,6 +2418,20 @@ impl FluidApp {
         let mut parts = cmd.split_whitespace();
         match parts.next() {
             Some("join") => self.request_join(),
+            // `zoom <fit|mid|leaf>`: the `?zoom=` presets, after load.
+            Some("zoom") => {
+                self.forced_zoom = parts.next().map(str::to_string);
+                self.apply_forced_zoom();
+            }
+            // `view <cx> <cy> <span>`: center the camera on a world point
+            // (nm) showing `span` nm across (Phase 6 SLICE 3: pan/zoom runs).
+            Some("view") => {
+                let v: Vec<f64> = parts.filter_map(|t| t.parse().ok()).collect();
+                if let [cx, cy, span] = v[..] {
+                    self.camera.center = Vec2::new(cx as f32, cy as f32);
+                    self.camera.scale = (self.camera.viewport.x as f64 / span.max(1.0)) as f32;
+                }
+            }
             // Phase 6: leave the room (edits keep working offline).
             Some("leave") => {
                 self.auto_rejoin = false;
@@ -2646,7 +2857,23 @@ impl FluidApp {
 
             ui.separator();
             ui.label("Editing");
-            ui.checkbox(&mut self.edit_mode, "Edit mode (click to select)");
+            if let Some(st) = &self.stream {
+                // Phase 6 SLICE 3: a streamed design is view-only.
+                ui.small("streamed from the server: view-only");
+                ui.small(format!(
+                    "resident {} chunks · {} MB GPU",
+                    self.uploaded.len(),
+                    self.gpu_bytes / 1_048_576
+                ));
+                ui.small(format!(
+                    "fetched {} ({} MB) · evicted {} · dense {}",
+                    st.fetched,
+                    st.fetched_bytes / 1_048_576,
+                    st.evicted,
+                    st.dense
+                ));
+            }
+            ui.add_enabled(self.stream.is_none(), egui::Checkbox::new(&mut self.edit_mode, "Edit mode (click to select)"));
             if self.edit_mode {
                 // Phase 5 SLICE 1: the canvas tools + the layer new shapes draw on.
                 ui.horizontal(|ui| {
@@ -2764,18 +2991,22 @@ impl FluidApp {
                     self.do_redo();
                 }
             });
-            ui.horizontal(|ui| {
-                if ui.button("💾 Save GDS").clicked() {
-                    self.save_gds();
-                }
-                if ui.button("Export OASIS").on_hover_text("same content, typically 10–30× smaller").clicked() {
-                    self.save_layout(true);
-                }
+            ui.add_enabled_ui(self.stream.is_none(), |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("💾 Save GDS").clicked() {
+                        self.save_gds();
+                    }
+                    if ui.button("Export OASIS").on_hover_text("same content, typically 10–30× smaller").clicked() {
+                        self.save_layout(true);
+                    }
+                });
             });
 
             ui.separator();
             ui.label("DRC (merge-first, intra-cell)");
-            if ui.checkbox(&mut self.drc_enabled, "enable").changed() && !self.drc_enabled {
+            if ui.add_enabled(self.stream.is_none(), egui::Checkbox::new(&mut self.drc_enabled, "enable")).changed()
+                && !self.drc_enabled
+            {
                 self.drc.clear(); // off ⇒ zero cost, and no stale results on re-enable
             }
             if self.drc_enabled {

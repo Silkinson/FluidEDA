@@ -35,6 +35,7 @@ pub mod gds_write;
 pub mod oasis;
 pub mod oasis_write;
 pub mod index;
+pub mod pack;
 pub mod path;
 pub mod pick;
 pub mod serialize;
@@ -56,7 +57,9 @@ pub use gds_write::write_gds;
 pub use oasis_write::write_oasis;
 pub use index::ShapeIndex;
 pub use pick::{pick_composite, pick_hierarchy, pick_in_cell, point_in_polygon, CompositeHit, PickHit, PickTarget};
-pub use serialize::{deserialize, deserialize_from, serialize, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse};
+pub use serialize::{
+    deserialize, deserialize_from, serialize, skeleton_meta, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse,
+};
 pub use store::ShapeStore;
 
 /// Version of the rule that numbers each cell's shapes (the index in a

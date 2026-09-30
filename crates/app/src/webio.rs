@@ -55,6 +55,19 @@ pub fn query_file() -> Option<String> {
     None
 }
 
+/// Read query parameter `name`, if present.
+#[cfg(target_arch = "wasm32")]
+pub fn query_param(name: &str) -> Option<String> {
+    let search = web_sys::window()?.location().search().ok()?;
+    let prefix = format!("{name}=");
+    search.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix(prefix.as_str())).map(js_decode)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn query_param(_name: &str) -> Option<String> {
+    None
+}
+
 /// Read the `room` query parameter (Phase 6: the room to join once the
 /// design is in), if any.
 #[cfg(target_arch = "wasm32")]
@@ -406,6 +419,7 @@ fn run_worker(
             worker_heap_bytes: get_f64(&data, "worker_heap_bytes") as usize,
             hash: hash_slot.clone(),
             source: source.clone(),
+            stream: None,
         };
         // Hand the pending rebuild to the app (it copies across frames). The
         // worker lives on only to hash the file (Phase 6, a few hundred ms
@@ -550,6 +564,11 @@ pub struct TessReply {
     pub chunk: u32,
     pub gen: u32,
     pub meshes: Vec<fluideda_core::LayerMesh>,
+    /// Streaming (Phase 6 SLICE 3): the chunk record's size and fetch time.
+    pub fetch_bytes: usize,
+    pub fetch_ms: f64,
+    /// The job failed (logged): nothing to upload; the app may retry it.
+    pub failed: bool,
 }
 
 /// Completed tessellation jobs land here for the app to drain each frame (like
@@ -582,7 +601,17 @@ impl TessWorker {
                 match get_str(&data, "type").as_deref() {
                     Some("tess_done") => slot.borrow_mut().push(reconstruct_tess(&data)),
                     Some("tess_error") => {
-                        log::error!("tess worker: {}", get_str(&data, "message").unwrap_or_default())
+                        log::error!("tess worker: {}", get_str(&data, "message").unwrap_or_default());
+                        // Reported, so the chunk is not left pending forever.
+                        slot.borrow_mut().push(TessReply {
+                            cell: get_f64(&data, "cell") as usize,
+                            chunk: get_f64(&data, "chunk") as u32,
+                            gen: get_f64(&data, "gen") as u32,
+                            meshes: Vec::new(),
+                            fetch_bytes: 0,
+                            fetch_ms: 0.0,
+                            failed: true,
+                        });
                     }
                     _ => {}
                 }
@@ -612,6 +641,27 @@ impl TessWorker {
         set("layers", &larr.buffer());
         let transfer = js_sys::Array::of3(&carr.buffer(), &sarr.buffer(), &larr.buffer());
         if let Err(e) = self.worker.post_message_with_transfer(&payload, &transfer) {
+            log::error!("tess post failed: {e:?}");
+        }
+    }
+
+    /// Streaming (Phase 6 SLICE 3): have the worker fetch the chunk's record —
+    /// bytes `start..end` of the pack's geometry blob at `url` — and
+    /// tessellate it. The geometry never touches the main thread.
+    pub fn post_fetch(&self, cell: usize, chunk: u32, gen: u32, url: &str, start: u64, end: u64) {
+        use wasm_bindgen::JsValue;
+        let payload = js_sys::Object::new();
+        let set = |k: &str, v: &JsValue| {
+            let _ = js_sys::Reflect::set(&payload, &k.into(), v);
+        };
+        set("type", &"tess_fetch".into());
+        set("cell", &JsValue::from_f64(cell as f64));
+        set("chunk", &JsValue::from_f64(chunk as f64));
+        set("gen", &JsValue::from_f64(gen as f64));
+        set("url", &url.into());
+        set("start", &JsValue::from_f64(start as f64));
+        set("end", &JsValue::from_f64(end as f64));
+        if let Err(e) = self.worker.post_message(&payload) {
             log::error!("tess post failed: {e:?}");
         }
     }
@@ -654,7 +704,15 @@ fn reconstruct_tess(data: &wasm_bindgen::JsValue) -> TessReply {
         vo += vc;
         io += ic;
     }
-    TessReply { cell, chunk, gen, meshes }
+    TessReply {
+        cell,
+        chunk,
+        gen,
+        meshes,
+        fetch_bytes: get_f64(data, "fetch_bytes") as usize,
+        fetch_ms: get_f64(data, "fetch_ms"),
+        failed: false,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -674,6 +732,7 @@ impl TessWorker {
         Err("tessellation worker is web-only".into())
     }
     pub fn post(&self, _cell: usize, _chunk: u32, _gen: u32, _coords: &[i32], _starts: &[u32], _layers: &[u32]) {}
+    pub fn post_fetch(&self, _cell: usize, _chunk: u32, _gen: u32, _url: &str, _start: u64, _end: u64) {}
 }
 
 // --- Phase 5b SLICE 3: DRC worker pool ---------------------------------------
@@ -988,3 +1047,79 @@ pub fn ensure_blob(hash: String, source: crate::design::DesignSource, embedded: 
 pub fn ensure_blob(_hash: String, _source: crate::design::DesignSource, _embedded: &'static [u8], slot: UploadSlot) {
     *slot.borrow_mut() = UploadState::Unavailable;
 }
+
+// --- Phase 6 SLICE 3: streaming a design pack ---------------------------------
+//
+// Instead of the file, the client fetches the server's *pack* of the design:
+// the manifest (`/packs/<sha256>`), the skeleton and the chunk index (both
+// immutable blobs). The skeleton installs exactly like a worker-parsed one;
+// geometry is then fetched per chunk, by the tessellation worker, as byte
+// ranges of the geometry blob — only for chunks on screen.
+
+/// Fetch design `hash`'s pack and queue its skeleton for installation in
+/// `slot` (the same slot a worker parse delivers to). `name` labels it.
+#[cfg(target_arch = "wasm32")]
+pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            let t0 = js_sys::Date::now();
+            let url = format!("/packs/{hash}");
+            let resp = http(&url, "GET", None).await?;
+            if !resp.ok() {
+                return Err(format!("GET {url}: HTTP {}", resp.status()));
+            }
+            let m = wasm_bindgen_futures::JsFuture::from(resp.json().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("GET {url}: {e:?}"))?;
+            let blob = |k: &str| -> (String, f64) {
+                let b = get_val(&m, k);
+                (get_str(&b, "hash").unwrap_or_default(), get_f64(&b, "bytes"))
+            };
+            let ((sk, sk_bytes), (geo, geo_bytes), (ix, _)) = (blob("skeleton"), blob("geometry"), blob("index"));
+            let bytes_of = |h: String| async move {
+                let u = format!("/blobs/{h}");
+                let r = http(&u, "GET", None).await?;
+                if !r.ok() {
+                    return Err(format!("GET {u}: HTTP {}", r.status()));
+                }
+                let buf = wasm_bindgen_futures::JsFuture::from(r.array_buffer().map_err(|e| format!("{e:?}"))?)
+                    .await
+                    .map_err(|e| format!("GET {u}: {e:?}"))?;
+                Ok::<Vec<u8>, String>(js_sys::Uint8Array::new(&buf).to_vec())
+            };
+            let skeleton = bytes_of(sk).await?;
+            let offsets = fluideda_core::pack::parse_index(&bytes_of(ix).await?).map_err(|e| e.to_string())?;
+            let bbox = js_sys::Array::from(&get_val(&m, "world_bbox"));
+            let layers = js_sys::Array::from(&get_val(&m, "layers"));
+            let hash_slot: crate::design::HashSlot = Rc::new(RefCell::new(Some((hash.clone(), 0.0))));
+            let msg = crate::design::WorkerMsg {
+                name,
+                file_bytes: geo_bytes as usize,
+                columns: Box::new(crate::design::NoColumns),
+                meta: skeleton,
+                bbox: [0, 1, 2, 3].map(|i| bbox.get(i).as_f64().unwrap_or(0.0)),
+                total_shapes: get_f64(&m, "flat_shapes") as u64,
+                distinct_polys: get_f64(&m, "shapes") as usize,
+                cell_defs: get_f64(&m, "cells") as usize,
+                layers_packed: layers.iter().map(|v| v.as_f64().unwrap_or(0.0) as u32).collect(),
+                parse_ms: get_f64(&m, "build_ms"),
+                worker_heap_bytes: 0,
+                hash: hash_slot,
+                source: crate::design::DesignSource::Url(format!("/blobs/{hash}")),
+                stream: Some(crate::design::StreamInfo {
+                    geometry_url: format!("/blobs/{geo}"),
+                    offsets,
+                    geometry_bytes: geo_bytes as u64,
+                    skeleton_bytes: sk_bytes as u64,
+                    fetch_ms: js_sys::Date::now() - t0,
+                }),
+            };
+            crate::design::Reconstruction::new(msg).map_err(|e| format!("pack skeleton: {e}"))
+        }
+        .await;
+        *slot.borrow_mut() = Some(result);
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_pack(_hash: String, _name: String, _slot: DesignSlot) {}
