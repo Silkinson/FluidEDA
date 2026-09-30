@@ -50,7 +50,7 @@ pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, Shape};
 pub use gds_write::write_gds;
 pub use index::ShapeIndex;
 pub use pick::{pick_hierarchy, pick_in_cell, point_in_polygon, PickHit};
-pub use serialize::{deserialize, deserialize_from, serialize, ColumnSource, DbColumns};
+pub use serialize::{deserialize, deserialize_from, serialize, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse};
 pub use store::ShapeStore;
 pub use tess::{
     tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_columns, tessellate_shapes,

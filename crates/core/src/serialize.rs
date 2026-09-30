@@ -172,42 +172,54 @@ pub fn deserialize(cols: DbColumns) -> Result<CellDb> {
 /// Rebuild a `CellDb` in one go from its metadata blob, pulling each cell's
 /// column slices from `src` (see [`ColumnSource`]).
 pub fn deserialize_from(meta: Vec<u8>, src: &mut dyn ColumnSource) -> Result<CellDb> {
-    let mut d = Deserializer::new(meta)?;
-    while !d.step(src, usize::MAX)? {}
-    d.finish()
+    let (mut db, mut load) = ProgressiveLoad::new(&meta)?;
+    let mut done = Vec::new();
+    while !load.step(src, usize::MAX, &[], &mut done)? {}
+    for (c, store) in done {
+        db.cells[c].set_shapes(store);
+    }
+    Ok(db)
 }
 
 /// Coordinates copied per coord-slice of one big cell (4 M × 4 B = 16 MB): the
 /// unit that lets a 100 MB cell (caravel_core) span several steps.
 const COORD_SLICE: usize = 4 << 20;
 
-/// A cell whose columns are part-way through copying.
-struct PartialCell {
+/// Where one cell's shapes live in the concatenated columns.
+#[derive(Debug, Clone, Copy)]
+struct CellSpan {
     n_coords: usize,
     n_shapes: usize,
+    coord_off: usize,
+    start_off: usize,
+    layer_off: usize,
+}
+
+/// A cell whose coordinates are part-way through copying.
+struct PartialCell {
+    cell: CellId,
     coords: Vec<i32>,
 }
 
-/// **Incremental** rebuild of a `CellDb` (Phase 5c): each [`step`](Self::step)
-/// copies at most about `max_bytes` of columns, splitting even a single huge
-/// cell's coordinate column into slices, so the main thread can spread the
-/// design swap over frames instead of blocking one. Owns the metadata blob and
-/// a cursor into it; the columns stay in the caller's [`ColumnSource`].
-pub struct Deserializer {
+/// Budgeted parse of the metadata blob into a skeleton `CellDb` (Phase 5c).
+///
+/// The blob is not small: caravel's is 24.6 MB — ~460 k instance records, most
+/// of them caravel_core's standard cells — and parsing it whole was a 14 ms
+/// block of its own. [`step`](Self::step) parses cells until about `max_bytes`
+/// of the blob are consumed; [`finish`](Self::finish) yields the skeleton and
+/// the column [`ProgressiveLoad`].
+pub struct SkeletonParse {
     meta: Vec<u8>,
     pos: usize,
     top: CellId,
     cell_count: usize,
     cells: Vec<Cell>,
-    coord_off: usize,
-    start_off: usize,
-    layer_off: usize,
-    partial: Option<PartialCell>,
-    bytes_copied: usize,
+    spans: Vec<CellSpan>,
+    offs: (usize, usize, usize),
 }
 
-impl Deserializer {
-    /// Validate the header. No column is touched yet.
+impl SkeletonParse {
+    /// Validate the header.
     pub fn new(meta: Vec<u8>) -> Result<Self> {
         let mut r = Reader::new(&meta);
         if r.u32()? != MAGIC {
@@ -218,120 +230,208 @@ impl Deserializer {
         }
         let top = r.u32()? as CellId;
         let cell_count = r.u32()? as usize;
+        if top >= cell_count && cell_count > 0 {
+            bail!("CellDb blob: top cell out of range");
+        }
         let pos = r.pos;
-        Ok(Deserializer {
+        Ok(SkeletonParse {
             meta,
             pos,
             top,
             cell_count,
             cells: Vec::with_capacity(cell_count),
-            coord_off: 0,
-            start_off: 0,
-            layer_off: 0,
-            partial: None,
-            bytes_copied: 0,
+            spans: Vec::with_capacity(cell_count),
+            offs: (0, 0, 0),
         })
     }
 
-    /// Copy up to about `max_bytes` more; `Ok(true)` once every cell is built.
-    pub fn step(&mut self, src: &mut dyn ColumnSource, max_bytes: usize) -> Result<bool> {
-        let mut budget = max_bytes;
+    /// Parse cells until about `max_bytes` of metadata are consumed; `Ok(true)`
+    /// once every cell is parsed.
+    pub fn step(&mut self, max_bytes: usize) -> Result<bool> {
+        let stop = self.pos.saturating_add(max_bytes);
+        let mut r = Reader { buf: &self.meta, pos: self.pos };
         while self.cells.len() < self.cell_count {
-            // Start the next cell: read its column lengths.
-            let p = match self.partial.as_mut() {
-                Some(p) => p,
-                None => {
-                    let mut r = Reader { buf: &self.meta, pos: self.pos };
-                    let n_coords = r.u32()? as usize;
-                    let n_shapes = r.u32()? as usize;
-                    self.pos = r.pos;
-                    self.partial.insert(PartialCell { n_coords, n_shapes, coords: Vec::with_capacity(n_coords) })
-                }
-            };
-            // Coordinates, a slice at a time.
-            while p.coords.len() < p.n_coords {
-                if budget == 0 {
-                    return Ok(false);
-                }
-                let n = (p.n_coords - p.coords.len()).min(COORD_SLICE).min((budget / 4).max(1));
-                src.coords_into(self.coord_off + p.coords.len(), n, &mut p.coords)?;
-                budget = budget.saturating_sub(n * 4);
-                self.bytes_copied += n * 4;
-            }
-            // Starts + layers (8 B/shape) and the metadata finish the cell.
-            let p = self.partial.take().unwrap();
-            let s = src.starts(self.start_off, p.n_shapes + 1)?;
-            let l = src.layers(self.layer_off, p.n_shapes)?;
-            budget = budget.saturating_sub(p.n_shapes * 8);
-            self.bytes_copied += p.n_shapes * 8;
-            if s.last().copied().unwrap_or(0) as usize * 2 != p.coords.len() {
-                bail!("CellDb blob: cell starts/coords mismatch");
-            }
-            self.coord_off += p.n_coords;
-            self.start_off += p.n_shapes + 1;
-            self.layer_off += p.n_shapes;
-            let shapes = ShapeStore::from_columns(p.coords, s, l);
-            let cell = self.read_cell_meta(shapes)?;
-            self.cells.push(cell);
-            if budget == 0 && self.cells.len() < self.cell_count {
+            if r.pos >= stop {
+                self.pos = r.pos;
                 return Ok(false);
             }
+            let n_coords = r.u32()? as usize;
+            let n_shapes = r.u32()? as usize;
+            let (coord_off, start_off, layer_off) = self.offs;
+            self.spans.push(CellSpan { n_coords, n_shapes, coord_off, start_off, layer_off });
+            self.offs = (coord_off + n_coords, start_off + n_shapes + 1, layer_off + n_shapes);
+
+            let name_len = r.u32()? as usize;
+            let name = String::from_utf8(r.bytes(name_len)?.to_vec())?;
+            let n_inst = r.u32()? as usize;
+            let mut instances = Vec::with_capacity(n_inst);
+            for _ in 0..n_inst {
+                let child = r.u32()? as CellId;
+                let transform = r.transform()?;
+                let kind = match r.u8()? {
+                    0 => InstanceKind::Single,
+                    1 => InstanceKind::Array {
+                        cols: r.i32()?,
+                        rows: r.i32()?,
+                        col_step: [r.f64()?, r.f64()?],
+                        row_step: [r.f64()?, r.f64()?],
+                    },
+                    t => bail!("bad instance kind tag {t}"),
+                };
+                if child >= self.cell_count {
+                    bail!("CellDb blob: instance of unknown cell {child}");
+                }
+                instances.push(Instance { child, transform, kind });
+            }
+            let n_chunks = r.u32()? as usize;
+            let mut chunks = Vec::with_capacity(n_chunks);
+            for _ in 0..n_chunks {
+                let start = r.u32()?;
+                let end = r.u32()?;
+                let bbox = r.bbox()?;
+                chunks.push(Chunk { start, end, bbox });
+            }
+            self.cells.push(Cell::from_parts(name, ShapeStore::new(), instances, chunks));
         }
+        self.pos = r.pos;
         Ok(true)
     }
 
-    /// Name, instances and chunk table of the cell whose shapes just finished.
-    fn read_cell_meta(&mut self, shapes: ShapeStore) -> Result<Cell> {
-        let mut r = Reader { buf: &self.meta, pos: self.pos };
-        let name_len = r.u32()? as usize;
-        let name = String::from_utf8(r.bytes(name_len)?.to_vec())?;
-
-        let n_inst = r.u32()? as usize;
-        let mut instances = Vec::with_capacity(n_inst);
-        for _ in 0..n_inst {
-            let child = r.u32()? as CellId;
-            let transform = r.transform()?;
-            let kind = match r.u8()? {
-                0 => InstanceKind::Single,
-                1 => InstanceKind::Array {
-                    cols: r.i32()?,
-                    rows: r.i32()?,
-                    col_step: [r.f64()?, r.f64()?],
-                    row_step: [r.f64()?, r.f64()?],
-                },
-                t => bail!("bad instance kind tag {t}"),
-            };
-            instances.push(Instance { child, transform, kind });
-        }
-
-        let n_chunks = r.u32()? as usize;
-        let mut chunks = Vec::with_capacity(n_chunks);
-        for _ in 0..n_chunks {
-            let start = r.u32()?;
-            let end = r.u32()?;
-            let bbox = r.bbox()?;
-            chunks.push(Chunk { start, end, bbox });
-        }
-        self.pos = r.pos;
-        Ok(Cell::from_parts(name, shapes, instances, chunks))
+    /// Fraction of the metadata parsed (progress readout).
+    pub fn progress(&self) -> f64 {
+        self.pos as f64 / self.meta.len().max(1) as f64
     }
 
-    /// Fraction of the column bytes copied so far, given the total (readout).
-    pub fn bytes_copied(&self) -> usize {
-        self.bytes_copied
-    }
-
-    /// Assemble the `CellDb` (call once `step` returned `true`).
-    pub fn finish(self) -> Result<CellDb> {
+    /// The skeleton `CellDb` (every cell's hierarchy, chunk table and bbox; no
+    /// shapes) and the loader for its columns. Call once `step` returned `true`.
+    pub fn finish(self) -> Result<(CellDb, ProgressiveLoad)> {
         if self.cells.len() != self.cell_count {
-            bail!("CellDb deserializer finished early");
+            bail!("CellDb skeleton finished early");
         }
         let mut r = Reader { buf: &self.meta, pos: self.pos };
         let mut local_bboxes = Vec::with_capacity(self.cell_count);
         for _ in 0..self.cell_count {
             local_bboxes.push(r.bbox()?);
         }
-        Ok(CellDb::from_parts(self.cells, self.top, local_bboxes))
+        let db = CellDb::from_parts(self.cells, self.top, local_bboxes);
+        Ok((db, ProgressiveLoad::from_spans(self.spans)))
+    }
+}
+
+/// **Progressive** rebuild of a `CellDb` (Phase 5c).
+///
+/// [`new`](Self::new) parses the whole metadata blob — names, instances, chunk
+/// tables, local bboxes; no geometry — into a **skeleton** `CellDb` whose cells
+/// have empty shape stores. The skeleton is installable at once: culling needs
+/// only bboxes, chunk tables and instances, and the renderer draws every chunk
+/// it cannot tessellate as a bbox proxy, so the new design's outline appears
+/// the moment the worker replies. [`step`](Self::step) then copies columns a
+/// bounded number of bytes at a time — in any cell order, *priority cells
+/// first* (the app passes the cells on screen), a big cell's coordinates in
+/// slices — and hands each finished `ShapeStore` back to be slotted in with
+/// [`crate::db::Cell::set_shapes`]. One copy per cell column, straight from the
+/// [`ColumnSource`]; no concatenated intermediate.
+pub struct ProgressiveLoad {
+    spans: Vec<CellSpan>,
+    loaded: Vec<bool>,
+    remaining: usize,
+    /// Sequential cursor for non-priority loading.
+    next: usize,
+    partial: Option<PartialCell>,
+    bytes_copied: usize,
+    total_bytes: usize,
+}
+
+impl ProgressiveLoad {
+    /// Parse the metadata blob into the skeleton `CellDb` + the load plan, in
+    /// one go (see [`SkeletonParse`] for the budgeted form).
+    pub fn new(meta: &[u8]) -> Result<(CellDb, ProgressiveLoad)> {
+        let mut p = SkeletonParse::new(meta.to_vec())?;
+        while !p.step(usize::MAX)? {}
+        p.finish()
+    }
+
+    /// A loader with nothing to load (a placeholder while swapping phases).
+    pub fn empty() -> ProgressiveLoad {
+        ProgressiveLoad::from_spans(Vec::new())
+    }
+
+    fn from_spans(spans: Vec<CellSpan>) -> ProgressiveLoad {
+        let total_bytes = spans.iter().map(|s| s.n_coords * 4 + s.n_shapes * 8).sum();
+        let cell_count = spans.len();
+        let mut loaded = vec![false; cell_count];
+        let mut remaining = cell_count;
+        // Cells with no shapes are complete already (the skeleton's empty store
+        // IS their store).
+        for (i, sp) in spans.iter().enumerate() {
+            if sp.n_shapes == 0 && sp.n_coords == 0 {
+                loaded[i] = true;
+                remaining -= 1;
+            }
+        }
+        ProgressiveLoad { spans, loaded, remaining, next: 0, partial: None, bytes_copied: 0, total_bytes }
+    }
+
+    /// Is `cell`'s geometry in place (handed out by `step`, or shapeless)?
+    pub fn is_loaded(&self, cell: CellId) -> bool {
+        self.loaded.get(cell).copied().unwrap_or(true)
+    }
+
+    /// Fraction of the column bytes copied (progress readout).
+    pub fn progress(&self) -> f64 {
+        (self.bytes_copied as f64 / self.total_bytes.max(1) as f64).min(1.0)
+    }
+
+    /// Copy up to about `max_bytes`, finishing cells into `out` as
+    /// `(cell, store)`. The next cell to start is the first not-yet-loaded one
+    /// in `priority`, else the next in file order. A cell already started is
+    /// finished before another begins. `Ok(true)` once every cell is loaded.
+    pub fn step(
+        &mut self,
+        src: &mut dyn ColumnSource,
+        max_bytes: usize,
+        priority: &[CellId],
+        out: &mut Vec<(CellId, ShapeStore)>,
+    ) -> Result<bool> {
+        let mut budget = max_bytes;
+        while self.remaining > 0 {
+            if self.partial.is_none() {
+                let pick = priority.iter().copied().find(|&c| c < self.loaded.len() && !self.loaded[c]).or_else(|| {
+                    while self.next < self.loaded.len() && self.loaded[self.next] {
+                        self.next += 1;
+                    }
+                    (self.next < self.loaded.len()).then_some(self.next)
+                });
+                let Some(cell) = pick else { break };
+                self.partial = Some(PartialCell { cell, coords: Vec::with_capacity(self.spans[cell].n_coords) });
+            }
+            let p = self.partial.as_mut().unwrap();
+            let sp = self.spans[p.cell];
+            while p.coords.len() < sp.n_coords {
+                if budget == 0 {
+                    return Ok(false);
+                }
+                let n = (sp.n_coords - p.coords.len()).min(COORD_SLICE).min((budget / 4).max(1));
+                src.coords_into(sp.coord_off + p.coords.len(), n, &mut p.coords)?;
+                budget = budget.saturating_sub(n * 4);
+                self.bytes_copied += n * 4;
+            }
+            let p = self.partial.take().unwrap();
+            let s = src.starts(sp.start_off, sp.n_shapes + 1)?;
+            let l = src.layers(sp.layer_off, sp.n_shapes)?;
+            budget = budget.saturating_sub(sp.n_shapes * 8);
+            self.bytes_copied += sp.n_shapes * 8;
+            if s.last().copied().unwrap_or(0) as usize * 2 != p.coords.len() {
+                bail!("CellDb blob: cell starts/coords mismatch");
+            }
+            out.push((p.cell, ShapeStore::from_columns(p.coords, s, l)));
+            self.loaded[p.cell] = true;
+            self.remaining -= 1;
+            if budget == 0 && self.remaining > 0 {
+                return Ok(false);
+            }
+        }
+        Ok(self.remaining == 0)
     }
 }
 
@@ -431,26 +531,43 @@ mod tests {
     const HIER: &[u8] = include_bytes!("../../../assets/hier.gds");
     const FIXTURE: &[u8] = include_bytes!("../../../assets/edit_fixture.gds");
 
-    /// Budgeted (sliced) reconstruction must build exactly the same CellDb as a
-    /// one-shot one — including a cell whose coords span several slices.
+    /// Progressive (sliced, priority-ordered) reconstruction must build exactly
+    /// the same CellDb as a one-shot one — including a cell whose coords span
+    /// several slices — and the skeleton must be complete except for shapes.
     #[test]
-    fn incremental_deserialize_matches_one_shot() {
+    fn progressive_load_matches_one_shot() {
         let db = crate::gds::load_gds_db(FIXTURE).unwrap();
         let cols = serialize(&db);
         let mut src = VecSource { coords: &cols.coords, starts: &cols.starts, layers: &cols.layers };
-        let mut d = Deserializer::new(cols.meta.clone()).unwrap();
-        let mut steps = 0;
-        while !d.step(&mut src, 64).unwrap() {
+        // Skeleton parsed in small budgeted steps, as the app drives it.
+        let mut sp = SkeletonParse::new(cols.meta.clone()).unwrap();
+        let mut sk_steps = 1;
+        while !sp.step(1).unwrap() {
+            sk_steps += 1;
+        }
+        assert_eq!(sk_steps, db.cells.len(), "a 1-byte budget parses one cell per step");
+        let (mut skel, mut load) = sp.finish().unwrap();
+        assert_eq!(skel.cells.len(), db.cells.len());
+        assert_eq!(skel.top, db.top);
+        for (a, b) in skel.cells.iter().zip(&db.cells) {
+            assert_eq!(a.chunks.len(), b.chunks.len(), "skeleton carries the chunk tables");
+            assert_eq!(a.instances.len(), b.instances.len(), "skeleton carries the hierarchy");
+            assert!(a.shapes.is_empty(), "…but no geometry yet");
+        }
+        // Load the LAST cell first (a priority request), in 64-byte steps.
+        let prio = [db.cells.len() - 1];
+        let (mut steps, mut done) = (0, Vec::new());
+        while !load.step(&mut src, 64, &prio, &mut done).unwrap() {
             steps += 1;
         }
         assert!(steps > 3, "a 64-byte budget must take several steps ({steps})");
-        let inc = d.finish().unwrap();
-        let whole = deserialize(serialize(&db)).unwrap();
-        assert_eq!(inc.cells.len(), whole.cells.len());
-        for (a, b) in inc.cells.iter().zip(&whole.cells) {
+        assert_eq!(done.first().map(|d| d.0), Some(prio[0]), "priority cell finished first");
+        for (c, store) in done {
+            skel.cells[c].set_shapes(store);
+        }
+        for (a, b) in skel.cells.iter().zip(&db.cells) {
             assert_eq!(a.name, b.name);
             assert_eq!(a.shapes.columns(), b.shapes.columns());
-            assert_eq!(a.chunks.len(), b.chunks.len());
         }
     }
 

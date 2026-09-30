@@ -15,9 +15,9 @@ use std::rc::Rc;
 /// parse synchronously on the next frame (fallback path).
 pub type LoadSlot = Rc<RefCell<Option<(String, Vec<u8>)>>>;
 
-/// The worker path drops a pending [`Reconstruction`](crate::design::Reconstruction)
-/// (or an error string) here; the app advances it across frames and installs
-/// the finished design (Phase 5c).
+/// The worker path drops the new design's progressive [`Reconstruction`](crate::design::Reconstruction)
+/// (or an error string) here; the app advances it within the frame budget —
+/// skeleton first (installed as soon as it is complete), then geometry.
 pub type DesignSlot = Rc<RefCell<Option<Result<crate::design::Reconstruction, String>>>>;
 
 /// Does this browser support Web Workers (the off-main-thread parse path)?
@@ -304,12 +304,10 @@ fn run_worker(name: String, payload: js_sys::Object, transfer: js_sys::Array, sl
             starts: js_sys::Uint32Array::new(&get_val(&data, "starts")),
             layers: js_sys::ArrayBuffer::from(get_val(&data, "layers")),
         };
-        let coord_count = columns.coords.length() as usize;
         let msg = crate::design::WorkerMsg {
             name: name_for_msg.clone(),
             file_bytes: get_f64(&data, "file_bytes") as usize,
             columns: Box::new(columns),
-            coord_count,
             meta: get_u8_vec(&data, "meta"),
             bbox: get_bbox(&data),
             total_shapes: get_f64(&data, "total_shapes") as u64,

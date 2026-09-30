@@ -131,11 +131,12 @@ pub struct FluidApp {
     load_slot: LoadSlot,
     /// Worker-parsed designs land here (Phase 2b STEP 2); drained before load_slot.
     design_slot: webio::DesignSlot,
-    /// A worker-parsed design being rebuilt across frames (Phase 5c); installed
-    /// when complete. The old design keeps rendering meanwhile.
-    pending_design: Option<design::Reconstruction>,
-    /// A rebuilt design waiting for next frame's install.
-    ready_design: Option<Design>,
+    /// A worker-parsed design arriving progressively (Phase 5c): first its
+    /// skeleton is parsed (the old design keeps rendering), then installed
+    /// (it renders as proxies), then its geometry fills in, visible cells
+    /// first. While its geometry is arriving, editing, picking, DRC and save
+    /// wait.
+    loading: Option<design::Reconstruction>,
     load_instant: web_time::Instant,
     awaiting_first_frame: bool,
     status: String,
@@ -320,8 +321,7 @@ impl FluidApp {
             metrics: design.metrics,
             load_slot,
             design_slot,
-            pending_design: None,
-            ready_design: None,
+            loading: None,
             load_instant: web_time::Instant::now(),
             awaiting_first_frame: true, // measure TTFF for the default too
             status: String::new(),
@@ -386,6 +386,9 @@ impl FluidApp {
     /// renderer, camera and layer list. Tessellation is deferred — cells upload
     /// lazily as they become visible (STEP 3).
     fn install(&mut self, design: Design, frame: &mut eframe::Frame) {
+        // A new design supersedes one still loading (the caller sets `loading`
+        // again for a progressive install).
+        self.loading = None;
         self.db = design.db;
         self.layers = design.layers;
         self.layer_visible = vec![true; self.layers.len()];
@@ -458,6 +461,9 @@ impl FluidApp {
     /// instance hierarchy and resolves to a cell **master** + shape, plus the
     /// clicked placement's world transform.
     fn pick_at(&mut self, world: Vec2) {
+        if self.geometry_pending() {
+            return; // geometry still arriving (Phase 5c): nothing to hit-test yet
+        }
         let p = Point::new(world.x.round() as i32, world.y.round() as i32);
         let t = web_time::Instant::now();
         let top = self.db.top;
@@ -766,6 +772,10 @@ impl FluidApp {
     /// Export the current design (base composited with the edit overlay) to GDSII
     /// and save it (web: download; native: write a file). Phase 3 SLICE 1.
     fn save_gds(&mut self) {
+        if self.geometry_pending() {
+            self.status = "still loading — save when the geometry is in".into();
+            return;
+        }
         let bytes = fluideda_core::write_gds(&self.db, &self.overlay);
         let name = out_name(&self.metrics.name);
         match webio::save_bytes(&name, &bytes) {
@@ -877,8 +887,8 @@ impl FluidApp {
     /// way the main thread only gathers (~0.1 ms/tile) and never blocks past
     /// about one job of `DRC_BUDGET_MS`.
     fn run_drc_budget(&mut self) {
-        if !self.drc_enabled {
-            return;
+        if !self.drc_enabled || self.geometry_pending() {
+            return; // (a progressive load's cells have no geometry to check yet)
         }
         // 1. Replies from the pool. A reply from before a clear (new design,
         //    deck change, DRC toggled) carries an old epoch: drop it — its
@@ -1014,6 +1024,7 @@ impl FluidApp {
             .iter()
             .filter(|d| {
                 !d.dirty
+                    && self.cell_loaded(d.cell)
                     && !self.uploaded.contains(&(d.cell, d.chunk))
                     && self.db.cells[d.cell].chunks[d.chunk as usize].len() >= TESS_WORKER_MIN_SHAPES
             })
@@ -1026,6 +1037,9 @@ impl FluidApp {
             let key = (d.cell, d.chunk);
             if self.uploaded.contains(&key) || self.tess_pending.contains(&key) {
                 continue; // already on the GPU, or a worker job is in flight (proxy shows)
+            }
+            if !self.cell_loaded(d.cell) {
+                continue; // progressive load: geometry not here yet — the renderer proxies it
             }
             let cell = &self.db.cells[d.cell];
             let chunk = &cell.chunks[d.chunk as usize];
@@ -1084,40 +1098,18 @@ impl FluidApp {
 
     /// Consume any pending drag-drop / fetched / picked file.
     fn drain_loads(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // 0. Worker-parsed design (Phase 2b STEP 2): the reply queues a
-        //    reconstruction; advance it within the frame budget and install the
-        //    design once complete (Phase 5c — the swap spans a few frames
-        //    instead of blocking one).
+        // 0. Worker-parsed design (Phase 2b STEP 2): queue its progressive
+        //    reconstruction (Phase 5c) and advance it within the frame budget —
+        //    the skeleton installs on a frame of its own as soon as it is
+        //    parsed, then geometry fills in, cells on screen first.
         let worker_done = self.design_slot.borrow_mut().take();
         if let Some(res) = worker_done {
             match res {
-                Ok(r) => self.pending_design = Some(r),
+                Ok(recon) => self.loading = Some(recon),
                 Err(e) => self.status = format!("load failed: {e}"),
             }
         }
-        // A design finished rebuilding last frame: install it now, on a frame
-        // of its own (install + first-view tessellation are ~20 ms by
-        // themselves; stacking them on the last copy slice made one long frame).
-        if let Some(design) = self.ready_design.take() {
-            self.install(design, frame);
-            self.status.clear();
-        }
-        if let Some(r) = self.pending_design.as_mut() {
-            match r.step(RECON_BUDGET_MS) {
-                Ok(true) => {
-                    let r = self.pending_design.take().unwrap();
-                    match r.finish() {
-                        Ok(design) => self.ready_design = Some(design),
-                        Err(e) => self.status = format!("reconstruct failed: {e}"),
-                    }
-                }
-                Ok(false) => self.status = format!("rebuilding design… {:.0}%", r.progress() * 100.0),
-                Err(e) => {
-                    self.pending_design = None;
-                    self.status = format!("reconstruct failed: {e}");
-                }
-            }
-        }
+        self.advance_load(frame);
 
         // egui drag-and-drop (bytes on web, path on native).
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -1157,13 +1149,82 @@ impl FluidApp {
         }
     }
 
+    /// Advance a progressive load (Phase 5c) within `RECON_BUDGET_MS`: copy the
+    /// next cells' columns — those on screen first — and slot each finished
+    /// store into the live design, whose chunks then tessellate like any other.
+    /// On completion, record the load's cost and publish the metrics.
+    fn advance_load(&mut self, frame: &mut eframe::Frame) {
+        let Some(recon) = self.loading.as_mut() else { return };
+        let mut prio: Vec<CellId> = if recon.installed() {
+            self.visible.draws.iter().map(|d| d.cell).filter(|&c| !recon.is_loaded(c)).collect()
+        } else {
+            Vec::new()
+        };
+        prio.dedup();
+        let mut done_cells = Vec::new();
+        let result = recon.step(RECON_BUDGET_MS, &prio, &mut done_cells);
+        for (c, store) in done_cells {
+            self.db.cells[c].set_shapes(store);
+        }
+        match result {
+            Ok(design::ReconStep::Progress) => {
+                let (what, p) = self.loading.as_ref().map_or(("", 0.0), |r| r.progress());
+                self.status = format!("{what}… {:.0}%", p * 100.0);
+            }
+            Ok(design::ReconStep::SkeletonReady(design)) => {
+                // install() clears `loading` (a new design supersedes an old
+                // load) — keep this one: it now fills in the installed skeleton.
+                let recon = self.loading.take();
+                self.install(design, frame);
+                self.loading = recon;
+            }
+            Ok(design::ReconStep::Done) => {
+                let (ms, frames) = self.loading.take().map_or((0.0, 0), |r| r.cost());
+                self.metrics.reconstruct_ms = ms;
+                self.metrics.reconstruct_frames = frames;
+                self.metrics.geometry_ms = self.load_instant.elapsed().as_secs_f64() * 1e3;
+                self.status.clear();
+                // The first frame already happened (skeleton): publish now.
+                if !self.awaiting_first_frame {
+                    self.publish_load_metrics();
+                }
+            }
+            Err(e) => {
+                self.loading = None;
+                self.status = format!("load failed: {e}");
+            }
+        }
+    }
+
+    /// Is `cell`'s geometry in place? (Always, except while an installed
+    /// progressive design is still filling in.)
+    fn cell_loaded(&self, cell: CellId) -> bool {
+        self.loading.as_ref().map_or(true, |r| !r.installed() || r.is_loaded(cell))
+    }
+
+    /// Is the installed design's geometry still arriving?
+    fn geometry_pending(&self) -> bool {
+        self.loading.as_ref().is_some_and(|r| r.installed())
+    }
+
     /// On the frame *after* a load (so at least one frame has actually rendered),
     /// record wall-clock TTFF, force + time the R-tree build, and publish metrics.
+    /// For a progressive load the first frame is the skeleton's: TTFF is taken
+    /// then, and the metrics are published when the geometry completes.
     fn finish_first_frame(&mut self) {
         if !self.awaiting_first_frame || !self.renderer_ready {
             return;
         }
         self.metrics.ttff_ms = self.load_instant.elapsed().as_secs_f64() * 1e3;
+        self.awaiting_first_frame = false;
+        if !self.geometry_pending() {
+            self.publish_load_metrics();
+        }
+    }
+
+    /// Finalize the load metrics (tessellation so far, heap, optional index
+    /// timing) and publish them for the harnesses.
+    fn publish_load_metrics(&mut self) {
         // Lazy tessellation: report what the initial view actually cost, not all defs.
         self.metrics.tess_ms = self.tess_accum_ms;
         self.metrics.vertex_bytes = self.gpu_bytes;
@@ -1178,8 +1239,10 @@ impl FluidApp {
             self.metrics.index_max_ms = idx_max;
         }
         self.metrics.wasm_heap_bytes = design::wasm_heap_bytes();
+        if self.metrics.geometry_ms == 0.0 {
+            self.metrics.geometry_ms = self.metrics.ttff_ms; // not progressive
+        }
         self.metrics.publish();
-        self.awaiting_first_frame = false;
     }
 
     /// Publish the per-frame perf snapshot to `window.__fluideda_perf` (wasm only):

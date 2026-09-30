@@ -114,12 +114,12 @@ still byte-identical).
 |---|--:|---|
 | leaf-zoom tessellation | 22 ms | was 2235 ms (chunking) |
 | leaf GPU geometry | 1.1 MB | was 141 MB |
-| main-thread parse freeze | **~0** (pannable) | was 1.2 s; parse runs in a Web Worker (STEP 2), which now also *fetches* the file (Phase 5c). The design swap is rebuilt across ~7 frames at ≤ 6 ms each; longest load frame 42–58 ms vs 76–176 ms before (same session, headless) |
+| main-thread parse freeze | **~0** (pannable) | was 1.2 s; parse runs in a Web Worker (STEP 2), which now also *fetches* the file (Phase 5c). The design arrives progressively: skeleton parsed in slices, installed as proxies, geometry filled in visible-first — ≤ 6 ms/frame, ~8 frames. Longest load frame at leaf **50 ms** (was 76–176 ms, same session, headless; what remains is the leaf view's inline tessellation) |
 | parse wall | 1.0–1.2 s | now off the main thread (in the worker) |
 | combined peak heap (worker+main) | **~1.28 GB** | was 1.46 GB: single-copy reconstruction drops the concatenated wasm-side columns (main heap 434 → 254 MB). Worker memory reclaimed on terminate |
 | fit fps | 47–78 | browser WebGL2 / native Metal; chunking cost ~6% at fit |
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |
-| fit-view TTFF | **2.1 s** | was ~3.0 s inline (first paint no longer waits for tessellation — proxies show immediately). caravan-signoff 3.3 s → 2.2 s |
+| fit-view TTFF | **1.7 s** (first frame of the new design) | Phase 5c: the skeleton (hierarchy + chunk boxes) installs before any geometry, so first paint no longer waits for the column copy either; all geometry in ~150 ms later (`geometry_ms`). Same session before/after: caravel 2.7 → 1.7 s, caravan-signoff 3.0 → 2.0 s; longest fit frame 112 → 84 ms / 119 → 82 ms (machine under load; absolute numbers above this table's older 62 ms were measured on a quiet machine) |
 | edit re-tess frame | < 2 ms | dirty chunks stay inline (finer-chunking, SLICE 2 path unchanged); offload never touches the edit path. caravel 1.8 ms, caravan-signoff 0.4 ms |
 | DRC: biggest cell full check | **2.9 s** (wasm, single-threaded) | caravel_core, 2.5 M shapes, merge-first (Phase 5b); was 10.3 s cold / 9.6 s warm per-shape. Native 2.3 s. Includes the 95 ms tile-grid build (budgeted, replaces the atomic R-tree). 2923 tiles, slowest 5.1 ms |
 | DRC: re-check after one edit | **1.1 ms** (wasm) | tiles within reach of the edit (1 tile for a typical shape); was a 9.6 s whole-cell re-check |
@@ -242,6 +242,15 @@ still byte-identical).
   ships (`phase2b-worker`). Measured combined peak across worker+main during load:
   caravel ~1.46 GB, caravan-signoff ~1.39 GB, both << 4 GB; worker memory reclaimed
   on `terminate()`. (phase2b-findings, "STEP 2 — worker offload (SHIPPED)")
+- ~~No progressive render during load~~ **RESOLVED** (`phase5c-load-perf`
+  SLICE 2): the worker's metadata blob (caravel: 24.6 MB, ~460 k instance
+  records) is parsed in budgeted slices into a *skeleton* `CellDb` — hierarchy,
+  chunk tables, bboxes, empty shape stores — installed on a frame of its own
+  (every chunk draws as a bbox proxy), then each cell's geometry is copied in
+  (`ProgressiveLoad`, cells on screen first) and slotted into the live design
+  (`Cell::set_shapes`). Picking, DRC and save wait for the geometry. TTFF now
+  means *first frame of the new design*; `geometry_ms` is when every cell's
+  shapes are in.
 - ~~Residual ~200 ms design-swap frame~~ **RESOLVED** (`phase5c-load-perf`
   SLICE 1): the worker fetches the file itself (the main thread materialising a
   278 MB fetch body was a ~70 ms stall of its own), the reply only queues a
@@ -329,8 +338,6 @@ only merges across the hierarchy.
 Queued from Phase 4, unchanged:
 - **wgpu upgrade** — unblocks real WebGPU measurement (all browser numbers are
   WebGL2/ANGLE today) and reclaims the ~6% fit-view chunking cost.
-- **Progressive render during parse** (proxy the whole design before the first
-  chunk lands).
 
 Remaining editing follow-ons (deferred, named in code): edit one AREF placement
 vs. the master; drawing into an instanced master (draw is TOP-only); insert /

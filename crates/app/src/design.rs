@@ -53,12 +53,16 @@ pub struct Metrics {
     pub reconstruct_ms: f64,
     /// Frames the (budgeted) reconstruction spanned (Phase 5c).
     pub reconstruct_frames: usize,
+    /// Worker path (Phase 5c): wall ms from load start until every cell's
+    /// geometry is in place. `ttff_ms` is the first frame of the *skeleton*
+    /// (the new design's outline as proxies), which now comes much earlier.
+    pub geometry_ms: f64,
 }
 
 /// Everything the parse worker sends back: the serialized columns (left where
 /// the transfer put them, behind a [`ColumnSource`]) and metadata blob, plus the
 /// summary it computed (so the main thread doesn't rescan 3.9 M shapes). The
-/// worker path builds a [`Design`] from this via [`Reconstruction`].
+/// worker path turns this into a skeleton [`Design`] + [`Reconstruction`].
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
 pub struct WorkerMsg {
     pub name: String,
@@ -66,8 +70,6 @@ pub struct WorkerMsg {
     /// The three geometry columns. On the web: the transferred `ArrayBuffer`s,
     /// read per cell (Phase 5c single-copy reconstruction).
     pub columns: Box<dyn ColumnSource>,
-    /// Length of the coord column (i32 elements) — progress readout.
-    pub coord_count: usize,
     pub meta: Vec<u8>,
     pub bbox: [f64; 4],
     pub total_shapes: u64,
@@ -78,59 +80,101 @@ pub struct WorkerMsg {
     pub worker_heap_bytes: usize,
 }
 
-/// Main-thread bytes copied per `Deserializer::step` call between clock checks.
+/// Main-thread bytes copied (columns) or parsed (metadata) per step call
+/// between clock checks.
 const RECON_STEP_BYTES: usize = 4 << 20;
+const SKELETON_STEP_BYTES: usize = 1 << 20;
 
-/// A design being rebuilt from the worker's transferred buffers, **across
-/// frames** (Phase 5c). The worker reply only creates this; the app then
-/// advances it each frame within a time budget ([`step`](Self::step)) — one
-/// copy per cell column, straight from the transferred JS buffers, a big cell's
-/// coordinates in slices — and installs the finished [`Design`]. The swap no
-/// longer lands as one ~30–50 ms task between two frames.
+enum Phase {
+    /// Parsing the metadata blob into the skeleton (the old design still shows).
+    Skeleton(fluideda_core::SkeletonParse),
+    /// The skeleton is installed; copying cell geometry into it.
+    Loading(fluideda_core::ProgressiveLoad),
+}
+
+/// What one [`Reconstruction::step`] produced.
+pub enum ReconStep {
+    /// More to do next frame.
+    Progress,
+    /// The skeleton is complete: install this design now (it renders as proxies
+    /// until its cells' geometry arrives through the following steps).
+    SkeletonReady(Design),
+    /// Every cell's geometry is in place.
+    Done,
+}
+
+/// A worker-parsed design arriving **progressively** (Phase 5c). Each
+/// [`step`](Self::step) spends at most a frame budget: first parsing the
+/// metadata into a *skeleton* design — the whole hierarchy, chunk tables and
+/// bboxes, no geometry — which the app installs as soon as it is complete
+/// (every chunk draws as a bbox proxy); then copying cell geometry into the
+/// live design, visible cells first. One copy per cell column, straight from
+/// the transferred JS buffers; nothing on the main thread takes more than the
+/// budget plus one slice.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
 pub struct Reconstruction {
-    deser: fluideda_core::serialize::Deserializer,
+    phase: Phase,
     columns: Box<dyn ColumnSource>,
-    summary: WorkerMsg,
-    total_bytes: usize,
+    /// The worker's summary, consumed when the skeleton becomes a `Design`.
+    summary: Option<WorkerMsg>,
     spent_ms: f64,
     frames: usize,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
 impl Reconstruction {
-    /// Validate the metadata header; copies nothing yet.
-    pub fn new(mut m: WorkerMsg) -> anyhow::Result<Self> {
-        let deser = fluideda_core::serialize::Deserializer::new(std::mem::take(&mut m.meta))?;
-        // Every column byte gets copied once: coords (4 B/coord) + starts +
-        // layers (8 B/shape, near enough) — for the progress readout only.
-        let total_bytes = m.coord_count * 4 + m.distinct_polys * 8;
+    /// Validate the metadata header; nothing is parsed or copied yet.
+    pub fn new(mut m: WorkerMsg) -> anyhow::Result<Reconstruction> {
+        let parse = fluideda_core::SkeletonParse::new(std::mem::take(&mut m.meta))?;
         let columns = std::mem::replace(&mut m.columns, Box::new(NoColumns));
-        Ok(Reconstruction { deser, columns, summary: m, total_bytes, spent_ms: 0.0, frames: 0 })
+        Ok(Reconstruction { phase: Phase::Skeleton(parse), columns, summary: Some(m), spent_ms: 0.0, frames: 0 })
     }
 
-    /// Copy for up to `budget_ms`; `Ok(true)` when the CellDb is complete.
-    pub fn step(&mut self, budget_ms: f64) -> anyhow::Result<bool> {
+    /// Spend up to `budget_ms`. In the loading phase, cells in `priority` load
+    /// first and finished cell stores are pushed to `out`.
+    pub fn step(
+        &mut self,
+        budget_ms: f64,
+        priority: &[fluideda_core::CellId],
+        out: &mut Vec<(fluideda_core::CellId, fluideda_core::ShapeStore)>,
+    ) -> anyhow::Result<ReconStep> {
         let t = Instant::now();
         self.frames += 1;
-        let mut done = false;
-        while !done && t.elapsed().as_secs_f64() * 1e3 < budget_ms {
-            done = self.deser.step(self.columns.as_mut(), RECON_STEP_BYTES)?;
-        }
+        let within = |t: &Instant| t.elapsed().as_secs_f64() * 1e3 < budget_ms;
+        let result = match &mut self.phase {
+            Phase::Skeleton(p) => {
+                let mut done = false;
+                while !done && within(&t) {
+                    done = p.step(SKELETON_STEP_BYTES)?;
+                }
+                if done {
+                    let Phase::Skeleton(p) =
+                        std::mem::replace(&mut self.phase, Phase::Loading(fluideda_core::ProgressiveLoad::empty()))
+                    else {
+                        unreachable!()
+                    };
+                    let (db, load) = p.finish()?;
+                    self.phase = Phase::Loading(load);
+                    ReconStep::SkeletonReady(self.design(db))
+                } else {
+                    ReconStep::Progress
+                }
+            }
+            Phase::Loading(load) => {
+                let mut done = false;
+                while !done && within(&t) {
+                    done = load.step(self.columns.as_mut(), RECON_STEP_BYTES, priority, out)?;
+                }
+                if done { ReconStep::Done } else { ReconStep::Progress }
+            }
+        };
         self.spent_ms += t.elapsed().as_secs_f64() * 1e3;
-        Ok(done)
+        Ok(result)
     }
 
-    /// Fraction of the column bytes copied (panel readout).
-    pub fn progress(&self) -> f64 {
-        (self.deser.bytes_copied() as f64 / self.total_bytes.max(1) as f64).min(1.0)
-    }
-
-    /// The finished design (call once `step` returned `true`). Adopts the
-    /// worker's precomputed summary — no reparse, no shape rescan.
-    pub fn finish(self) -> anyhow::Result<Design> {
-        let db = self.deser.finish()?;
-        let m = self.summary;
+    /// The installable skeleton design, from the worker's summary.
+    fn design(&mut self, db: fluideda_core::CellDb) -> Design {
+        let m = self.summary.take().expect("skeleton built once");
         let layers = m.layers_packed.iter().map(|&v| Layer::new((v & 0xffff) as u16, (v >> 16) as u16)).collect();
         let metrics = Metrics {
             name: m.name,
@@ -139,21 +183,44 @@ impl Reconstruction {
             cell_defs: m.cell_defs,
             distinct_polys: m.distinct_polys,
             flattened: m.total_shapes,
-            wasm_heap_bytes: wasm_heap_bytes(), // main-thread heap after reconstruction
-            parse_heap_bytes: m.worker_heap_bytes, // the parse peak now lives in the worker
+            parse_heap_bytes: m.worker_heap_bytes, // the parse peak lives in the worker
             worker_used: true,
-            reconstruct_ms: self.spent_ms,
-            reconstruct_frames: self.frames,
             ..Default::default()
         };
-        Ok(Design {
+        Design {
             db,
             layers,
             bbox_min: glam::Vec2::new(m.bbox[0] as f32, m.bbox[1] as f32),
             bbox_max: glam::Vec2::new(m.bbox[2] as f32, m.bbox[3] as f32),
             total_shapes: m.total_shapes,
             metrics,
-        })
+        }
+    }
+
+    /// Has the skeleton been handed out (so the live design is this one)?
+    pub fn installed(&self) -> bool {
+        matches!(self.phase, Phase::Loading(_))
+    }
+
+    /// Is `cell`'s geometry in place? Meaningful once [`installed`](Self::installed).
+    pub fn is_loaded(&self, cell: fluideda_core::CellId) -> bool {
+        match &self.phase {
+            Phase::Skeleton(_) => false,
+            Phase::Loading(l) => l.is_loaded(cell),
+        }
+    }
+
+    /// Progress in `[0, 1]` of the current phase, and its name (panel readout).
+    pub fn progress(&self) -> (&'static str, f64) {
+        match &self.phase {
+            Phase::Skeleton(p) => ("reading hierarchy", p.progress()),
+            Phase::Loading(l) => ("loading geometry", l.progress()),
+        }
+    }
+
+    /// Main-thread ms spent so far, and frames spanned.
+    pub fn cost(&self) -> (f64, usize) {
+        (self.spent_ms, self.frames)
     }
 }
 
@@ -266,7 +333,7 @@ impl Metrics {
              \"cell_defs\":{},\"distinct_polys\":{},\"flattened\":{},\"triangles\":{},\
              \"vertex_bytes\":{},\"index_bytes\":{},\"wasm_heap_bytes\":{},\
              \"parse_heap_bytes\":{},\"worker_used\":{},\"reconstruct_ms\":{:.1},\
-             \"reconstruct_frames\":{}}}",
+             \"reconstruct_frames\":{},\"geometry_ms\":{:.1}}}",
             self.name.replace('"', "'"),
             self.file_bytes,
             self.parse_ms,
@@ -286,6 +353,7 @@ impl Metrics {
             self.worker_used,
             self.reconstruct_ms,
             self.reconstruct_frames,
+            self.geometry_ms,
         )
     }
 

@@ -101,6 +101,14 @@ impl Cell {
         }
     }
 
+    /// Replace the cell's shape store (Phase 5c progressive load: a skeleton
+    /// cell's geometry arrives after the cell is installed). Drops any cached
+    /// R-tree, which was built from the old store.
+    pub fn set_shapes(&mut self, shapes: ShapeStore) {
+        self.shapes = shapes;
+        self.index = OnceCell::new();
+    }
+
     /// The cell's spatial index, built on first access and cached thereafter.
     pub fn index(&self) -> &ShapeIndex {
         self.index.get_or_init(|| ShapeIndex::build(&self.shapes))

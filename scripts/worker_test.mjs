@@ -87,6 +87,7 @@ async function main() {
   const frames = await page.evaluate(() => window.__frames);
   const spikes = await page.evaluate(() => window.__spikes);
 
+
   await browser.close();
   console.log('frame spikes (>60ms) during load:', JSON.stringify(spikes));
 
@@ -101,7 +102,8 @@ async function main() {
   console.log(`worker_used:     ${metrics.worker_used}`);
   console.log(`parse (worker):  ${metrics.parse_ms} ms`);
   console.log(`reconstruct:     ${metrics.reconstruct_ms.toFixed(1)} ms main-thread, over ${metrics.reconstruct_frames} frame(s) (budgeted)`);
-  console.log(`TTFF:            ${metrics.ttff_ms} ms`);
+  console.log(`TTFF:            ${metrics.ttff_ms.toFixed(0)} ms  (first frame of the new design — skeleton proxies)`);
+  console.log(`geometry in:     ${metrics.geometry_ms.toFixed(0)} ms  (every cell's shapes in place)`);
   console.log(`worker heap:     ${mb(workerHeap)} MB  (parse peak, off main)`);
   console.log(`main heap:       ${mb(mainHeap)} MB`);
   console.log(`COMBINED peak:   ${mb(combined)} MB  (target << 4096)`);
