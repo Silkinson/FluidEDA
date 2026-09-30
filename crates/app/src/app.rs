@@ -231,6 +231,9 @@ pub struct FluidApp {
     /// per-tile results, the pending queue (edits first). Jobs run inline under
     /// `DRC_BUDGET_MS` each frame.
     drc: fluideda_core::DrcDriver,
+    /// The active rule deck (auto-detected from the design's layers on load;
+    /// the panel can override). Changing it drops all DRC state.
+    drc_deck: fluideda_core::Deck,
     /// `drc_bench` results (see `run_test_command`).
     drc_bench: Option<DrcBench>,
     /// Monotonic origin for the driver's pass timing.
@@ -273,6 +276,7 @@ impl FluidApp {
             }
         }
 
+        let deck = fluideda_core::Deck::detect(&design.layers);
         let mut app = Self {
             camera,
             db: design.db,
@@ -318,7 +322,8 @@ impl FluidApp {
             vertex_drag: None,
             geom_edited: HashSet::new(),
             drc_enabled: false,
-            drc: fluideda_core::DrcDriver::new(fluideda_core::DrcRules::default_table()),
+            drc: fluideda_core::DrcDriver::new(deck.rules()),
+            drc_deck: deck,
             drc_bench: None,
             app_t0: web_time::Instant::now(),
             dirty_keys: HashSet::new(),
@@ -368,7 +373,9 @@ impl FluidApp {
         self.drag_geom_start = None;
         self.vertex_drag = None;
         self.geom_edited.clear();
-        self.drc.clear();
+        // A new design picks its own deck (sky130 layers ⇒ the PDK table).
+        self.drc_deck = fluideda_core::Deck::detect(&self.layers);
+        self.drc.set_rules(self.drc_deck.rules());
         self.drc_bench = None;
         self.tool = Tool::Select;
         self.active_layer = 0;
@@ -786,6 +793,14 @@ impl FluidApp {
 
     // --- Phase 5 SLICE 3 / Phase 5b: DRC driver ------------------------------
 
+    /// Switch the rule deck: grids and results are deck-dependent, so the driver
+    /// starts over (any cells the user asked to check must be asked again).
+    fn set_deck(&mut self, deck: fluideda_core::Deck) {
+        self.drc_deck = deck;
+        self.drc.set_rules(deck.rules());
+        self.drc_bench = None;
+    }
+
     /// Milliseconds since app start (the driver's clock; it has none itself).
     fn now_ms(&self) -> f64 {
         self.app_t0.elapsed().as_secs_f64() * 1e3
@@ -1075,7 +1090,7 @@ impl FluidApp {
     #[cfg(target_arch = "wasm32")]
     fn publish_perf(&self) {
         let Some(w) = web_sys::window() else { return };
-        let b = self.drc_bench.unwrap_or_default();
+        let b = self.drc_bench.unwrap_or(DrcBench { cell: -1, ..Default::default() });
         let (drc_last_ms, drc_last_tiles) = self.drc.last_pass.map_or((-1.0, 0), |p| (p.ms, p.tiles));
         let json = format!(
             "{{\"max_frame_ms\":{:.1},\"frames\":{},\"worker_chunks\":{},\"in_flight\":{},\
@@ -1084,7 +1099,7 @@ impl FluidApp {
              \"drc_cell\":{},\"drc_shapes\":{},\"drc_grid_ms\":{:.1},\"drc_cold_ms\":{:.1},\
              \"drc_warm_ms\":{:.2},\"drc_warm_tiles\":{},\"drc_tiles\":{},\"drc_tile_max_ms\":{:.2},\
              \"drc_violations\":{},\"drc_busy\":{},\"drc_pending\":{},\"drc_total\":{},\
-             \"drc_last_pass_ms\":{:.1},\"drc_last_pass_tiles\":{}}}",
+             \"drc_last_pass_ms\":{:.1},\"drc_last_pass_tiles\":{},\"drc_deck\":\"{:?}\"}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -1108,6 +1123,7 @@ impl FluidApp {
             self.drc.violation_count(),
             drc_last_ms,
             drc_last_tiles,
+            self.drc_deck,
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -1470,10 +1486,17 @@ impl FluidApp {
                 _ => self.tool = Tool::Select,
             },
             Some("layer") => {
-                if let Some(i) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
-                    if i < self.layers.len() {
-                        self.active_layer = i;
-                    }
+                // `layer <index>` or `layer <layer>/<datatype>` (e.g. `layer 68/20`).
+                let arg = parts.next().unwrap_or("");
+                let idx = match arg.split_once('/') {
+                    Some((l, d)) => match (l.parse::<u16>(), d.parse::<u16>()) {
+                        (Ok(l), Ok(d)) => self.layers.iter().position(|&x| x == Layer::new(l, d)),
+                        _ => None,
+                    },
+                    None => arg.parse::<usize>().ok(),
+                };
+                if let Some(i) = idx.filter(|&i| i < self.layers.len()) {
+                    self.active_layer = i;
                 }
             }
             Some("draw_rect") => {
@@ -1536,6 +1559,12 @@ impl FluidApp {
                 }
             }
             Some("drc_on") => self.drc_enabled = true,
+            Some("drc_deck") => {
+                // `drc_deck sky130|blanket` — switch the rule deck.
+                if let Some(d) = parts.next().and_then(fluideda_core::Deck::from_name) {
+                    self.set_deck(d);
+                }
+            }
             Some("perf_reset") => {
                 // Restart the freeze measurement (longest frame) from now — lets
                 // the harness measure a window (e.g. a background DRC pass).
@@ -1816,6 +1845,15 @@ impl FluidApp {
                 self.drc.clear(); // off ⇒ zero cost, and no stale results on re-enable
             }
             if self.drc_enabled {
+                let mut deck = self.drc_deck;
+                egui::ComboBox::from_label("deck").selected_text(deck.label()).show_ui(ui, |ui| {
+                    for d in fluideda_core::Deck::ALL {
+                        ui.selectable_value(&mut deck, d, d.label());
+                    }
+                });
+                if deck != self.drc_deck {
+                    self.set_deck(deck);
+                }
                 if ui.button("Check visible cells").clicked() {
                     self.drc_enqueue_visible();
                 }
@@ -1844,11 +1882,16 @@ impl FluidApp {
                         ui.small("…");
                         break;
                     }
+                    // Named rule when the deck has one ("met1 m1.1 width").
+                    let what = match self.drc_deck.entry(v.layer) {
+                        Some(e) => match v.kind {
+                            fluideda_core::DrcKind::Width => format!("{} {} width", e.name, e.width_rule),
+                            fluideda_core::DrcKind::Spacing => format!("{} {} space", e.name, e.space_rule),
+                        },
+                        None => format!("{:?} L{}/{}", v.kind, v.layer.layer, v.layer.datatype),
+                    };
                     ui.small(format!(
-                        "{:?} L{}/{} cell {} @ ({:.2}, {:.2}) µm",
-                        v.kind,
-                        v.layer.layer,
-                        v.layer.datatype,
+                        "{what} · cell {} @ ({:.2}, {:.2}) µm",
                         cell,
                         v.bbox.min.x as f64 / 1000.0,
                         v.bbox.min.y as f64 / 1000.0

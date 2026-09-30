@@ -1,7 +1,7 @@
 // Merge-first tiled DRC measurement (Phase 5b), in the real environment (wasm).
 //
 // Loads caravel, then:
-//   1. `drc_bench` — synchronous, single-threaded check of the biggest cell
+//   1. `drc_bench` (blanket, then sky130 deck) — synchronous, single-threaded check of the biggest cell
 //      (caravel_core): GRID (the budgeted tile-grid build that replaced the
 //      atomic lazy R-tree), COLD (grid + every tile), the slowest tile (the
 //      unit the frame budget schedules), and WARM (the incremental re-check
@@ -49,18 +49,23 @@ async function main() {
   );
   await sleep(1500);
 
-  // 1. The biggest-cell bench (synchronous inside one frame; generous timeout).
-  await cmd(page, 'drc_bench');
-  const b = await waitFor(perf, page, (s) => s.drc_cold_ms >= 0, 'drc_bench result', 300000);
-  console.log(`caravel biggest cell (${b.drc_shapes} shapes = caravel_core), single-threaded wasm:`);
-  console.log(`  grid build:                     ${b.drc_grid_ms.toFixed(0)} ms`);
-  console.log(`  cold full check (grid + tiles): ${b.drc_cold_ms.toFixed(0)} ms over ${b.drc_tiles} tiles (slowest tile ${b.drc_tile_max_ms.toFixed(1)} ms)`);
-  console.log(`  warm re-check after one edit:   ${b.drc_warm_ms.toFixed(1)} ms over ${b.drc_warm_tiles} tile(s)`);
-  console.log(`  violations: ${b.drc_violations} (blanket 100/100 deck)`);
+  // 1. The biggest-cell bench (synchronous inside one frame; generous timeout),
+  //    under each rule deck (caravel auto-selects sky130 on load).
+  for (const deck of ['blanket', 'sky130']) {
+    await cmd(page, `drc_deck ${deck}`); await sleep(300);
+    await cmd(page, 'drc_bench');
+    const b = await waitFor(perf, page, (s) => s.drc_cell >= 0, 'drc_bench result', 300000);
+    console.log(`caravel biggest cell (${b.drc_shapes} shapes = caravel_core), ${deck} deck (${b.drc_deck}), single-threaded wasm:`);
+    console.log(`  grid build:                     ${b.drc_grid_ms.toFixed(0)} ms`);
+    console.log(`  cold full check (grid + tiles): ${b.drc_cold_ms.toFixed(0)} ms over ${b.drc_tiles} tiles (slowest tile ${b.drc_tile_max_ms.toFixed(1)} ms)`);
+    console.log(`  warm re-check after one edit:   ${b.drc_warm_ms.toFixed(1)} ms over ${b.drc_warm_tiles} tile(s)`);
+    console.log(`  violations: ${b.drc_violations}`);
+  }
 
   // 2. Interactive: a drawn too-narrow sliver flags (edit-local tiles only).
   await cmd(page, 'edit_mode'); await sleep(100);
   await cmd(page, 'drc_on'); await sleep(100);
+  await cmd(page, 'layer 68/20'); await sleep(100); // met1 — ruled by both decks
   const t0 = Date.now();
   await cmd(page, 'draw_rect 500000 500000 500040 502000'); // 40 nm x 2 µm sliver on TOP
   const s = await waitFor(state, page, (x) => x.drc_viols > 0, 'sliver width violation', 30000);

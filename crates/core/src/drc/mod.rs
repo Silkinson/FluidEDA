@@ -27,10 +27,12 @@
 //!
 //! No wgpu, no network — core stays the Web Worker seam.
 
+pub mod decks;
 pub mod driver;
 pub mod edges;
 pub mod grid;
 
+pub use decks::{Deck, DeckEntry, SKY130};
 pub use driver::{DrcDriver, DrcStep, PassStats, TileJob};
 pub use grid::{DrcGrid, DrcGridBuilder, TileKey, TILE_TARGET_SHAPES};
 

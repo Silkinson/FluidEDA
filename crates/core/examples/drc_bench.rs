@@ -6,7 +6,11 @@
 //!   * the incremental re-check cost of one edit (the tiles near one shape),
 //!   * violations by kind and layer.
 //!
-//! Run: cargo run --release -p fluideda-core --example drc_bench -- <file.gds> [blanket|sky130]
+//! With `--all`, also sweeps EVERY cell of the design (intra-cell) and reports
+//! flags by rule, the worst cells, and how many flags sit on a child instance's
+//! same-layer metal (the scope limitation, measured).
+//!
+//! Run: cargo run --release -p fluideda-core --example drc_bench -- <file.gds> [blanket|sky130] [--all]
 
 use fluideda_core::{
     build_grid, cell_tiles, check_tile, gather_tile, point_in_polygon, CellDb, CellId, DrcKind, DrcRules, EditOverlay,
@@ -18,14 +22,13 @@ use std::time::Instant;
 fn main() {
     let path = std::env::args().nth(1).expect("usage: drc_bench <file.gds> [blanket|sky130]");
     let deck = std::env::args().nth(2).unwrap_or_else(|| "blanket".into());
+    let sweep_all = std::env::args().any(|a| a == "--all");
     let bytes = std::fs::read(&path).expect("read gds");
     let t = Instant::now();
     let db = fluideda_core::gds::load_gds_db(&bytes).expect("parse");
     println!("parsed {} in {:.1} s", path, t.elapsed().as_secs_f64());
 
-    let rules = match deck.as_str() {
-        _ => DrcRules::default_table(),
-    };
+    let rules = fluideda_core::Deck::from_name(&deck).map(|d| d.rules()).unwrap_or_else(DrcRules::default_table);
     println!("deck: {deck} (max reach {} nm)", rules.max_reach());
 
     let biggest = (0..db.cells.len()).max_by_key(|&c| db.cell(c).shapes.len()).unwrap();
@@ -101,6 +104,38 @@ fn main() {
     top.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
     for ((l, d, k), n) in top.into_iter().take(8) {
         println!("  L{l}/{d} {k:?}: {n}");
+    }
+
+    if sweep_all {
+        let t = Instant::now();
+        let (mut total, mut flagged, mut covered) = (0usize, 0usize, 0usize);
+        let mut by_rule: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut worst: Vec<(usize, String)> = Vec::new();
+        for c in 0..db.cells.len() {
+            let v = fluideda_core::check_cell(db.cell(c), c, &overlay, &rules);
+            if v.is_empty() {
+                continue;
+            }
+            flagged += 1;
+            total += v.len();
+            for x in &v {
+                let name = match fluideda_core::Deck::from_name(&deck).and_then(|d| d.entry(x.layer)) {
+                    Some(e) => format!("{} {:?}", e.name, x.kind),
+                    None => format!("L{}/{} {:?}", x.layer.layer, x.layer.datatype, x.kind),
+                };
+                *by_rule.entry(name).or_default() += 1;
+                covered += covered_by_child(&db, c, x) as usize;
+            }
+            worst.push((v.len(), db.cell(c).name.clone()));
+        }
+        worst.sort_by(|a, b| b.cmp(a));
+        println!(
+            "ALL CELLS: {} cells in {:.1} s — {flagged} with flags, {total} flags, {covered} on a child's same-layer metal",
+            db.cells.len(),
+            t.elapsed().as_secs_f64()
+        );
+        println!("  by rule: {by_rule:?}");
+        println!("  worst cells: {:?}", &worst[..worst.len().min(8)]);
     }
 
     // A typical mid-size cell too (median-by-shapes of cells > 1k shapes).

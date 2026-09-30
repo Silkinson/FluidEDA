@@ -15,7 +15,7 @@
 //! Touching/overlapping shapes need no special case any more: they are one
 //! polygon after the union, so there is no edge pair between them to measure.
 //!
-//! ## The pair test (Euclidean metric, KLayout-style)
+//! ## The pair test
 //!
 //! For edges `a`, `b` (not adjacent in their ring):
 //!   1. **angle filter** — they must run in opposite directions
@@ -24,7 +24,13 @@
 //!   2. **facing** — clip each edge to the other's open half-plane on the
 //!      checked side (interior for width, exterior for space); both clipped
 //!      pieces must be non-empty;
-//!   3. **distance** — the clipped pieces' minimum distance must be `< d`.
+//!   3. **distance** — width between *parallel* edges uses the **projection**
+//!      metric (they must overlap in projection; distance = separation), as
+//!      Manhattan signoff does; every other pair uses the **Euclidean** minimum
+//!      distance of the clipped pieces (so corner-to-corner *spacing* counts);
+//!   4. **shielding** — the pair must see each other across the checked side;
+//!      a connection that lands on a vertex and enters the region's own corner
+//!      is blocked (KLayout's default "shielded" mode).
 //!
 //! Adjacent edges are checked for an **acute** vertex instead: an interior
 //! angle under 90° is a width violation (the region pinches to nothing at the
@@ -84,11 +90,13 @@ impl Seg {
 /// window's border — those are artifacts of clipping a tile, not real geometry
 /// (a real edge exactly on the border is at least `reach` from the tile core, so
 /// it cannot take part in any violation the tile reports).
-fn collect_edges(region: &Region, window: Option<&Bbox>) -> Vec<Edge> {
+fn collect_edges<'r>(region: &'r Region, window: Option<&Bbox>) -> (Vec<Edge>, Vec<&'r [Point]>) {
     let mut edges = Vec::new();
+    let mut rings: Vec<&[Point]> = Vec::new();
     let mut ring_id = 0u32;
     for poly in region {
         for ring in poly {
+            rings.push(ring.as_slice());
             let n = ring.len();
             if n < 2 {
                 ring_id += 1;
@@ -113,7 +121,7 @@ fn collect_edges(region: &Region, window: Option<&Bbox>) -> Vec<Edge> {
             ring_id += 1;
         }
     }
-    edges
+    (edges, rings)
 }
 
 #[inline]
@@ -139,13 +147,13 @@ pub fn check_region(region: &Region, d: i32, facing: Facing, window: Option<&Bbo
     if d <= 0 {
         return;
     }
-    let edges = collect_edges(region, window);
+    let (edges, rings) = collect_edges(region, window);
     if edges.len() < 2 {
         return;
     }
     let df = d as f64;
     let mut test = |a: &Edge, b: &Edge| {
-        let m = if adjacent(a, b) { acute_vertex(a, b, df, facing) } else { pair(a, b, df, facing) };
+        let m = if adjacent(a, b) { acute_vertex(a, b, df, facing) } else { pair(a, b, df, facing, &rings) };
         if let Some(m) = m {
             out.push(m);
         }
@@ -328,7 +336,7 @@ fn len(d: (i64, i64)) -> f64 {
 }
 
 /// The non-adjacent pair test (see the module note).
-fn pair(a: &Edge, b: &Edge, d: f64, facing: Facing) -> Option<BoxF> {
+fn pair(a: &Edge, b: &Edge, d: f64, facing: Facing, rings: &[&[Point]]) -> Option<BoxF> {
     let (da, db) = (delta(a), delta(b));
     // 1. Angle filter: facing edges run in opposite directions.
     if dot(da, db) >= 0 {
@@ -337,6 +345,16 @@ fn pair(a: &Edge, b: &Edge, d: f64, facing: Facing) -> Option<BoxF> {
     // 2. Facing: each edge clipped to the other's open half-plane on `facing`.
     let bs = clip_to_side(b, a, facing)?;
     let as_ = clip_to_side(a, b, facing)?;
+    // Width between PARALLEL edges uses the projection metric: they must
+    // overlap when projected onto each other, and the distance is their
+    // separation. That is how Manhattan signoff (sky130's Magic deck) measures
+    // width — a jog whose reflex corners are closer than `d` only diagonally is
+    // legal (the production cell sky130_fd_sc_hd__dfrtp_4 has one: 88.6 nm
+    // diagonal against li.1's 170 nm). Space stays Euclidean (corner-to-corner
+    // spacing is a real rule) and non-parallel pairs stay Euclidean.
+    if facing == Facing::Interior && cross(da, db) == 0 {
+        return projected_width(as_, bs, d);
+    }
     // 3. Distance.
     let (d2, ta, tb) = closest(as_, bs);
     if d2 >= d * d {
@@ -344,7 +362,107 @@ fn pair(a: &Edge, b: &Edge, d: f64, facing: Facing) -> Option<BoxF> {
     }
     let (a0, a1) = within(as_, bs, d, ta);
     let (b0, b1) = within(bs, as_, d, tb);
+    // 4. Shielding (KLayout's default): the edges must *see* each other across
+    //    the checked side. The half-plane test of step 2 is exact along an
+    //    edge's interior but not at its end: when the connection lands on a
+    //    vertex, the region's own corner can block it — e.g. two poly edges
+    //    that face each other's exterior across the band joining them, their
+    //    "gap" running through interior. So probe from the middle of each
+    //    violating portion to its nearest point on the other edge, and drop
+    //    the pair if either probe enters the wrong side at a vertex.
+    for (s, other, lo, hi, e_s, e_o) in [(as_, bs, a0, a1, a, b), (bs, as_, b0, b1, b, a)] {
+        let pm = s.at(0.5 * (lo + hi));
+        let q = other.at(closest_param(pm, other));
+        if blocked_at(e_o, q, pm, facing, rings) || blocked_at(e_s, pm, q, facing, rings) {
+            return None;
+        }
+    }
     Some(bbox_of(&[as_.at(a0), as_.at(a1), bs.at(b0), bs.at(b1)]))
+}
+
+/// The projection-metric width test for two parallel (antiparallel) pieces:
+/// the overlap of their projections, if positive and closer than `d`, is the
+/// violation; its marker spans both pieces over the overlap.
+fn projected_width(a: Seg, b: Seg, d: f64) -> Option<BoxF> {
+    let u = (a.q.0 - a.p.0, a.q.1 - a.p.1);
+    let l2 = u.0 * u.0 + u.1 * u.1;
+    if l2 <= 0.0 {
+        return None;
+    }
+    let t = |p: (f64, f64)| ((p.0 - a.p.0) * u.0 + (p.1 - a.p.1) * u.1) / l2;
+    let (tb0, tb1) = {
+        let (x, y) = (t(b.p), t(b.q));
+        (x.min(y), x.max(y))
+    };
+    let (o0, o1) = (tb0.max(0.0), tb1.min(1.0));
+    if o1 <= o0 {
+        return None; // no projection overlap: not a width pair under this metric
+    }
+    let sep2 = point_seg2(a.at(0.5 * (o0 + o1)), b);
+    if sep2 >= d * d {
+        return None;
+    }
+    // Points of b over the overlap: b's foot of a(o0) and a(o1).
+    let (pa0, pa1) = (a.at(o0), a.at(o1));
+    let fb0 = b.at(closest_param(pa0, b));
+    let fb1 = b.at(closest_param(pa1, b));
+    Some(bbox_of(&[pa0, pa1, fb0, fb1]))
+}
+
+/// Parameter of the point on `s` closest to `x`.
+fn closest_param(x: (f64, f64), s: Seg) -> f64 {
+    let v = (s.q.0 - s.p.0, s.q.1 - s.p.1);
+    let l2 = v.0 * v.0 + v.1 * v.1;
+    if l2 > 0.0 {
+        (((x.0 - s.p.0) * v.0 + (x.1 - s.p.1) * v.1) / l2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Is the connection from `at` (a point on edge `e`) toward `toward` blocked
+/// by the region's corner at `at`? Only when `at` is one of `e`'s vertices —
+/// elsewhere on the edge the half-plane test already decided. Blocked means
+/// the direction enters the interior wedge (space) / exterior wedge (width).
+fn blocked_at(e: &Edge, at: (f64, f64), toward: (f64, f64), facing: Facing, rings: &[&[Point]]) -> bool {
+    let near = |p: Point| (p.x as f64 - at.0).abs() < 1e-6 && (p.y as f64 - at.1).abs() < 1e-6;
+    let ring = rings[e.ring as usize];
+    let n = ring.len();
+    let k = e.idx as usize;
+    let (prev, v, next) = if near(e.p0) {
+        (ring[(k + n - 1) % n], ring[k], ring[(k + 1) % n])
+    } else if near(e.p1) {
+        (ring[k], ring[(k + 1) % n], ring[(k + 2) % n])
+    } else {
+        return false;
+    };
+    let r = (toward.0 - at.0, toward.1 - at.1);
+    if r.0 == 0.0 && r.1 == 0.0 {
+        return false;
+    }
+    let out = ((next.x - v.x) as f64, (next.y - v.y) as f64); // outgoing edge direction
+    let back = ((prev.x - v.x) as f64, (prev.y - v.y) as f64); // reversed incoming
+    // Interior (on the left of both edges) is the CCW sector from `out` to `back`.
+    match facing {
+        Facing::Exterior => in_ccw_sector(out, back, r),
+        Facing::Interior => in_ccw_sector(back, out, r),
+    }
+}
+
+/// Is `r` strictly inside the counter-clockwise sector from `from` to `to`?
+fn in_ccw_sector(from: (f64, f64), to: (f64, f64), r: (f64, f64)) -> bool {
+    let cr = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
+    let c = cr(from, to);
+    if c > 0.0 {
+        cr(from, r) > 0.0 && cr(r, to) > 0.0
+    } else if c < 0.0 {
+        // Reflex sector: everything outside the closed sector from `to` to `from`.
+        !(cr(to, r) >= 0.0 && cr(r, from) >= 0.0)
+    } else if from.0 * to.0 + from.1 * to.1 < 0.0 {
+        cr(from, r) > 0.0 // straight: the half-plane on the left of `from`
+    } else {
+        false // degenerate spike — not a shield
+    }
 }
 
 /// The piece of `s` strictly on `facing` side of `l`'s supporting line (left =
@@ -508,9 +626,8 @@ mod tests {
         assert_eq!(v.len(), 1, "exactly the thin arm: {v:?}");
         let m = v[0];
         assert!(m[0] >= 0.0 && m[2] <= 60.0, "marker spans the arm's width: {m:?}");
-        // Euclidean metric: the outer edge is within 100 nm of the arm's inner
-        // edge from y = 200 − √(100² − 60²) = 120 up, not only above the foot.
-        assert!((m[1] - 120.0).abs() < 1e-3 && m[3] == 1000.0, "marker covers the arm: {m:?}");
+        // Projection metric: exactly where the arm's two edges overlap.
+        assert_eq!(m, [0.0, 200.0, 60.0, 1000.0], "marker covers the arm");
     }
 
     #[test]
@@ -555,10 +672,56 @@ mod tests {
     }
 
     #[test]
-    fn diagonal_neck_between_overlapping_squares() {
-        // Squares overlapping in a 50×50 corner patch: the neck is 70.7 nm wide.
-        let v = check(&[rect(0, 0, 1000, 1000), rect(950, 950, 1000, 1000)], 100, Facing::Interior);
-        assert!(!v.is_empty(), "70.7 nm neck < 100");
-        assert!(check(&[rect(0, 0, 1000, 1000), rect(950, 950, 1000, 1000)], 70, Facing::Interior).is_empty());
+    fn corner_across_the_interior_is_shielded_not_a_space_violation() {
+        // Two stems joined by a band (the sky130 xor3 poly shape, reduced):
+        // the stems' facing edges are 15 nm apart in x, 150 nm apart in y, and
+        // each lies on the other's exterior half-plane — but the straight line
+        // between their corners runs through the band. Not a space violation.
+        let poly = vec![
+            Point::new(3985, 1085),
+            Point::new(4150, 1085),
+            Point::new(4150, 105),
+            Point::new(4300, 105),
+            Point::new(4300, 1085),
+            Point::new(5080, 1085),
+            Point::new(5080, 1235),
+            Point::new(4135, 1235),
+            Point::new(4135, 2615),
+            Point::new(3985, 2615),
+        ];
+        assert!(check(&[poly], 210, Facing::Exterior).is_empty());
+        // The staircase bend (caravel_core's P&R output): its reflex corners are
+        // 99 nm apart diagonally, but width between parallel edges is measured
+        // by projection (Manhattan signoff), and no parallel pair overlaps
+        // closer than 140. Not a width violation.
+        let bend = vec![
+            Point::new(67390, 3504140),
+            Point::new(68930, 3504140),
+            Point::new(68930, 3504280),
+            Point::new(67460, 3504280),
+            Point::new(67460, 3504820),
+            Point::new(67320, 3504820),
+            Point::new(67320, 3504210),
+            Point::new(67390, 3504210),
+        ];
+        assert!(check(&[bend.clone()], 140, Facing::Interior).is_empty());
+        // …while a genuinely narrow part of the same bend still flags: thin the
+        // vertical wire to 100 nm.
+        let mut thin = bend.clone();
+        thin[3] = Point::new(67420, 3504280);
+        thin[4] = Point::new(67420, 3504820);
+        assert_eq!(check(&[thin], 140, Facing::Interior).len(), 1);
+    }
+
+    #[test]
+    fn diagonal_neck_is_a_space_check_matter_not_width_under_projection() {
+        // Squares overlapping in a 50×50 corner patch: a 70.7 nm diagonal neck.
+        // Width between parallel edges is projection-measured (the documented
+        // trade-off of Manhattan signoff semantics), so no width flag…
+        let sq = [rect(0, 0, 1000, 1000), rect(950, 950, 1000, 1000)];
+        assert!(check(&sq, 100, Facing::Interior).is_empty());
+        // …whereas a real thin neck (projection overlap) does flag.
+        let neck = [rect(0, 0, 1000, 1000), rect(1000, 400, 500, 60), rect(1500, 0, 1000, 1000)];
+        assert_eq!(check(&neck, 100, Facing::Interior).len(), 1);
     }
 }

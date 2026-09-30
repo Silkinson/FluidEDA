@@ -43,7 +43,7 @@ pub use chunk::{Chunk, ChunkId};
 pub use cull::{cull, cull_counted, cull_with_overlay, CellDraw, CullStats, VisibleSet};
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
 pub use drc::{
-    build_grid, cell_tiles, check_cell, check_tile, check_tile_columns, gather_tile, DrcDriver, DrcGrid,
+    build_grid, cell_tiles, check_cell, check_tile, check_tile_columns, gather_tile, Deck, DrcDriver, DrcGrid,
     DrcGridBuilder, DrcKind, DrcRules, DrcStep, LayerRule, PassStats, TileInput, TileJob, TileKey, Violation,
 };
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, Shape};

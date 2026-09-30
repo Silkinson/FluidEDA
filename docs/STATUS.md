@@ -35,6 +35,22 @@ follow-ups Phase 5's own DRC measurements named.
   9.6 s → 1.1 ms**; a background pass never pushes a frame past ~19 ms.
   Scheduler = `DrcDriver` (core, pure state machine: grids, per-tile results,
   generation-stamped jobs) — the seam SLICE 3's worker pool plugs into.
+* **SLICE 2 — a real rule deck + signoff measurement semantics.** `Deck::Sky130`
+  (`drc/decks.rs`): width/space for 22 drawing layers with the manual's rule
+  ids (`m1.1`, `li.3`, …), **drawing datatypes only** (pins, labels, markers
+  unchecked), auto-selected when a design carries the sky130 back-end stack;
+  a panel picker switches decks. Validating it against production data fixed
+  two measurement semantics: **shielding** (a pair whose connection lands on a
+  vertex and runs through the region's own corner is not a violation — the
+  standard-cell library went 286 → 4 flags) and **projection width** for
+  parallel edges (a jog whose reflex corners are only *diagonally* closer than
+  min width is legal: the production cell `sky130_fd_sc_hd__dfrtp_4` has an
+  88.6 nm one against li.1's 170 nm). Result (sky130 deck): **caravel_core 0
+  flags**, the 440-cell standard-cell library 4 flags in 2 cells (genuine
+  intra-cell geometry). Whole-chip intra-cell sweep: 3,305 flags in 252 of
+  1,014 cells, concentrated in `sky130_fd_io` pad cells whose 45° corner-fill
+  triangles and stubs only merge in hierarchical context — the measured case
+  for in-context (flattened-window) checking.
 
 **Phase 5 shipped: FluidEDA authors geometry and checks it.** Three slices on
 `phase5-authoring-drc`:
@@ -82,7 +98,7 @@ still byte-identical).
 | 3 — real editing | `phase3-real-editing` | ✅ done | SLICE 1: GDS export (round-trip + pixel-match). SLICE 2: non-TOP editing under the transform stack (landmine eliminated), master-edit semantics, finer chunking (edit 22→0.8 ms), two-browser non-TOP convergence |
 | 4 — integrate + fit-view offload | `phase4` | ✅ done | STEP 1: merged parse-worker + real-editing onto the trunk (build + 39 core + golden green). STEP 2: fit-view tessellation offloaded to a worker (bbox proxy → stream). Longest fit frame ~1.1–1.35 s → **62–64 ms** (caravel / caravan-signoff), leaf unchanged, edit < 2 ms |
 | 5 — authoring + DRC | `phase5-authoring-drc` | ✅ done | SLICE 1: rect/poly draw tools, geometry-carrying CRDT adds with stable `(client, seq)` ids — concurrent adds converge; export covers adds (0 px round-trip). SLICE 2: vertex editing via `SetPoints` (LWW on same shape), non-TOP masters. SLICE 3: intra-cell DRC (exact spacing, per-shape width), overlay-composited, 8 ms/frame budget; caravel_core 10.3 s cold / 9.6 s warm (wasm) |
-| 5b — DRC hardening | `phase5b-drc-hardening` | ◑ SLICE 1 done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid. caravel_core: 611,680 → 61 flags (all 61 = child-instance context); full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms |
+| 5b — DRC hardening | `phase5b-drc-hardening` | ◑ SLICE 1–2 done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine) |
 | 6 — backend/OASIS | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS (moved from the old "Phase 5" label — see the ledger-reshape note) |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
@@ -101,7 +117,8 @@ still byte-identical).
 | DRC: biggest cell full check | **2.9 s** (wasm, single-threaded) | caravel_core, 2.5 M shapes, merge-first (Phase 5b); was 10.3 s cold / 9.6 s warm per-shape. Native 2.3 s. Includes the 95 ms tile-grid build (budgeted, replaces the atomic R-tree). 2923 tiles, slowest 5.1 ms |
 | DRC: re-check after one edit | **1.1 ms** (wasm) | tiles within reach of the edit (1 tile for a typical shape); was a 9.6 s whole-cell re-check |
 | DRC: background pass | 8.0 s wall, longest frame **19.1 ms** | "check visible" over caravel_core at leaf, 8 ms/frame budget, inline (no worker yet) |
-| DRC: flags on caravel_core | **61** (blanket 100/100) | was 611,680. All 61 lie on same-layer metal of a child instance (70 nm staircase bends a via cell fills in context) — the intra-cell scope, not false geometry |
+| DRC: flags on caravel_core | **0** (sky130 and blanket) | was 611,680 (per-shape, blanket). SLICE 1's merge-first left 61 staircase-bend diagonals; SLICE 2's projection width (sky130 signoff semantics) clears them |
+| DRC: whole caravel, every cell (sky130) | 3,305 flags / 252 of 1,014 cells, 3.6 s native | intra-cell sweep (`drc_bench … sky130 --all`); dominated by `sky130_fd_io` pad cells (45° corner-fill triangles and stubs that merge only in hierarchical context). Stdcell library: 4 flags / 2 of 440 cells |
 | DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 
@@ -162,6 +179,17 @@ still byte-identical).
   what is found (tested). Manhattan pairs use 1-D strip sweeps (H with H, V
   with V — perpendicular edges never face); only diagonals use an R-tree. The
   edge check went 6.6 s → 0.5 s on caravel_core with that split.
+- **Width between parallel edges is projection-measured; everything else
+  Euclidean; pairs are shielded (Phase 5b SLICE 2).** Measured against
+  production sky130 data, not chosen: Euclidean width flagged a jog in the
+  shipping cell `dfrtp_4` (88.6 nm diagonal vs li.1 170 nm) and every P&R
+  staircase bend in caravel_core; unshielded space flagged 272 corner-across-
+  interior poly configurations in the standard cells. The accepted cost: a
+  corner-overlap "diagonal neck" is not a width flag (tested, documented).
+- **Rule decks are data, drawing datatypes only.** `Deck::Sky130` (22 layers,
+  basic width/space, rule ids from the manual; `dnwell` omitted — its 6.3 µm
+  space would widen every tile's reach); `Deck::Blanket` (100/100 everywhere).
+  Auto-detected per design (li1+met1+met2 drawing present ⇒ sky130).
 - **The DRC grid index replaces the R-tree for DRC.** Uniform buckets (bbox ⊕
   reach), two budgeted linear passes, deck-dependent (rebuilt on deck change),
   edit-independent (base never mutates). Dense buckets split k×k by shape
@@ -236,8 +264,10 @@ still byte-identical).
 - **DRC deferrals, updated by Phase 5b SLICE 1:** merge-first width is DONE
   (the 593 k fracture flags are gone); the atomic index build is DONE (grid,
   budgeted); non-rect width is exact now (edge pairs). Still open below:
-  cross-instance context (now *measured* as the only remaining source of flags
-  on caravel_core), the rule table, and DRC-in-worker.
+  cross-instance context (measured: on the whole chip it is what remains —
+  pad-cell corner fills and stubs), and DRC-in-worker. The rule table is DONE
+  (SLICE 2: sky130 subset; wide-metal / EOL / enclosure / density rules are not
+  modeled).
 - **DRC deferrals (phase5 SLICE 3 — scoped honestly, in the code too):**
   - **Cross-instance / hierarchical spacing is NOT checked.** Checks are
     intra-cell; a shape in cell A near an instance of cell B is invisible to
