@@ -17,6 +17,14 @@
 //! applied with no origin, so the local [`UndoManager`] — which tracks only this
 //! client's origin — never captures a peer's edits. That is what makes undo
 //! **per-user**: undo in A reverts only A's edits.
+//!
+//! **Connection lifecycle (Phase 6).** The server keeps the room's document:
+//! its first message to a joining peer is the whole room state, so a late
+//! joiner converges. The session pushes its own whole state when the socket
+//! *opens* (a browser WebSocket drops anything sent while still connecting —
+//! before Phase 6 the join push was lost that way on the web), which also
+//! merges edits made offline or while a dropped connection was down. A peer
+//! whose design differs from the room's is refused ([`Session::refused`]).
 
 use anyhow::Result;
 use ewebsock::{WsMessage, WsReceiver, WsSender};
@@ -86,9 +94,24 @@ pub struct AddedGeom {
     pub points: Vec<Point>,
 }
 
+/// The design a room is bound to (Phase 6): the server writes it into the
+/// document's `meta` map when the first peer with a design joins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomDesign {
+    /// SHA-256 of the design file's bytes (lower-case hex).
+    pub hash: String,
+    /// The shape-id scheme it was parsed with.
+    pub ids: u32,
+    /// Its file name (display only).
+    pub name: String,
+}
+
 /// Message envelope on the wire. Byte 0 tags the channel.
 ///   0x01 = yrs document update (markers + edits share the doc)
 ///   0x02 = awareness/presence update
+///
+/// The server's only other message is a JSON text frame refusing the join
+/// (`{"error":"design_mismatch",...}`), followed by a close.
 pub mod tag {
     pub const DOC: u8 = 0x01;
     pub const AWARENESS: u8 = 0x02;
@@ -105,6 +128,8 @@ pub struct Session {
     doc: Doc,
     markers: ArrayRef,
     edits: MapRef,
+    /// Room metadata, written only by the server (the design binding).
+    meta: MapRef,
     undo: UndoManager<()>,
     /// State vector already broadcast; the next broadcast sends only the delta
     /// past it. Advanced after each local mutation AND after applying a remote
@@ -114,6 +139,14 @@ pub struct Session {
     /// tracks it, so only local edits are undoable.
     origin: Origin,
     socket: Option<Socket>,
+    /// The socket has opened (sends before that are dropped by browsers).
+    opened: bool,
+    /// The room's state has arrived since the socket opened.
+    synced: bool,
+    /// Why the last connection ended, if it failed.
+    error: Option<String>,
+    /// The room's design, when the server refused us for having another.
+    refused: Option<RoomDesign>,
     pub local: Presence,
     pub remote: HashMap<u64, Presence>,
     client_id: u64,
@@ -131,6 +164,7 @@ impl Session {
         let doc = Doc::new();
         let markers = doc.get_or_insert_array("markers");
         let edits = doc.get_or_insert_map("edits");
+        let meta = doc.get_or_insert_map("meta");
         let client_id = doc.client_id();
         let origin = Origin::from(client_id);
 
@@ -153,10 +187,15 @@ impl Session {
             doc,
             markers,
             edits,
+            meta,
             undo,
             last_sv,
             origin,
             socket: None,
+            opened: false,
+            synced: false,
+            error: None,
+            refused: None,
             local,
             remote: HashMap::new(),
             client_id,
@@ -171,26 +210,77 @@ impl Session {
         Ok(s)
     }
 
-    /// Open the socket for an offline session (the "Join room" path). On connect
-    /// we push our whole doc state so a peer already in the room converges with
-    /// our local edits.
+    /// Open the socket for an offline session (the "Join room" path), or
+    /// reconnect after a drop. When it opens, [`poll`](Self::poll) pushes our
+    /// whole doc state, so the room merges edits made before joining; the
+    /// server's first message is the whole room state.
     pub fn join(&mut self, url: &str) -> Result<()> {
         let (tx, rx) = ewebsock::connect(url, ewebsock::Options::default())
             .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
         self.socket = Some(Socket { tx, rx });
-        // Broadcast full state from the empty base so peers merge our edits.
-        let full = self.doc.transact().encode_state_as_update_v1(&StateVector::default());
-        self.send_doc(full);
+        self.opened = false;
+        self.synced = false;
+        // `error` stays until the socket opens: while reconnecting, it still
+        // says why the last connection ended.
+        self.refused = None;
         Ok(())
     }
 
+    /// Close the socket (edits keep working offline).
+    pub fn disconnect(&mut self) {
+        self.socket = None;
+        self.opened = false;
+        self.synced = false;
+    }
+
+    /// The socket is open.
     pub fn is_connected(&self) -> bool {
-        self.socket.is_some()
+        self.socket.is_some() && self.opened
+    }
+
+    /// A socket exists but has not opened yet.
+    pub fn is_connecting(&self) -> bool {
+        self.socket.is_some() && !self.opened
+    }
+
+    /// The room's state has arrived on the current connection: the server
+    /// accepted us and we hold everything the room held when we joined.
+    pub fn is_synced(&self) -> bool {
+        self.is_connected() && self.synced
+    }
+
+    /// Why the last connection ended, if it failed (kept while reconnecting,
+    /// cleared when a socket opens).
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Set when the server refused the join because the room holds another
+    /// design: that design.
+    pub fn refused(&self) -> Option<&RoomDesign> {
+        self.refused.as_ref()
+    }
+
+    /// The design the room is bound to, once its state has arrived.
+    pub fn room_design(&self) -> Option<RoomDesign> {
+        let txn = self.doc.transact();
+        let get = |k: &str| match self.meta.get(&txn, k) {
+            Some(Out::Any(Any::String(s))) => Some(s.to_string()),
+            _ => None,
+        };
+        Some(RoomDesign {
+            hash: get("design")?,
+            ids: get("ids").and_then(|v| v.parse().ok()).unwrap_or(0),
+            name: get("design_name").unwrap_or_default(),
+        })
     }
 
     /// Publish our cursor (world nm). No-op when offline.
     pub fn set_cursor(&mut self, world: Vec2) {
         self.local.cursor = world;
+        if !self.opened {
+            return;
+        }
         let Some(sock) = &mut self.socket else { return };
         let mut buf = vec![tag::AWARENESS];
         buf.extend_from_slice(&self.client_id.to_le_bytes());
@@ -407,7 +497,12 @@ impl Session {
         }
     }
 
+    /// Send an update — only on an open socket: anything a connecting socket
+    /// would drop is covered by the whole-state push when it opens.
     fn send_doc(&mut self, update: Vec<u8>) {
+        if !self.opened {
+            return;
+        }
         if let Some(sock) = &mut self.socket {
             let mut buf = vec![tag::DOC];
             buf.extend_from_slice(&update);
@@ -415,17 +510,44 @@ impl Session {
         }
     }
 
-    /// Pump incoming messages. Returns true if the shared doc or presence changed
-    /// (so the app can reconcile + repaint).
+    /// Pump incoming messages. Returns true if the shared doc, presence or
+    /// the connection state changed (so the app can reconcile + repaint).
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         let mut incoming: Vec<Vec<u8>> = Vec::new();
+        let mut opened = false;
+        let mut ended: Option<Option<String>> = None; // Some(reason) once the socket is gone
         if let Some(sock) = &mut self.socket {
             while let Some(ev) = sock.rx.try_recv() {
-                if let ewebsock::WsEvent::Message(WsMessage::Binary(buf)) = ev {
-                    incoming.push(buf);
+                match ev {
+                    ewebsock::WsEvent::Opened => opened = true,
+                    ewebsock::WsEvent::Message(WsMessage::Binary(buf)) => incoming.push(buf),
+                    ewebsock::WsEvent::Message(WsMessage::Text(t)) => {
+                        // The server's only text frame: a refusal.
+                        self.refused = parse_refusal(&t);
+                        ended = Some(Some(match &self.refused {
+                            Some(d) => format!("room holds another design: {} ({})", d.name, &d.hash[..d.hash.len().min(12)]),
+                            None => format!("server: {t}"),
+                        }));
+                    }
+                    ewebsock::WsEvent::Message(_) => {}
+                    ewebsock::WsEvent::Error(e) => {
+                        ended.get_or_insert(Some(e));
+                    }
+                    ewebsock::WsEvent::Closed => {
+                        ended.get_or_insert(None);
+                    }
                 }
             }
+        }
+        if opened {
+            // Push our whole state now that the socket can carry it: the room
+            // merges whatever we did before joining (or while disconnected).
+            self.opened = true;
+            self.error = None;
+            let full = self.doc.transact().encode_state_as_update_v1(&StateVector::default());
+            self.send_doc(full);
+            changed = true;
         }
         for buf in incoming {
             match buf.first().copied() {
@@ -438,6 +560,7 @@ impl Session {
                             let _ = txn.apply_update(update);
                         }
                         self.last_sv = self.doc.transact().state_vector();
+                        self.synced = true;
                         changed = true;
                     }
                 }
@@ -450,8 +573,41 @@ impl Session {
                 _ => {}
             }
         }
+        if let Some(reason) = ended {
+            self.error = reason.or_else(|| Some("connection closed".to_string()));
+            self.disconnect();
+            changed = true;
+        }
         changed
     }
+}
+
+/// The room's design from a `{"error":"design_mismatch","design":{...}}`
+/// refusal. (Hand-parsed: the sync crate has no JSON dependency, and the
+/// server writes exactly this shape.)
+fn parse_refusal(t: &str) -> Option<RoomDesign> {
+    if !t.contains("\"design_mismatch\"") {
+        return None;
+    }
+    let field = |k: &str| -> Option<String> {
+        let at = t.find(&format!("\"{k}\":"))? + k.len() + 3;
+        let rest = t[at..].trim_start();
+        if let Some(r) = rest.strip_prefix('"') {
+            let mut out = String::new();
+            let mut chars = r.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => return Some(out),
+                    '\\' => out.push(chars.next()?),
+                    c => out.push(c),
+                }
+            }
+            None
+        } else {
+            Some(rest.chars().take_while(|c| c.is_ascii_digit()).collect())
+        }
+    };
+    Some(RoomDesign { hash: field("hash")?, ids: field("ids")?.parse().ok()?, name: field("name").unwrap_or_default() })
 }
 
 /// One op of [`Session::apply_batch`].
@@ -610,6 +766,17 @@ fn hsv(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_names_the_rooms_design() {
+        // Exactly what the server sends (serde_json, room.rs `DesignKey`).
+        let t = r#"{"error":"design_mismatch","room":"r1","design":{"hash":"ab12","ids":2,"name":"my \"chip\".gds"}}"#;
+        assert_eq!(
+            parse_refusal(t),
+            Some(RoomDesign { hash: "ab12".into(), ids: 2, name: "my \"chip\".gds".into() })
+        );
+        assert_eq!(parse_refusal(r#"{"error":"something_else"}"#), None);
+    }
 
     #[test]
     fn key_round_trip() {

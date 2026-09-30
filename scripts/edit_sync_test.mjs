@@ -7,16 +7,27 @@
 //   1. an edit in A shows in B (move + delete);
 //   2. concurrent edits of DIFFERENT shapes converge (both see both);
 //   3. undo in A reverts only A's edit (B's survives).
+// ...through the Phase 5d edit ops; Phase 6 adds the server's side:
+//   21. a LATE joiner that opens only `?room=` gets the design from the blob
+//       store and the whole room state, and matches A exactly;
+//   22. a peer with ANOTHER design is refused (and the room is untouched),
+//       then loads the room's design from the store and converges.
 //
 // Prereqs (started by the caller):
-//   cargo run -p fluideda-server &        # relay on :9000
-//   trunk serve --release &               # app on :8080, proxies /ws
+//   cargo run -p fluideda-server &        # server on :9000 (store: ./store)
+//   trunk serve --release &               # app on :8080, proxies /ws, /blobs, /rooms
 //
+// Each run uses a fresh room (rooms persist on the server now).
 // Run: node scripts/edit_sync_test.mjs
 import { launch } from './launch.mjs';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8080';
-const URL = `${BASE}/?file=/assets/edit_fixture.gds`; // TOP has direct editable shapes
+const ROOM = process.env.ROOM || `sync-${Date.now()}`;
+const URL = `${BASE}/?file=/assets/edit_fixture.gds&room=${ROOM}`; // TOP has direct editable shapes
+// The edit-derived counts two converged peers must agree on.
+const SHAPE_STATE = ['edited', 'moves', 'deletes', 'adds', 'geom_edits', 'hidden', 'adds_nontop', 'top_shapes'];
+const same = (a, b) => SHAPE_STATE.every((k) => a[k] === b[k]);
+const pick = (s) => Object.fromEntries(SHAPE_STATE.map((k) => [k, s[k]]));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -246,6 +257,51 @@ async function main() {
     await cmd(B, 'undo');
     const a20 = await waitFor(A, (s) => s.hidden === 0 && s.adds === s0.adds, "A sees B's undo of the flatten");
     check(a20.hidden === 0 && a20.adds === s0.adds, 'one undo restores the flattened placement everywhere');
+
+    // --- Phase 6: the server keeps the room ------------------------------------
+
+    // 21. A LATE joiner: C opens only the room link. The design comes from the
+    //     server's blob store (A or B uploaded it when the room was bound), the
+    //     room state from the server's document — neither from a live peer.
+    //     (B leaves first: under the default SwiftShader GL, a third page that
+    //     renders every frame starves a new page's context creation — the app
+    //     never starts. Two live pages at a time is the harness's limit.)
+    const aNow = await state(A);
+    check(/^(stored|present)$/.test(aNow.upload), `A's design is in the blob store (${aNow.upload})`);
+    await ctxB.close();
+    const ctxC = await browser.newContext();
+    const C = await ctxC.newPage();
+    const clog = [];
+    C.on('console', (m) => clog.push(`[${m.type()}] ${m.text()}`));
+    C.on('pageerror', (e) => clog.push(`[pageerror] ${e.message}`));
+    C.on('crash', () => clog.push('[crash]'));
+    process.on('exit', () => { if (fails.length) console.log('C console:\n' + clog.slice(-25).join('\n')); });
+    await C.goto(`${BASE}/?room=${ROOM}`);
+    const c21 = await waitFor(C, (s) => s.synced && same(s, aNow), 'C (late joiner) matches A', 30000);
+    check(c21.design_hash === aNow.design_hash && c21.room_design === aNow.design_hash,
+      `C loaded the room's design from /blobs (${c21.design_hash.slice(0, 12)})`);
+    check(same(c21, aNow), `late joiner converges to A exactly ${JSON.stringify(pick(c21))}`);
+
+    // ...and is a full peer: its edit reaches A.
+    await cmd(C, 'select 1'); await sleep(150); await cmd(C, 'nudge');
+    const a21 = await waitFor(A, (s) => s.edited === aNow.edited + 1, "A sees the late joiner's edit");
+    check(a21.edited === aNow.edited + 1, 'the late joiner edits like any peer (C→A)');
+
+    // 22. D has ANOTHER design (the embedded default): refused, room untouched.
+    await ctxC.close();
+    const ctxD = await browser.newContext();
+    const D = await ctxD.newPage();
+    await D.goto(`${BASE}/?file=/assets/hier.gds&room=${ROOM}`);
+    const d22 = await waitFor(D, (s) => s.refused, 'D refused (another design)', 30000);
+    check(d22.refused && d22.join_error.includes('edit_fixture'), `D refused: "${d22.join_error}"`);
+    await sleep(500);
+    const a22 = await state(A);
+    check(same(a22, a21), 'the refused peer changed nothing in the room');
+    // D takes the room's design from the store instead, and converges.
+    await cmd(D, 'open_room_design');
+    const d22b = await waitFor(D, (s) => s.synced && same(s, a22), 'D converges on the room design', 30000);
+    check(same(d22b, a22) && d22b.design_hash === a22.design_hash, 'D opens the room\'s design and converges');
+    await ctxD.close();
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

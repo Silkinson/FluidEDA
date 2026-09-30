@@ -22,6 +22,15 @@ use std::sync::Arc;
 
 /// Zero-config default: the tiny embedded hierarchical sample.
 const HIER_GDS: &[u8] = include_bytes!("../../../assets/hier.gds");
+/// Its SHA-256 — its identity in rooms and the blob store (Phase 6). Checked
+/// against the bytes by a test; the worker hashes every other design.
+const HIER_SHA256: &str = "eda35fd78e4e9eb9522ac26fccf0aec80367d9e8f70edf04819391d08598dd77";
+
+/// Reconnect backoff after a room connection drops: the first retry after
+/// `REJOIN_MIN_S`, doubling per failed attempt up to `REJOIN_MAX_S` (a quick
+/// server restart is back within a second; a long outage is not hammered).
+const REJOIN_MIN_S: f64 = 0.5;
+const REJOIN_MAX_S: f64 = 8.0;
 
 /// A cell projecting smaller than this many pixels becomes an LOD proxy.
 const MIN_PIXEL: f64 = 4.0;
@@ -131,8 +140,16 @@ pub struct FluidApp {
 
     // runtime loading
     load_slot: LoadSlot,
+    /// Local files for the worker path (Phase 6: the handle, not the bytes).
+    source_slot: webio::SourceSlot,
     /// Worker-parsed designs land here (Phase 2b STEP 2); drained before load_slot.
     design_slot: webio::DesignSlot,
+    /// Where the installed design came from (Phase 6: read again to upload it).
+    design_source: design::DesignSource,
+    /// A design load was started and has not reached `loading` (or failed) yet.
+    load_in_flight: bool,
+    /// The installed design's hash, still being computed by its worker.
+    pending_hash: Option<design::HashSlot>,
     /// A worker-parsed design arriving progressively (Phase 5c): first its
     /// skeleton is parsed (the old design keeps rendering), then installed
     /// (it renders as proxies), then its geometry fills in, visible cells
@@ -295,6 +312,25 @@ pub struct FluidApp {
     /// `join` upgrades to a live connection. Editing and undo work before any
     /// connection; joining a room then syncs.
     session: Session,
+    /// The room to join (`?room=`, else `demo`).
+    room: String,
+    /// Join once the design is in (`?room=` given). While `room_lookup` is
+    /// pending, the room's own design may still have to be fetched first.
+    pending_join: bool,
+    /// `GET /rooms/<room>` for a `?room=` link without `?file=` (Phase 6).
+    room_lookup: Option<webio::RoomSlot>,
+    /// The URL of the current (or last) join; reconnects reuse it.
+    joined_url: Option<String>,
+    /// Reconnect after a drop (set by joining; cleared by a refusal or a new design).
+    auto_rejoin: bool,
+    rejoin_at: f64,
+    /// Reconnect attempts since the session was last in sync (backoff).
+    rejoin_failures: u32,
+    reconnects: u32,
+    /// The design's state in the server's blob store.
+    upload: webio::UploadSlot,
+    /// The blob check ran for the current connection.
+    upload_checked: bool,
     name: String,
     last_frame: f64,
     fps: f32,
@@ -324,14 +360,23 @@ impl FluidApp {
 
         // Web: honor ?file=<url>. Prefer the off-main-thread worker parse; the URL
         // path streams the bytes straight into the worker (no main-thread copy).
-        if let Some(url) = webio::query_file() {
+        let file = webio::query_file();
+        if let Some(url) = file.clone() {
             log::info!("autoloading ?file={url}");
             if webio::worker_supported() {
-                webio::spawn_worker_fetch(url, design_slot.clone());
+                webio::spawn_worker_fetch(url, None, design_slot.clone());
             } else {
                 webio::spawn_fetch(url, load_slot.clone());
             }
         }
+        // ?room=<name> (Phase 6): join it once the design is in. Without a
+        // ?file=, the design is the room's own — look it up first.
+        let room_query = webio::query_room().filter(|r| valid_room(r));
+        let room_lookup = (room_query.is_some() && file.is_none()).then(|| {
+            let slot: webio::RoomSlot = Rc::new(RefCell::new(None));
+            webio::fetch_room(room_query.clone().unwrap(), slot.clone());
+            slot
+        });
 
         let deck = fluideda_core::Deck::detect(&design.layers);
         let mut app = Self {
@@ -348,7 +393,11 @@ impl FluidApp {
             metrics: Metrics { backend: backend.clone(), ..design.metrics },
             gpu_backend: backend,
             load_slot,
+            source_slot: Rc::new(RefCell::new(None)),
             design_slot,
+            design_source: design::DesignSource::Embedded,
+            load_in_flight: file.is_some(),
+            pending_hash: None,
             loading: None,
             load_instant: web_time::Instant::now(),
             awaiting_first_frame: true, // measure TTFF for the default too
@@ -409,10 +458,21 @@ impl FluidApp {
                 color: color_from_id(0),
             }),
             name: "guest".to_string(),
+            pending_join: room_query.is_some(),
+            room: room_query.unwrap_or_else(|| "demo".to_string()),
+            room_lookup,
+            joined_url: None,
+            auto_rejoin: false,
+            rejoin_at: 0.0,
+            rejoin_failures: 0,
+            reconnects: 0,
+            upload: Rc::new(RefCell::new(webio::UploadState::Idle)),
+            upload_checked: false,
             last_frame: 0.0,
             fps: 0.0,
             dragging: false,
         };
+        app.metrics.hash = HIER_SHA256.to_string();
         app.layer_visible = vec![true; app.layers.len()];
         app
     }
@@ -475,6 +535,14 @@ impl FluidApp {
             name: self.name.clone(),
             color: color_from_id(0),
         });
+        // The old design's room connection went with the old session; a
+        // pending `?room=` join still happens once this design is in.
+        self.design_source = design.source.clone();
+        self.pending_hash = design.pending_hash;
+        self.joined_url = None;
+        self.auto_rejoin = false;
+        self.upload_checked = false;
+        *self.upload.borrow_mut() = webio::UploadState::Idle;
 
         if let Some(rs) = frame.wgpu_render_state() {
             // Reuse the existing renderer (keeping its compiled pipeline) rather
@@ -1430,6 +1498,7 @@ impl FluidApp {
         //    parsed, then geometry fills in, cells on screen first.
         let worker_done = self.design_slot.borrow_mut().take();
         if let Some(res) = worker_done {
+            self.load_in_flight = false;
             match res {
                 Ok(recon) => self.loading = Some(recon),
                 Err(e) => self.status = format!("load failed: {e}"),
@@ -1449,7 +1518,16 @@ impl FluidApp {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("dropped.gds")
                 .to_string();
-            webio::read_dropped(name, f, self.load_slot.clone(), &mut self.status);
+            webio::read_dropped(name, f, self.load_slot.clone(), self.source_slot.clone(), &mut self.status);
+        }
+
+        // A local file for the worker (Phase 6): the worker reads the handle.
+        let picked = self.source_slot.borrow_mut().take();
+        if let Some((name, source)) = picked {
+            self.load_instant = web_time::Instant::now();
+            self.status = format!("parsing {name} in worker…");
+            self.load_in_flight = true;
+            webio::spawn_worker_source(name, source, self.design_slot.clone());
         }
 
         // Byte slot (drag-drop / picker). Take at most one per frame. On web with
@@ -1457,8 +1535,10 @@ impl FluidApp {
         let pending = self.load_slot.borrow_mut().take();
         if let Some((name, bytes)) = pending {
             self.load_instant = web_time::Instant::now();
+            self.load_in_flight = false; // the sync path completes right here
             if webio::worker_supported() {
                 self.status = format!("parsing {name} ({} KB) in worker…", bytes.len() / 1024);
+                self.load_in_flight = true;
                 webio::spawn_worker_bytes(name, bytes, self.design_slot.clone());
             } else {
                 self.status = format!("loading {name} ({} KB)…", bytes.len() / 1024);
@@ -1504,6 +1584,11 @@ impl FluidApp {
             }
             Ok(design::ReconStep::Done) => {
                 let (ms, frames) = self.loading.take().map_or((0.0, 0), |r| r.cost());
+                // Edits of cells whose geometry was still arriving were skipped
+                // by the overlay rebuild; now every base shape is in place.
+                if !self.session.edits().is_empty() || !self.session.adds().is_empty() {
+                    self.reconcile_edits();
+                }
                 self.metrics.reconstruct_ms = ms;
                 self.metrics.reconstruct_frames = frames;
                 self.metrics.geometry_ms = self.load_instant.elapsed().as_secs_f64() * 1e3;
@@ -1659,12 +1744,166 @@ impl FluidApp {
         self.visible = Arc::new(vs);
     }
 
+    /// The collaboration section of the side panel (Phase 6: room, connection
+    /// state, the room's design, and whether the server has it).
+    fn room_panel(&mut self, ui: &mut egui::Ui) {
+        let live = self.session.is_connected() || self.session.is_connecting();
+        ui.horizontal(|ui| {
+            ui.label("room");
+            ui.add_enabled(!live, egui::TextEdit::singleline(&mut self.room).desired_width(120.0));
+        });
+        if self.session.is_connected() {
+            ui.colored_label(egui::Color32::GREEN, format!("● connected · {} peers", self.session.remote.len()));
+        } else if self.session.is_connecting() {
+            ui.colored_label(egui::Color32::YELLOW, "● connecting…");
+        } else {
+            if let Some(e) = self.session.error() {
+                ui.colored_label(egui::Color32::LIGHT_RED, e.to_string());
+            }
+            if self.auto_rejoin {
+                ui.small(format!("reconnecting… (attempt {})", self.reconnects));
+            }
+            if ui.button("Join room").clicked() {
+                self.request_join();
+            }
+            // Refused for having another design: offer the room's own.
+            if let Some(d) = self.session.refused().cloned() {
+                if ui.button(format!("Open the room's design ({})", d.name)).clicked() {
+                    self.open_room_design(&d.hash, &d.name);
+                }
+            }
+        }
+        if let Some(d) = self.session.room_design() {
+            ui.small(format!("design: {} ({})", d.name, &d.hash[..12.min(d.hash.len())]));
+        }
+        let upload = self.upload.borrow().clone();
+        if upload != webio::UploadState::Idle {
+            ui.small(format!("in store: {}", upload.label()));
+        }
+    }
+
+    /// Load the design blob `hash` from the server and join the room once it
+    /// is in (the room's design, when ours was refused).
+    fn open_room_design(&mut self, hash: &str, name: &str) {
+        self.load_instant = web_time::Instant::now();
+        self.status = format!("loading {name} from room {}…", self.room);
+        self.load_in_flight = true;
+        self.pending_join = true;
+        webio::spawn_worker_fetch(format!("/blobs/{hash}"), Some(name.to_string()), self.design_slot.clone());
+    }
+
+    /// Join now — or, while a design is loading or its hash is still being
+    /// computed, as soon as it is in (the join must name the design).
+    fn request_join(&mut self) {
+        if self.load_in_flight || self.loading.is_some() || self.pending_hash.is_some() {
+            self.pending_join = true;
+        } else {
+            self.connect();
+        }
+    }
+
+    /// Join `self.room` (a no-op while that connection is open or opening).
+    /// The URL names our design, so the server binds an unbound room to it
+    /// and refuses us from a room bound to another (Phase 6).
     fn connect(&mut self) {
-        let url = server_url();
+        if !valid_room(&self.room) {
+            self.status = "room names are 1-64 of A-Z a-z 0-9 _ -".to_string();
+            return;
+        }
+        let url = server_url(&self.room, &self.metrics.hash, &self.metrics.name);
+        if self.joined_url.as_deref() == Some(url.as_str()) && (self.session.is_connected() || self.session.is_connecting()) {
+            return;
+        }
         self.session.local.name = self.name.clone();
         match self.session.join(&url) {
-            Ok(()) => log::info!("joined {url}"),
+            Ok(()) => log::info!("joining {url}"),
             Err(e) => log::error!("join failed: {e}"),
+        }
+        self.joined_url = Some(url);
+        self.auto_rejoin = true;
+        self.rejoin_at = 0.0;
+        self.rejoin_failures = 0;
+        self.upload_checked = false;
+    }
+
+    /// Room upkeep, once per frame (Phase 6): start a pending `?room=` join
+    /// once the design is in, reconnect after a drop, and make sure the
+    /// server's blob store has our design once a join is accepted.
+    fn drive_room(&mut self, now: f64) {
+        // The design's hash follows its parse (worker loads).
+        let hashed = self.pending_hash.as_ref().and_then(|slot| slot.borrow_mut().take());
+        if let Some((hash, ms)) = hashed {
+            self.pending_hash = None;
+            self.metrics.hash = hash;
+            self.metrics.hash_ms = ms;
+            // A fast load publishes its metrics before the hash lands.
+            if !self.awaiting_first_frame && !self.geometry_pending() {
+                self.metrics.publish();
+            }
+        }
+        // A `?room=` link without a file: load the room's design first.
+        let lookup = self.room_lookup.as_ref().and_then(|slot| slot.borrow_mut().take());
+        if let Some(result) = lookup {
+            self.room_lookup = None;
+            match result {
+                // Edits numbered by another parser version cannot be applied
+                // here (the server would refuse the join anyway).
+                Ok(webio::RoomInfo { design: Some((_, name, ids)) }) if ids != fluideda_core::SHAPE_ID_SCHEME => {
+                    self.pending_join = false;
+                    self.status = format!(
+                        "room {} holds {name} under shape-id scheme {ids}; this build numbers shapes with scheme {}",
+                        self.room,
+                        fluideda_core::SHAPE_ID_SCHEME
+                    );
+                }
+                Ok(webio::RoomInfo { design: Some((hash, name, _)) }) if hash != self.metrics.hash => {
+                    log::info!("room {}: loading its design {name} ({})", self.room, &hash[..12.min(hash.len())]);
+                    self.open_room_design(&hash, &name);
+                }
+                Ok(_) => {} // unbound, or already our design: join with what we have
+                Err(e) => log::warn!("room lookup failed ({e}); joining anyway"),
+            }
+        }
+        if self.pending_join
+            && self.room_lookup.is_none()
+            && !self.load_in_flight
+            && self.loading.is_none()
+            && self.pending_hash.is_none()
+        {
+            self.pending_join = false;
+            self.connect();
+        }
+        // Reconnect after a drop — not after a refusal (it would only be refused again).
+        let gone = !self.session.is_connected() && !self.session.is_connecting();
+        if self.session.is_synced() {
+            self.rejoin_failures = 0;
+            self.rejoin_at = 0.0;
+        }
+        if self.auto_rejoin && gone {
+            if self.session.refused().is_some() {
+                self.auto_rejoin = false;
+            } else if self.rejoin_at == 0.0 {
+                // Just dropped: schedule the first retry.
+                self.rejoin_at = now + REJOIN_MIN_S;
+            } else if now >= self.rejoin_at {
+                self.rejoin_failures += 1;
+                let wait = (REJOIN_MIN_S * 2f64.powi(self.rejoin_failures as i32)).min(REJOIN_MAX_S);
+                self.rejoin_at = now + wait;
+                if let Some(url) = self.joined_url.clone() {
+                    self.reconnects += 1;
+                    log::info!("reconnecting to {url} (attempt {})", self.reconnects);
+                    if let Err(e) = self.session.join(&url) {
+                        log::error!("rejoin failed: {e}");
+                    }
+                    self.upload_checked = false;
+                }
+            }
+        }
+        // Accepted into the room: make sure later joiners can fetch the design.
+        if self.session.is_synced() && !self.upload_checked && !self.metrics.hash.is_empty() {
+            self.upload_checked = true;
+            let source = self.design_source.clone();
+            webio::ensure_blob(self.metrics.hash.clone(), source, HIER_GDS, self.upload.clone());
         }
     }
 
@@ -1872,6 +2111,7 @@ impl eframe::App for FluidApp {
             }
             ctx.request_repaint();
         }
+        self.drive_room(now);
 
         self.drive_test_hook();
 
@@ -1929,8 +2169,12 @@ impl FluidApp {
         //   pure deletes  = deleted.len() - edited.len().
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
+        let room_design = self.session.room_design();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{},\"hidden\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{},\"hidden\":{},\
+             \"room\":\"{}\",\"connecting\":{},\"synced\":{},\"design_hash\":\"{}\",\"room_design\":\"{}\",\
+             \"room_design_name\":\"{}\",\"refused\":{},\"join_error\":\"{}\",\"upload\":\"{}\",\"reconnects\":{},\
+             \"loading\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -1952,6 +2196,17 @@ impl FluidApp {
             self.selection_set.len(),
             self.overlay.added.iter().filter(|a| a.cell != top).count(),
             self.overlay.hidden.len(),
+            json_str(&self.room),
+            self.session.is_connecting(),
+            self.session.is_synced(),
+            self.metrics.hash,
+            room_design.as_ref().map_or("", |d| d.hash.as_str()),
+            json_str(room_design.as_ref().map_or("", |d| d.name.as_str())),
+            self.session.refused().is_some(),
+            json_str(self.session.error().unwrap_or("")),
+            json_str(&self.upload.borrow().label()),
+            self.reconnects,
+            self.load_in_flight || self.loading.is_some(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -1965,7 +2220,18 @@ impl FluidApp {
         let top = self.db.top;
         let mut parts = cmd.split_whitespace();
         match parts.next() {
-            Some("join") => self.connect(),
+            Some("join") => self.request_join(),
+            // Phase 6: leave the room (edits keep working offline).
+            Some("leave") => {
+                self.auto_rejoin = false;
+                self.session.disconnect();
+            }
+            // Phase 6: after a refusal, load the room's design and join.
+            Some("open_room_design") => {
+                if let Some(d) = self.session.refused().cloned() {
+                    self.open_room_design(&d.hash, &d.name);
+                }
+            }
             Some("edit_mode") => self.edit_mode = true,
             Some("select") => {
                 // `select <idx>` selects a TOP shape; `select <cell> <idx>` selects
@@ -2300,7 +2566,7 @@ impl FluidApp {
             ui.separator();
 
             if ui.button("📂 Open GDS / OASIS…").clicked() {
-                webio::spawn_picker(self.load_slot.clone());
+                webio::spawn_picker(self.load_slot.clone(), self.source_slot.clone());
             }
             ui.small("or drag a .gds / .oas onto the canvas");
             ui.small(format!("file: {}", self.metrics.name));
@@ -2341,14 +2607,7 @@ impl FluidApp {
                 ui.label("name");
                 ui.text_edit_singleline(&mut self.name);
             });
-            if !self.session.is_connected() {
-                if ui.button("Join room").clicked() {
-                    self.connect();
-                }
-            } else {
-                ui.colored_label(egui::Color32::GREEN, "● connected");
-                ui.label(format!("{} peers", self.session.remote.len()));
-            }
+            self.room_panel(ui);
 
             ui.separator();
             ui.label("Culling");
@@ -2998,14 +3257,68 @@ fn out_name(loaded: &str) -> String {
     format!("{stem}-edited.gds")
 }
 
-fn server_url() -> String {
+/// A room name the server accepts (it becomes a directory name there).
+fn valid_room(r: &str) -> bool {
+    (1..=64).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The room socket's URL: the room plus the loaded design's identity (hash,
+/// shape-id scheme, file name), when known.
+fn server_url(room: &str, hash: &str, name: &str) -> String {
+    let mut q = format!("room={room}");
+    if !hash.is_empty() {
+        // "hier.gds (embedded)" → "hier.gds": drop a trailing label.
+        let name = name.rsplit_once(" (").filter(|(_, r)| r.ends_with(')')).map_or(name, |(l, _)| l);
+        q += &format!("&design={hash}&ids={}&name={}", fluideda_core::SHAPE_ID_SCHEME, encode_query(name));
+    }
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(w) = web_sys::window() {
             if let Ok(host) = w.location().host() {
-                return format!("ws://{host}/ws?room=demo");
+                return format!("ws://{host}/ws?{q}");
             }
         }
     }
-    "ws://127.0.0.1:9000/ws?room=demo".to_string()
+    format!("ws://127.0.0.1:9000/ws?{q}")
+}
+
+/// A string made safe to embed in the hand-rolled state JSON.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn json_str(s: &str) -> String {
+    s.chars().map(|c| if c == '"' || c == '\\' || c.is_control() { '\'' } else { c }).collect()
+}
+
+/// Percent-encode a query value (unreserved characters pass through).
+fn encode_query(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_design_hash_matches_its_bytes() {
+        use sha2::{Digest, Sha256};
+        let hex: String = Sha256::digest(HIER_GDS).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, HIER_SHA256, "assets/hier.gds changed: update HIER_SHA256");
+    }
+
+    #[test]
+    fn join_url_names_the_design_and_escapes_its_name() {
+        let url = server_url("r1", HIER_SHA256, "hier.gds (embedded)");
+        assert!(url.ends_with(&format!(
+            "/ws?room=r1&design={HIER_SHA256}&ids={}&name=hier.gds",
+            fluideda_core::SHAPE_ID_SCHEME
+        )));
+        assert!(server_url("r1", HIER_SHA256, "my chip (v2).gds").ends_with("&name=my%20chip%20%28v2%29.gds"));
+        assert_eq!(encode_query("a b&c=d.gds"), "a%20b%26c%3Dd.gds");
+        assert!(server_url("r1", "", "x").ends_with("/ws?room=r1"), "no design, no binding");
+        assert!(valid_room("sync-17_x") && !valid_room("../x") && !valid_room(""));
+    }
 }

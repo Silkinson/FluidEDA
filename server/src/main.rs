@@ -1,110 +1,56 @@
-//! FluidEDA relay server.
+//! FluidEDA collaboration server — see the library docs for the API.
 //!
-//! Deliberately dumb for Phase 0: a per-room broadcast hub. It does NOT parse
-//! or understand yrs updates or presence — it just forwards every binary
-//! message from one peer to all the others in the same room. Convergence is
-//! guaranteed by yrs on the clients. Persistence, the y-sync handshake for late
-//! joiners, and content-addressed storage come in Phase 4.
+//! Environment:
+//! * `FLUIDEDA_STORE` — store directory (default `store`, relative to the cwd).
+//! * `FLUIDEDA_ADDR` — listen address (default `127.0.0.1:9000`; the dev app
+//!   reaches it through Trunk's proxy, so nothing needs a wider bind).
+//! * `RUST_LOG` — log filter (default `info`).
 
-use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
-    },
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
-use futures::{sink::SinkExt, stream::StreamExt};
-use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
-use tokio::sync::broadcast;
-
-/// room name -> broadcast channel of (sender_peer_id, message bytes).
-type Rooms = Arc<Mutex<HashMap<String, broadcast::Sender<(u64, Vec<u8>)>>>>;
-
-#[derive(Deserialize)]
-struct RoomQuery {
-    #[serde(default = "default_room")]
-    room: String,
-}
-
-fn default_room() -> String {
-    "demo".to_string()
-}
+use fluideda_server::room::{Hub, SnapshotPolicy};
+use fluideda_server::store::Store;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
-    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let dir = std::env::var("FLUIDEDA_STORE").unwrap_or_else(|_| "store".to_string());
+    let addr = std::env::var("FLUIDEDA_ADDR").unwrap_or_else(|_| "127.0.0.1:9000".to_string());
+    let store = Store::open(&dir).unwrap_or_else(|e| panic!("cannot open store {dir}: {e}"));
+    let hub = Arc::new(Hub::new(store, SnapshotPolicy::default()));
+    fluideda_server::spawn_snapshotter(hub.clone());
 
-    let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .route("/health", get(|| async { "ok" }))
-        .with_state(rooms);
-
-    let addr = "0.0.0.0:9000";
-    log::info!("FluidEDA relay listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
-}
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    Query(q): Query<RoomQuery>,
-    State(rooms): State<Rooms>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, q.room, rooms))
-}
-
-async fn handle_socket(socket: WebSocket, room: String, rooms: Rooms) {
-    let peer_id = rand_id();
-    let tx = {
-        let mut guard = rooms.lock().unwrap();
-        guard
-            .entry(room.clone())
-            .or_insert_with(|| broadcast::channel(1024).0)
-            .clone()
-    };
-    let mut rx = tx.subscribe();
-    log::info!("peer {peer_id} joined room {room}");
-
-    let (mut sink, mut stream) = socket.split();
-
-    // Fan-in: this peer's messages -> room broadcast (tagged with peer id).
-    let tx_in = tx.clone();
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = stream.next().await {
-            if let Message::Binary(data) = msg {
-                let _ = tx_in.send((peer_id, data));
-            }
-        }
-    });
-
-    // Fan-out: room broadcast -> this peer (skip our own messages).
-    let mut send_task = tokio::spawn(async move {
-        while let Ok((from, data)) = rx.recv().await {
-            if from == peer_id {
-                continue;
-            }
-            if sink.send(Message::Binary(data)).await.is_err() {
-                break;
-            }
-        }
-    });
-
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| panic!("bind {addr}: {e}"));
+    log::info!("FluidEDA server on {addr}, store {dir}");
     tokio::select! {
-        _ = &mut recv_task => send_task.abort(),
-        _ = &mut send_task => recv_task.abort(),
+        r = fluideda_server::serve(listener, hub.clone()) => {
+            if let Err(e) = r {
+                log::error!("server error: {e}");
+            }
+        }
+        _ = shutdown_signal() => log::info!("shutting down"),
     }
-    log::info!("peer {peer_id} left room {room}");
+    // Compact every room with unsnapshotted updates. (Their WALs would
+    // recover them anyway; this leaves a clean store.)
+    let _ = tokio::task::spawn_blocking(move || hub.flush()).await;
 }
 
-fn rand_id() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    (n as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (n as u64 >> 17)
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
 }

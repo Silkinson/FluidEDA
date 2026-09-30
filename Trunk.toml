@@ -21,8 +21,15 @@ port = 8080
 # is a plain transferable-buffer worker, so cross-origin isolation is not needed —
 # and dropping COEP:require-corp avoids its subresource CORP requirement.
 
-# Proxy the collaboration WebSocket to the relay (Phase 0 server on :9000), so the
-# page and its socket share one origin. The app connects to ws://<host>/ws.
+# Proxy the collaboration server (:9000) so the page, its socket and the HTTP
+# API share one origin. The app connects to ws://<host>/ws; Phase 6 adds the
+# content-addressed blob store (/blobs/<sha256>) and room lookups (/rooms/<name>).
 [[proxy]]
 ws = true
 backend = "ws://127.0.0.1:9000/ws"
+
+[[proxy]]
+backend = "http://127.0.0.1:9000/blobs"
+
+[[proxy]]
+backend = "http://127.0.0.1:9000/rooms"

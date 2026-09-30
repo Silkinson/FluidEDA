@@ -6,6 +6,10 @@
 // columns back as zero-copy ArrayBuffers. The main thread terminates this worker
 // after `done`, reclaiming its ~0.8 GB parse memory.
 //
+// Phase 6: a second message follows `done` — the file's SHA-256, the design's
+// identity for collaboration rooms and the server's blob store — and the
+// worker then closes itself.
+//
 // This is a classic (no-modules) worker: importScripts defines the global
 // `wasm_bindgen` init function; after init, `wasm_bindgen.parse` is callable.
 
@@ -16,18 +20,21 @@ const ready = wasm_bindgen('worker_bg.wasm');
 
 self.onmessage = async (e) => {
   const msg = e.data || {};
-  if (msg.type !== 'parse' && msg.type !== 'fetch_parse') return;
+  if (msg.type !== 'parse' && msg.type !== 'fetch_parse' && msg.type !== 'file_parse') return;
   try {
     // 'fetch_parse' (Phase 5c): the worker fetches the file itself, so the main
     // thread never materialises the body (a 278 MB ArrayBuffer was a ~70 ms
-    // main-thread stall). 'parse': the bytes were transferred in (drag-drop /
-    // picker — they already live on the main thread).
+    // main-thread stall). 'file_parse' (Phase 6): the same for a local file —
+    // the main thread posts the disk-backed File handle and the worker reads
+    // it. 'parse': the bytes were transferred in.
     const body = msg.type === 'fetch_parse'
       ? fetch(msg.url).then((r) => {
           if (!r.ok) throw new Error(`fetch ${msg.url}: HTTP ${r.status}`);
           return r.arrayBuffer();
         })
-      : Promise.resolve(msg.bytes);
+      : msg.type === 'file_parse'
+        ? msg.file.arrayBuffer()
+        : Promise.resolve(msg.bytes);
     const [buf] = await Promise.all([body, ready]);
     const bytes = new Uint8Array(buf);
     const result = wasm_bindgen.parse(bytes); // the heavy work, off the main thread
@@ -59,7 +66,26 @@ self.onmessage = async (e) => {
       [coords.buffer, starts.buffer, layers.buffer, meta.buffer, layer_set.buffer]
     );
     result.free();
+
+    // The design's SHA-256, AFTER the reply so it costs the load nothing:
+    // WebCrypto copies its input first, and hashing before the parse put that
+    // copy (~130 ms for caravel's 291 MB) on the path to the first frame. The
+    // main thread needs the hash only to join a room, long after this lands.
+    // (`nohash`: the A/B knob — reply with no hash.)
+    const t0 = performance.now();
+    let hash = '';
+    try {
+      if (!msg.nohash) {
+        const d = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+        hash = Array.from(d, (b) => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (err) {
+      console.warn('design hash failed:', err);
+    }
+    self.postMessage({ type: 'hash', hash, hash_ms: performance.now() - t0 });
+    self.close();
   } catch (err) {
     self.postMessage({ type: 'error', message: String(err && err.message || err) });
+    self.close();
   }
 };

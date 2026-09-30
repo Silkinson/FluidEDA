@@ -17,3 +17,6 @@ package.json
 # Generated parse-worker wasm (scripts/build_worker.sh); parse_worker.js is tracked.
 /assets/worker/worker.js
 /assets/worker/worker_bg.wasm
+
+# Collaboration server store (Phase 6: blobs, room snapshots + WALs).
+/store/

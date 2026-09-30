@@ -7,7 +7,13 @@
 //! console so the Playwright bench can read them.
 
 use fluideda_core::{CellDb, ColumnSource, Layer};
+use std::cell::RefCell;
+use std::rc::Rc;
 use web_time::Instant;
+
+/// The design's SHA-256 (hex) and the worker's ms to compute it, delivered
+/// after the parse reply (Phase 6). Empty hash: none was computed.
+pub type HashSlot = Rc<RefCell<Option<(String, f64)>>>;
 
 /// Everything the app needs to render one design, plus how expensive it was.
 pub struct Design {
@@ -17,6 +23,28 @@ pub struct Design {
     pub bbox_max: glam::Vec2,
     pub total_shapes: u64,
     pub metrics: Metrics,
+    /// Where the file came from (Phase 6: read again to upload it to a room).
+    pub source: DesignSource,
+    /// Worker loads: where the design's hash will land (it follows the parse).
+    pub pending_hash: Option<HashSlot>,
+}
+
+/// Where a design's bytes came from — what the app reads again when a room
+/// needs the design in the server's store (Phase 6). Never the bytes
+/// themselves: a URL can be fetched again and a local `File` is a disk-backed
+/// handle, so keeping either costs nothing.
+#[derive(Clone, Default)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // most sources are web-only
+pub enum DesignSource {
+    #[default]
+    Unknown,
+    /// The embedded default (`hier.gds`).
+    Embedded,
+    /// An absolute URL.
+    Url(String),
+    /// A local file (drag-drop / picker).
+    #[cfg(target_arch = "wasm32")]
+    File(web_sys::File),
 }
 
 /// Load-time measurements. `index_ms`/`ttff_ms` are filled in later (after the
@@ -60,6 +88,13 @@ pub struct Metrics {
     /// geometry is in place. `ttff_ms` is the first frame of the *skeleton*
     /// (the new design's outline as proxies), which now comes much earlier.
     pub geometry_ms: f64,
+    /// SHA-256 of the file bytes, lower-case hex (Phase 6: the design's
+    /// identity for rooms and the blob store). Empty when unknown — or not
+    /// yet known: the worker computes it after replying with the parse.
+    pub hash: String,
+    /// Worker path: the worker's ms to hash the file (after the parse reply,
+    /// so it adds nothing to the load).
+    pub hash_ms: f64,
 }
 
 /// Everything the parse worker sends back: the serialized columns (left where
@@ -81,6 +116,9 @@ pub struct WorkerMsg {
     pub layers_packed: Vec<u32>,
     pub parse_ms: f64,
     pub worker_heap_bytes: usize,
+    /// Where the file's SHA-256 lands once the worker has computed it.
+    pub hash: HashSlot,
+    pub source: DesignSource,
 }
 
 /// Main-thread bytes copied (columns) or parsed (metadata) per step call
@@ -197,6 +235,8 @@ impl Reconstruction {
             bbox_max: glam::Vec2::new(m.bbox[2] as f32, m.bbox[3] as f32),
             total_shapes: m.total_shapes,
             metrics,
+            source: m.source,
+            pending_hash: Some(m.hash),
         }
     }
 
@@ -279,6 +319,8 @@ pub fn load_design(name: &str, bytes: &[u8]) -> anyhow::Result<Design> {
         bbox_max: glam::Vec2::new(wb.max_x as f32, wb.max_y as f32),
         total_shapes: flattened,
         metrics,
+        source: DesignSource::Unknown,
+        pending_hash: None,
     })
 }
 
@@ -336,7 +378,8 @@ impl Metrics {
              \"cell_defs\":{},\"distinct_polys\":{},\"flattened\":{},\"triangles\":{},\
              \"vertex_bytes\":{},\"index_bytes\":{},\"wasm_heap_bytes\":{},\
              \"parse_heap_bytes\":{},\"worker_used\":{},\"reconstruct_ms\":{:.1},\
-             \"reconstruct_frames\":{},\"geometry_ms\":{:.1},\"backend\":\"{}\"}}",
+             \"reconstruct_frames\":{},\"geometry_ms\":{:.1},\"backend\":\"{}\",\
+             \"hash\":\"{}\",\"hash_ms\":{:.1}}}",
             self.name.replace('"', "'"),
             self.file_bytes,
             self.parse_ms,
@@ -358,6 +401,8 @@ impl Metrics {
             self.reconstruct_frames,
             self.geometry_ms,
             self.backend,
+            self.hash,
+            self.hash_ms,
         )
     }
 

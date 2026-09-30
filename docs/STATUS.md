@@ -31,6 +31,27 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
   placements. caravel: 291 MB GDS → 16.6 MB our OASIS (KLayout: 10.6 MB); in
   the browser caravel.oas loads faster than caravel.gds (geometry in 0.88 s vs
   1.05 s). "Open" takes .oas, "Export OASIS" writes it.
+* **SLICE 2 — the server keeps the room.** The relay became a server
+  (`server/`) that holds each room's CRDT document.
+  - Every update is applied and appended to a WAL before it is relayed. A
+    joining peer first receives the **whole room state**: late joiners
+    converge, closing the Phase 0 debt.
+  - Rooms persist as **content-addressed snapshots**: SHA-256 blobs plus a
+    per-room version log and head. They survive a crash (WAL replay) and a
+    restart (snapshot).
+  - Rooms are **bound to a design** (the file's SHA-256 + the shape-id
+    scheme). A peer on another design is refused before any state moves, and
+    can open the room's design instead.
+  - An immutable blob API (`/blobs/<sha256>`: `Cache-Control: immutable`,
+    ETag = hash, ranges; verified `PUT`) serves designs: a `?room=R` link
+    fetches the design by hash.
+  - Found and fixed on the way: on the web, edits made before joining were
+    never sent (pushed while the socket was still connecting).
+  - Measured: a late joiner opening a caravel room link has the design and
+    the edits in 1.41 s. Hashing the design costs the load nothing (after the
+    parse reply; hashing first cost +129 ms first frame). A reconnect after a
+    server restart takes ~0.5 s. Rooms cost ~33 B/edit (100 k edits = 3.4 MB,
+    restore 23 ms).
 
 **Phase 5d shipped: the editing follow-ons** on `phase5d-editing` — every
 deferred editing item named in code since Phase 3.
@@ -167,7 +188,7 @@ still byte-identical).
 | 5b — DRC hardening | `phase5b-drc-hardening` | ✅ done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine). SLICE 3: worker pool — check-visible 10.6 s → **1.7 s** (8 workers), identical results |
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
-| 6 — backend/OASIS | `phase6-backend-oasis` | ◑ SLICE 1 done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). Next: content-addressed store + persistent rooms, out-of-core chunk streaming |
+| 6 — backend/OASIS | `phase6-backend-oasis` | ◑ SLICES 1–2 done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). Next: out-of-core chunk streaming |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -190,6 +211,8 @@ still byte-identical).
 | DRC: whole caravel, every cell (sky130) | 3,305 flags / 252 of 1,014 cells, 3.6 s native | intra-cell sweep (`drc_bench … sky130 --all`); dominated by `sky130_fd_io` pad cells (45° corner-fill triangles and stubs that merge only in hierarchical context). Stdcell library: 4 flags / 2 of 440 cells |
 | DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
+| room link → design + edits (late joiner) | **1.41 s** | Phase 6 SLICE 2: `?room=` only — room lookup, caravel (291 MB) from the blob store, the room state from the server (first frame 998 ms; WebGPU, headless) |
+| reconnect after a server restart | ~0.5 s | first retry at 0.5 s (backoff doubles to 8 s); the room comes back from its WAL or snapshot and offline edits merge |
 
 ## Decisions locked (do not relitigate without a measurement)
 
@@ -297,6 +320,15 @@ still byte-identical).
 - **Hit-test builds only the clicked cell's index** (chunk-bbox prefilter first),
   not a background build of all 1014. TOP first-click = 50 µs on caravel. (phase3)
 
+- **The server holds each room's document; the wire stays opaque-compatible.**
+  Updates are applied + WAL-logged before relay; a joiner gets the whole state
+  first; persistence is snapshot blobs + WAL (updates are idempotent, so every
+  crash point is safe). Rooms bind to the design's SHA-256 + `SHAPE_ID_SCHEME`
+  and refuse other designs before any exchange. Blobs are immutable and named
+  by content — cache forever, never overwrite. The design hash is computed in
+  the parse worker *after* its reply (hashing first cost +129 ms first frame:
+  WebCrypto copies its input). (phase6-findings, SLICE 2)
+
 ## Invariants (enforced)
 
 - `crates/core` has **no** wgpu/network deps (the Web Worker seam).
@@ -365,11 +397,22 @@ still byte-identical).
 - ~~GDS export of edits not built~~ **RESOLVED** (`phase3-real-editing` SLICE 1):
   `write_gds` composites base+overlay → GDSII, round-trip verified through our
   reader + gds21 + a pixel-match render test. "Save GDS" button.
-- **Late-joiner edit sync** relies on a full-state broadcast on `join`; there is
-  no y-sync handshake, so a peer must join before others edit (skeleton limitation,
-  same as Phase 0 markers). Related operational note: the relay accumulates dead
-  sockets across runs — a room reused after peers vanish can drop rebroadcasts
-  (bit us in testing; restart the relay). Worth a cleanup pass with the y-sync work.
+- ~~Late-joiner edit sync~~ **RESOLVED** (`phase6-backend-oasis` SLICE 2): the
+  server holds each room's document and sends the whole state to every joiner
+  first; rooms persist (WAL + snapshots). The join push that was silently
+  dropped on the web (sent before the socket opened) now goes on open.
+- **Server limits (Phase 6 SLICE 2):**
+  - No auth: any client that reaches the server can join any room and `PUT`
+    blobs (≤ 16 GiB). Binds 127.0.0.1 by default.
+  - No blob GC: every snapshot version is kept, and a room stays in memory
+    once touched.
+  - The join exchanges whole states both ways, with no state-vector
+    handshake. Fine at ~33 B/edit; revisit if rooms reach MBs.
+  - WAL durability is process-crash level (no fsync); snapshots are fsynced.
+- **The app repaints every frame even when idle** (`request_repaint` each
+  frame), so an untouched tab keeps a core busy. Found via the harness: three
+  such pages on headless SwiftShader starve a new page's WebGL context
+  creation. The browser tests keep ≤ 2 live pages.
 - **DRC deferrals, updated by Phase 5b SLICE 1:** merge-first width is DONE
   (the 593 k fracture flags are gone); the atomic index build is DONE (grid,
   budgeted); non-rect width is exact now (edge pairs). Still open below:
@@ -427,5 +470,9 @@ shape drawn past a cell's original extent grows that cell's cull/pick bbox but
 not its ancestors' precomputed ones; picking a flattened placement's copy
 needs a fresh click after the flatten (the app re-picks at the same point).
 
-Then Phase 6: content-addressed store, tile CDN, streaming OASIS (the out-of-core
-story the production-SoC scale ceiling needs).
+Phase 6 is under way (`phase6-backend-oasis`): OASIS in/out and GDS paths
+(SLICE 1), server-kept rooms on a content-addressed store (SLICE 2). Next,
+SLICE 3 — **out-of-core**: the server parses a stored design once and serves
+its skeleton and per-chunk geometry as immutable, CDN-cacheable blobs; the
+client streams only the chunks on screen (`ProgressiveLoad` over a remote
+`ColumnSource`, LRU residency), so a design larger than browser memory opens.

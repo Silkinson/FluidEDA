@@ -58,6 +58,13 @@ pub use index::ShapeIndex;
 pub use pick::{pick_composite, pick_hierarchy, pick_in_cell, point_in_polygon, CompositeHit, PickHit, PickTarget};
 pub use serialize::{deserialize, deserialize_from, serialize, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse};
 pub use store::ShapeStore;
+
+/// Version of the rule that numbers each cell's shapes (the index in a
+/// [`BaseShapeId`]). Collaborative edits are keyed by these ids, so a room
+/// records the scheme its design was parsed with and refuses peers on another
+/// (Phase 6). 1: Phases 3–5 (GDS PATHs skipped). 2: Phase 6 (PATHs become
+/// polygons; OASIS read).
+pub const SHAPE_ID_SCHEME: u32 = 2;
 pub use tess::{
     tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_columns, tessellate_shapes,
     LayerMesh,

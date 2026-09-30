@@ -15,6 +15,10 @@ use std::rc::Rc;
 /// parse synchronously on the next frame (fallback path).
 pub type LoadSlot = Rc<RefCell<Option<(String, Vec<u8>)>>>;
 
+/// Local files (drag-drop / picker) on the worker path: the name and a
+/// disk-backed handle, handed to the parse worker as-is (Phase 6).
+pub type SourceSlot = Rc<RefCell<Option<(String, crate::design::DesignSource)>>>;
+
 /// The worker path drops the new design's progressive [`Reconstruction`](crate::design::Reconstruction)
 /// (or an error string) here; the app advances it within the frame budget —
 /// skeleton first (installed as soon as it is complete), then geometry.
@@ -48,6 +52,19 @@ pub fn query_file() -> Option<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn query_file() -> Option<String> {
+    None
+}
+
+/// Read the `room` query parameter (Phase 6: the room to join once the
+/// design is in), if any.
+#[cfg(target_arch = "wasm32")]
+pub fn query_room() -> Option<String> {
+    let search = web_sys::window()?.location().search().ok()?;
+    search.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("room=")).map(js_decode)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn query_room() -> Option<String> {
     None
 }
 
@@ -89,9 +106,14 @@ pub fn query_flag(_name: &str) -> bool {
 
 /// Read a drag-and-dropped file into `slot` (egui 0.36 hands out a file handle):
 /// asynchronously on the web, synchronously natively. A read error is reported
-/// through `status`.
+/// through `status`. On the web worker path the browser `File` goes to
+/// `sources` instead — the worker reads it, and it stays the design's source.
 #[cfg(target_arch = "wasm32")]
-pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot, _status: &mut String) {
+pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot, sources: SourceSlot, _status: &mut String) {
+    if let (true, Some(f)) = (worker_supported(), file.web_file()) {
+        *sources.borrow_mut() = Some((name, crate::design::DesignSource::File(f.clone())));
+        return;
+    }
     wasm_bindgen_futures::spawn_local(async move {
         match file.bytes_async().await {
             Ok(bytes) => *slot.borrow_mut() = Some((name, bytes)),
@@ -101,7 +123,7 @@ pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot, status: &mut String) {
+pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot, _sources: SourceSlot, status: &mut String) {
     match file.bytes() {
         Ok(bytes) => *slot.borrow_mut() = Some((name, bytes)),
         Err(e) => *status = format!("read failed: {e}"),
@@ -148,10 +170,11 @@ pub fn spawn_fetch(url: String, slot: LoadSlot) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_fetch(_url: String, _slot: LoadSlot) {}
 
-/// Open the browser file picker (wasm) and deposit the chosen file's bytes into
-/// `slot`. Uses a transient `<input type=file>` — the browser File API.
+/// Open the browser file picker (wasm) and deposit the chosen file into
+/// `sources` (worker path: the handle) or its bytes into `slot`. Uses a
+/// transient `<input type=file>` — the browser File API.
 #[cfg(target_arch = "wasm32")]
-pub fn spawn_picker(slot: LoadSlot) {
+pub fn spawn_picker(slot: LoadSlot, sources: SourceSlot) {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
     let doc = match web_sys::window().and_then(|w| w.document()) {
@@ -171,6 +194,10 @@ pub fn spawn_picker(slot: LoadSlot) {
         let Some(files) = input_clone.files() else { return };
         let Some(file) = files.get(0) else { return };
         let name = file.name();
+        if worker_supported() {
+            *sources.borrow_mut() = Some((name, crate::design::DesignSource::File(file)));
+            return;
+        }
         let slot = slot.clone();
         wasm_bindgen_futures::spawn_local(async move {
             match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
@@ -189,7 +216,7 @@ pub fn spawn_picker(slot: LoadSlot) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn spawn_picker(_slot: LoadSlot) {}
+pub fn spawn_picker(_slot: LoadSlot, _sources: SourceSlot) {}
 
 /// Save `bytes` as a download named `name` (Phase 3 SLICE 1 — export edits).
 /// Wraps the bytes in a Blob and clicks a transient `<a download>`.
@@ -248,7 +275,9 @@ fn js_decode(s: &str) -> String {
 /// Native stubs — the worker path is web-only; `worker_supported()` is false on
 /// native so these are never actually called, but the call sites must compile.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn spawn_worker_fetch(_url: String, _slot: DesignSlot) {}
+pub fn spawn_worker_fetch(_url: String, _name: Option<String>, _slot: DesignSlot) {}
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_worker_source(_name: String, _source: crate::design::DesignSource, _slot: DesignSlot) {}
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_worker_bytes(_name: String, _bytes: Vec<u8>, _slot: DesignSlot) {}
 
@@ -259,10 +288,11 @@ const WORKER_URL: &str = "assets/worker/parse_worker.js";
 /// Parse the file at `url` in the worker — which **fetches it itself** (Phase
 /// 5c), so the body never materialises on the main thread. The pending
 /// reconstruction lands in `slot`. `file_bytes` for the metrics comes from the
-/// worker's reply.
+/// worker's reply. `name` defaults to the URL's last segment (a blob URL
+/// names a hash, so a room load passes the design's file name).
 #[cfg(target_arch = "wasm32")]
-pub fn spawn_worker_fetch(url: String, slot: DesignSlot) {
-    let name = url.rsplit('/').next().unwrap_or("file.gds").to_string();
+pub fn spawn_worker_fetch(url: String, name: Option<String>, slot: DesignSlot) {
+    let name = name.unwrap_or_else(|| url.rsplit('/').next().unwrap_or("file.gds").to_string());
     // Absolute URL: a worker resolves relative URLs against its own script.
     let abs = web_sys::window()
         .and_then(|w| w.location().href().ok())
@@ -271,8 +301,26 @@ pub fn spawn_worker_fetch(url: String, slot: DesignSlot) {
         .unwrap_or(url);
     let payload = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&payload, &"type".into(), &"fetch_parse".into());
-    let _ = js_sys::Reflect::set(&payload, &"url".into(), &abs.into());
-    run_worker(name, payload, js_sys::Array::new(), slot);
+    let _ = js_sys::Reflect::set(&payload, &"url".into(), &abs.clone().into());
+    run_worker(name, payload, js_sys::Array::new(), slot, crate::design::DesignSource::Url(abs));
+}
+
+/// Parse a design from its source in the worker: a URL is fetched there, a
+/// local `File` handle is posted as-is and read there (Phase 6 — the main
+/// thread never holds the bytes). Embedded/unknown sources have no worker path.
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_worker_source(name: String, source: crate::design::DesignSource, slot: DesignSlot) {
+    use crate::design::DesignSource;
+    match source {
+        DesignSource::Url(url) => spawn_worker_fetch(url, Some(name), slot),
+        DesignSource::File(file) => {
+            let payload = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&payload, &"type".into(), &"file_parse".into());
+            let _ = js_sys::Reflect::set(&payload, &"file".into(), &file);
+            run_worker(name, payload, js_sys::Array::new(), slot, DesignSource::File(file));
+        }
+        DesignSource::Embedded | DesignSource::Unknown => fail(&slot, format!("{name}: no worker source")),
+    }
 }
 
 /// Hand already-in-wasm `bytes` (drag-drop / picker) to the parse worker. Copies
@@ -287,16 +335,27 @@ pub fn spawn_worker_bytes(name: String, bytes: Vec<u8>, slot: DesignSlot) {
     let payload = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&payload, &"type".into(), &"parse".into());
     let _ = js_sys::Reflect::set(&payload, &"bytes".into(), &buf);
-    run_worker(name, payload, js_sys::Array::of1(&buf), slot);
+    run_worker(name, payload, js_sys::Array::of1(&buf), slot, crate::design::DesignSource::Unknown);
 }
 
 /// Spawn a one-shot parse worker, post it `payload` (with `transfer`), turn its
 /// reply into a pending reconstruction in `slot`, then terminate the worker
 /// (reclaiming its parse memory).
 #[cfg(target_arch = "wasm32")]
-fn run_worker(name: String, payload: js_sys::Object, transfer: js_sys::Array, slot: DesignSlot) {
+fn run_worker(
+    name: String,
+    payload: js_sys::Object,
+    transfer: js_sys::Array,
+    slot: DesignSlot,
+    source: crate::design::DesignSource,
+) {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
+
+    // `?nohash`: skip the design digest (Phase 6 — the load-time A/B knob).
+    if query_flag("nohash") {
+        let _ = js_sys::Reflect::set(&payload, &"nohash".into(), &JsValue::TRUE);
+    }
 
     let worker = match web_sys::Worker::new(WORKER_URL) {
         Ok(w) => w,
@@ -309,11 +368,19 @@ fn run_worker(name: String, payload: js_sys::Object, transfer: js_sys::Array, sl
     let worker_for_msg = worker.clone();
     let slot_for_msg = slot.clone();
     let name_for_msg = name.clone();
+    let hash_slot: crate::design::HashSlot = Rc::new(RefCell::new(None));
     let onmessage = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
         let data = e.data();
         let kind = get_str(&data, "type").unwrap_or_default();
         if kind == "error" {
             fail(&slot_for_msg, get_str(&data, "message").unwrap_or_else(|| "worker error".into()));
+            worker_for_msg.terminate();
+            return;
+        }
+        // Phase 6: the design's hash follows the parse reply; the worker is
+        // done after it (it also closes itself).
+        if kind == "hash" {
+            *hash_slot.borrow_mut() = Some((get_str(&data, "hash").unwrap_or_default(), get_f64(&data, "hash_ms")));
             worker_for_msg.terminate();
             return;
         }
@@ -337,18 +404,23 @@ fn run_worker(name: String, payload: js_sys::Object, transfer: js_sys::Array, sl
             layers_packed: get_u32_vec(&data, "layer_set"),
             parse_ms: get_f64(&data, "parse_ms"),
             worker_heap_bytes: get_f64(&data, "worker_heap_bytes") as usize,
+            hash: hash_slot.clone(),
+            source: source.clone(),
         };
-        // Hand the pending rebuild to the app (it copies across frames) and
-        // terminate the worker now — its ~0.8 GB parse heap is reclaimed while
-        // the main thread copies, so the two never peak together.
+        // Hand the pending rebuild to the app (it copies across frames). The
+        // worker lives on only to hash the file (Phase 6, a few hundred ms
+        // for the largest chip) and is terminated when the hash arrives — its
+        // ~0.8 GB parse heap is reclaimed early in the main thread's copying.
         match crate::design::Reconstruction::new(msg) {
             Ok(r) => *slot_for_msg.borrow_mut() = Some(Ok(r)),
-            Err(err) => *slot_for_msg.borrow_mut() = Some(Err(format!("reconstruct failed: {err}"))),
+            Err(err) => {
+                *slot_for_msg.borrow_mut() = Some(Err(format!("reconstruct failed: {err}")));
+                worker_for_msg.terminate();
+            }
         }
-        worker_for_msg.terminate();
     });
     worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-    onmessage.forget(); // keep alive for the one message; the worker is then dropped
+    onmessage.forget(); // keep alive for the worker's two messages (done, hash)
 
     if let Err(e) = worker.post_message_with_transfer(&payload, &transfer) {
         fail(&slot, format!("worker postMessage failed: {e:?}"));
@@ -773,4 +845,146 @@ impl DrcPool {
         0
     }
     pub fn post(&self, _epoch: u32, _job: &fluideda_core::TileJob, _rules: &[i32]) {}
+}
+
+// --- Phase 6: rooms and the blob store --------------------------------------
+//
+// The server (reached through Trunk's proxy, same origin as the page) binds
+// each room to one design and keeps designs as immutable, content-addressed
+// blobs. Two small async calls: look a room up (to open `?room=` links without
+// a file), and make sure the server has our design (so later joiners can load
+// it from `/blobs/<sha256>`).
+
+/// What `GET /rooms/<name>` says about a room's design.
+#[derive(Debug, Clone, Default)]
+pub struct RoomInfo {
+    /// (sha256, file name, shape-id scheme) — `None` for an unbound room.
+    pub design: Option<(String, String, u32)>,
+}
+
+pub type RoomSlot = Rc<RefCell<Option<Result<RoomInfo, String>>>>;
+
+/// Where the design stands in the server's blob store.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the upload is web-only
+pub enum UploadState {
+    Idle,
+    Checking,
+    Uploading,
+    /// The server already had it.
+    Present,
+    /// We uploaded it.
+    Stored,
+    /// Nothing to upload from (a source that cannot be read again).
+    Unavailable,
+    Failed(String),
+}
+
+impl UploadState {
+    pub fn label(&self) -> String {
+        match self {
+            UploadState::Idle => "idle".into(),
+            UploadState::Checking => "checking".into(),
+            UploadState::Uploading => "uploading".into(),
+            UploadState::Present => "present".into(),
+            UploadState::Stored => "stored".into(),
+            UploadState::Unavailable => "unavailable".into(),
+            UploadState::Failed(e) => format!("failed: {e}"),
+        }
+    }
+}
+
+pub type UploadSlot = Rc<RefCell<UploadState>>;
+
+#[cfg(target_arch = "wasm32")]
+async fn http(url: &str, method: &str, body: Option<&wasm_bindgen::JsValue>) -> Result<web_sys::Response, String> {
+    use wasm_bindgen::JsCast;
+    let win = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_method(method);
+    if let Some(b) = body {
+        init.set_body(b);
+    }
+    let req = web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{method} {url}: {e:?}"))?;
+    let resp = wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&req))
+        .await
+        .map_err(|e| format!("{method} {url}: {e:?}"))?;
+    resp.dyn_into::<web_sys::Response>().map_err(|_| format!("{method} {url}: not a Response"))
+}
+
+/// Look up room `room` (`GET /rooms/<room>`); the answer lands in `slot`.
+#[cfg(target_arch = "wasm32")]
+pub fn fetch_room(room: String, slot: RoomSlot) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let url = format!("/rooms/{room}");
+        let result = async {
+            let resp = http(&url, "GET", None).await?;
+            if !resp.ok() {
+                return Err(format!("GET {url}: HTTP {}", resp.status()));
+            }
+            let json = wasm_bindgen_futures::JsFuture::from(resp.json().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("GET {url}: {e:?}"))?;
+            let d = get_val(&json, "design");
+            let design = (!d.is_null() && !d.is_undefined()).then(|| {
+                (get_str(&d, "hash").unwrap_or_default(), get_str(&d, "name").unwrap_or_default(), get_f64(&d, "ids") as u32)
+            });
+            Ok(RoomInfo { design })
+        }
+        .await;
+        *slot.borrow_mut() = Some(result);
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_room(_room: String, _slot: RoomSlot) {}
+
+/// Make sure the server holds blob `hash`: `HEAD` it, and if it is missing,
+/// read the design again from `source` and `PUT` it. The progress lands in
+/// `slot`. A local `File` streams from disk; a URL is fetched again (usually
+/// from the browser cache); `embedded` is the embedded default's bytes.
+#[cfg(target_arch = "wasm32")]
+pub fn ensure_blob(hash: String, source: crate::design::DesignSource, embedded: &'static [u8], slot: UploadSlot) {
+    use crate::design::DesignSource;
+    *slot.borrow_mut() = UploadState::Checking;
+    wasm_bindgen_futures::spawn_local(async move {
+        let url = format!("/blobs/{hash}");
+        let result = async {
+            let head = http(&url, "HEAD", None).await?;
+            if head.ok() {
+                return Ok(UploadState::Present);
+            }
+            if head.status() != 404 {
+                return Err(format!("HEAD {url}: HTTP {}", head.status()));
+            }
+            *slot.borrow_mut() = UploadState::Uploading;
+            let body: wasm_bindgen::JsValue = match &source {
+                DesignSource::File(f) => f.clone().into(),
+                DesignSource::Embedded => js_sys::Uint8Array::from(embedded).into(),
+                DesignSource::Url(u) => {
+                    let r = http(u, "GET", None).await?;
+                    if !r.ok() {
+                        return Err(format!("GET {u}: HTTP {}", r.status()));
+                    }
+                    wasm_bindgen_futures::JsFuture::from(r.blob().map_err(|e| format!("{e:?}"))?)
+                        .await
+                        .map_err(|e| format!("GET {u}: {e:?}"))?
+                }
+                DesignSource::Unknown => return Ok(UploadState::Unavailable),
+            };
+            let put = http(&url, "PUT", Some(&body)).await?;
+            if put.ok() {
+                Ok(UploadState::Stored)
+            } else {
+                Err(format!("PUT {url}: HTTP {}", put.status()))
+            }
+        }
+        .await;
+        *slot.borrow_mut() = result.unwrap_or_else(UploadState::Failed);
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn ensure_blob(_hash: String, _source: crate::design::DesignSource, _embedded: &'static [u8], slot: UploadSlot) {
+    *slot.borrow_mut() = UploadState::Unavailable;
 }
