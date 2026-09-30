@@ -166,6 +166,24 @@ async function main() {
       a12.geom_edits === 2 && b12.geom_edits === 2,
       'move-after-vertex-edit stays a geometry record (edit preserved)'
     );
+
+    // --- Phase 5d: insert / delete vertex --------------------------------------
+
+    // 13. A inserts a vertex on a fresh TOP shape (5): the ring grows by one and
+    //     ships whole (SetPoints), so B must see the same count.
+    await cmd(A, 'select 5'); await sleep(150);
+    await cmd(B, 'select 5'); await sleep(150);
+    const before = (await state(A)).sel_points;
+    await cmd(A, 'vertex_insert 0 1 1');
+    const a13 = await waitFor(A, (s) => s.sel_points === before + 1, 'A inserted a vertex');
+    const b13 = await waitFor(B, (s) => s.sel_points === before + 1, "B sees A's inserted vertex");
+    check(a13.sel_points === b13.sel_points, `insert-vertex converges A→B (${before} → ${b13.sel_points})`);
+
+    // 14. B deletes that vertex again (a peer edits a count-changed ring).
+    await cmd(B, 'vertex_delete 1');
+    const b14 = await waitFor(B, (s) => s.sel_points === before, 'B deleted the vertex');
+    const a14 = await waitFor(A, (s) => s.sel_points === before, "A sees B's vertex delete");
+    check(a14.sel_points === before && b14.sel_points === before, 'delete-vertex converges B→A');
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

@@ -240,6 +240,78 @@ impl EditOverlay {
     }
 }
 
+/// Vertices of a ring that are handles (the closing duplicate, GDS convention
+/// `last == first`, is not its own vertex).
+pub fn vertex_count(ring: &[Point]) -> usize {
+    match (ring.first(), ring.last()) {
+        (Some(f), Some(l)) if ring.len() > 3 && f == l => ring.len() - 1,
+        _ => ring.len(),
+    }
+}
+
+/// Insert vertex `p` on edge `edge` (from vertex `edge` to the next one) of a
+/// ring — Phase 5d. Keeps a closed ring closed. The caller commits the result
+/// like any vertex edit (`SetPoints` / added-shape geometry: both ship the whole
+/// ring, so a count change needs no new CRDT kind).
+pub fn insert_vertex(ring: &[Point], edge: usize, p: Point) -> Vec<Point> {
+    let n = vertex_count(ring);
+    let closed = n < ring.len();
+    let mut out: Vec<Point> = ring[..n].to_vec();
+    let at = (edge % n.max(1)) + 1;
+    out.insert(at.min(out.len()), p);
+    if closed {
+        out.push(out[0]);
+    }
+    out
+}
+
+/// Delete vertex `i` of a ring — Phase 5d. `None` if fewer than three distinct
+/// vertices would remain or the ring would enclose no area (the edit is then
+/// refused rather than committing a degenerate shape). Keeps a closed ring
+/// closed (deleting vertex 0 moves the closing duplicate with it).
+pub fn delete_vertex(ring: &[Point], i: usize) -> Option<Vec<Point>> {
+    let n = vertex_count(ring);
+    let closed = n < ring.len();
+    if i >= n {
+        return None;
+    }
+    let mut out: Vec<Point> = ring[..n].to_vec();
+    out.remove(i);
+    out.dedup();
+    if out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    if out.len() < 3 || crate::boolean::signed_area2(&out) == 0 {
+        return None;
+    }
+    if closed {
+        out.push(out[0]);
+    }
+    Some(out)
+}
+
+/// The edge of `ring` nearest to `p` and the nearest point on it, as
+/// `(edge index, point, squared distance)` — where an insert would go.
+pub fn nearest_edge(ring: &[Point], p: Point) -> Option<(usize, Point, f64)> {
+    let n = vertex_count(ring);
+    if n < 2 {
+        return None;
+    }
+    let mut best: Option<(usize, Point, f64)> = None;
+    for e in 0..n {
+        let (a, b) = (ring[e], ring[(e + 1) % n]);
+        let (vx, vy) = ((b.x - a.x) as f64, (b.y - a.y) as f64);
+        let l2 = vx * vx + vy * vy;
+        let t = if l2 > 0.0 { (((p.x - a.x) as f64 * vx + (p.y - a.y) as f64 * vy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+        let q = (a.x as f64 + t * vx, a.y as f64 + t * vy);
+        let d2 = (q.0 - p.x as f64).powi(2) + (q.1 - p.y as f64).powi(2);
+        if best.map_or(true, |(_, _, bd)| d2 < bd) {
+            best = Some((e, Point::new(q.0.round() as i32, q.1.round() as i32), d2));
+        }
+    }
+    best
+}
+
 /// Translate a base polygon by `(dx, dy)` nm to produce its moved copy. The
 /// shared helper both the local editor and the CRDT-apply path use, so a move
 /// reconstructed from `(dx, dy)` on a peer is identical to the one made locally.
@@ -342,6 +414,48 @@ mod tests {
         o.add((1, 0), 0, poly());
         o.add((2, 0), 0, poly());
         assert_eq!(o.added.len(), 2);
+    }
+
+    fn sq() -> Vec<Point> {
+        vec![Point::new(0, 0), Point::new(100, 0), Point::new(100, 100), Point::new(0, 100), Point::new(0, 0)]
+    }
+
+    #[test]
+    fn insert_vertex_keeps_a_closed_ring_closed() {
+        let r = insert_vertex(&sq(), 1, Point::new(100, 50)); // on edge (100,0)-(100,100)
+        assert_eq!(
+            r,
+            vec![Point::new(0, 0), Point::new(100, 0), Point::new(100, 50), Point::new(100, 100), Point::new(0, 100), Point::new(0, 0)]
+        );
+        // On the closing edge (vertex 3 → vertex 0): appended before the duplicate.
+        let r = insert_vertex(&sq(), 3, Point::new(0, 50));
+        assert_eq!(r[4], Point::new(0, 50));
+        assert_eq!(r.first(), r.last());
+        assert_eq!(vertex_count(&r), 5);
+    }
+
+    #[test]
+    fn delete_vertex_refuses_degenerate_rings_and_moves_the_duplicate() {
+        let pent = insert_vertex(&sq(), 1, Point::new(150, 50));
+        let back = delete_vertex(&pent, 2).unwrap();
+        assert_eq!(back, sq(), "deleting the inserted vertex restores the square");
+        // Deleting vertex 0 keeps the ring closed on the new first vertex.
+        let r = delete_vertex(&pent, 0).unwrap();
+        assert_eq!(r.first(), r.last());
+        assert_eq!(r[0], Point::new(100, 0));
+        // A triangle cannot lose a vertex.
+        let tri = vec![Point::new(0, 0), Point::new(10, 0), Point::new(0, 10), Point::new(0, 0)];
+        assert!(delete_vertex(&tri, 1).is_none());
+        // Nor may a delete leave zero area (collinear remains).
+        let flat = vec![Point::new(0, 0), Point::new(10, 0), Point::new(20, 0), Point::new(10, 5), Point::new(0, 0)];
+        assert!(delete_vertex(&flat, 3).is_none());
+    }
+
+    #[test]
+    fn nearest_edge_finds_the_insert_point() {
+        let (e, q, d2) = nearest_edge(&sq(), Point::new(104, 30)).unwrap();
+        assert_eq!((e, q), (1, Point::new(100, 30)));
+        assert!((d2 - 16.0).abs() < 1e-9);
     }
 
     #[test]

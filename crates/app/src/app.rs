@@ -575,6 +575,66 @@ impl FluidApp {
         best.map(|(i, _)| i)
     }
 
+    /// The selection's outline edge under screen point `p` (within the handle
+    /// grab radius) and the snapped cell-local point on it — where a
+    /// double-click inserts a vertex (Phase 5d).
+    fn edge_at(&self, sel: Selection, p: egui::Pos2, rect: egui::Rect) -> Option<(usize, Point)> {
+        let (_, pts) = self.selection_geometry(sel)?;
+        let n = Self::handle_count(&pts);
+        if n < 2 {
+            return None;
+        }
+        let scr: Vec<egui::Pos2> = pts
+            .iter()
+            .take(n)
+            .map(|q| {
+                let (wx, wy) = self.selected_tf.apply_point(*q);
+                self.world_to_screen(Vec2::new(wx as f32, wy as f32), rect)
+            })
+            .collect();
+        let mut best: Option<(usize, f32)> = None;
+        for e in 0..n {
+            let (a, b) = (scr[e], scr[(e + 1) % n]);
+            let ab = b - a;
+            let l2 = ab.length_sq();
+            let t = if l2 > 0.0 { ((p - a).dot(ab) / l2).clamp(0.0, 1.0) } else { 0.0 };
+            let d2 = (a + ab * t - p).length_sq();
+            if d2 <= Self::HANDLE_GRAB_PX * Self::HANDLE_GRAB_PX && best.map_or(true, |(_, bd)| d2 < bd) {
+                best = Some((e, d2));
+            }
+        }
+        let (e, _) = best?;
+        // Pointer → world → cell-local, snapped, then clamped onto the edge.
+        let w = self.camera.screen_to_world(Vec2::new(p.x - rect.min.x, p.y - rect.min.y));
+        let (lx, ly) = self.selected_tf.inverse().apply(w.x as f64, w.y as f64);
+        let local = Point::new(snap_nm(lx as f32), snap_nm(ly as f32));
+        let ring: Vec<Point> = pts.iter().take(n).copied().collect();
+        let (_, on_edge, _) = fluideda_core::edit::nearest_edge(&[ring[e], ring[(e + 1) % n]], local)?;
+        Some((e, Point::new(snap_nm(on_edge.x as f32), snap_nm(on_edge.y as f32))))
+    }
+
+    /// Insert a vertex at `p` on edge `edge` of the selection and commit
+    /// (Phase 5d — the ring ships whole, so a count change needs no new CRDT kind).
+    fn insert_vertex(&mut self, sel: Selection, edge: usize, p: Point) {
+        let Some((_, pts)) = self.selection_geometry(sel) else { return };
+        let ring = fluideda_core::edit::insert_vertex(&pts, edge, p);
+        self.preview_ring(sel, ring);
+        self.commit_ring(sel);
+    }
+
+    /// Delete vertex `i` of the selection and commit; refused (status message)
+    /// if the ring would degenerate.
+    fn delete_vertex(&mut self, sel: Selection, i: usize) {
+        let Some((_, pts)) = self.selection_geometry(sel) else { return };
+        match fluideda_core::edit::delete_vertex(&pts, i) {
+            Some(ring) => {
+                self.preview_ring(sel, ring);
+                self.commit_ring(sel);
+            }
+            None => self.status = "can't delete: a shape needs 3 vertices and some area".into(),
+        }
+    }
+
     /// Move vertex `vi` of the drag-start snapshot to `local` (the pointer,
     /// inverse-mapped into the cell frame and snapped), keeping the closing
     /// duplicate in step. Returns the full new ring.
@@ -1597,7 +1657,7 @@ impl FluidApp {
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -1611,6 +1671,11 @@ impl FluidApp {
             self.db.cell(top).shapes.len(),
             self.drc.violation_count(),
             self.drc.pending_tiles(),
+            // Vertex count of the selection's current geometry (Phase 5d:
+            // insert/delete vertex convergence), -1 with no selection.
+            self.selected
+                .and_then(|sel| self.selection_geometry(sel))
+                .map_or(-1i64, |(_, pts)| fluideda_core::edit::vertex_count(&pts) as i64),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -1704,6 +1769,20 @@ impl FluidApp {
                 let y = parts.next().and_then(|s| s.parse::<f32>().ok());
                 if let (Some(x), Some(y)) = (x, y) {
                     self.pick_at(Vec2::new(x, y));
+                }
+            }
+            Some("vertex_insert") => {
+                // `vertex_insert <edge> <x> <y>` — insert a vertex (cell-local
+                // coords) on the selection's edge and commit (Phase 5d driver).
+                let mut n = || parts.next().and_then(|s| s.parse::<i64>().ok());
+                if let (Some(e), Some(x), Some(y), Some(sel)) = (n(), n(), n(), self.selected) {
+                    self.insert_vertex(sel, e as usize, Point::new(x as i32, y as i32));
+                }
+            }
+            Some("vertex_delete") => {
+                // `vertex_delete <i>` — delete vertex i of the selection and commit.
+                if let (Some(i), Some(sel)) = (parts.next().and_then(|s| s.parse::<usize>().ok()), self.selected) {
+                    self.delete_vertex(sel, i);
                 }
             }
             Some("vertex") => {
@@ -2003,6 +2082,7 @@ impl FluidApp {
                     if ui.button("Deselect").clicked() { self.selected = None; }
                 });
                 ui.small(format!("move Δ: ({}, {}) nm", self.move_delta.0, self.move_delta.1));
+                ui.small("double-click a vertex: delete it · an edge: add one");
             }
             if self.last_pick_us > 0.0 {
                 ui.small(format!("last hit-test: {:.0} µs", self.last_pick_us));
@@ -2299,10 +2379,29 @@ impl FluidApp {
             // Edit mode, Select tool: a plain click selects the shape under the
             // cursor (drag still pans, so navigation is unaffected). Clicking
             // empty space deselects. The draw tools consume clicks instead.
-            if self.edit_mode && self.tool == Tool::Select && resp.clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
-                    self.pick_at(self.camera.screen_to_world(local));
+            // Phase 5d: a double-click on the selection's vertex handle deletes
+            // that vertex; on its outline, inserts one there. A click that lands
+            // on the selection's own handles/outline does not re-pick (so the
+            // first click of a double-click can't deselect it).
+            if self.edit_mode && self.tool == Tool::Select {
+                let on_outline = |app: &Self, p: egui::Pos2| {
+                    app.selected.is_some_and(|sel| app.vertex_at(sel, p, rect).is_some() || app.edge_at(sel, p, rect).is_some())
+                };
+                if resp.double_clicked() {
+                    if let (Some(sel), Some(p)) = (self.selected, resp.interact_pointer_pos()) {
+                        if let Some(vi) = self.vertex_at(sel, p, rect) {
+                            self.delete_vertex(sel, vi);
+                        } else if let Some((e, q)) = self.edge_at(sel, p, rect) {
+                            self.insert_vertex(sel, e, q);
+                        }
+                    }
+                } else if resp.clicked() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        if !on_outline(self, p) {
+                            let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
+                            self.pick_at(self.camera.screen_to_world(local));
+                        }
+                    }
                 }
             }
 
