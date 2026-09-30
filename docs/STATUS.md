@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-09-30 · current branch: `phase5d-editing` (off `phase5c-load-perf`)_
+_Last updated: 2026-09-30 · current branch: `phase6-backend-oasis` (off `phase5d-editing`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -15,6 +15,22 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 `docs/AtomicStudio_Implementation_Plan.md`.
 
 ## Where we are
+
+**Phase 6 in progress: formats, backend, out-of-core** on `phase6-backend-oasis`.
+
+* **SLICE 1 — OASIS in and out, and paths.** A streaming OASIS (SEMI P39)
+  reader (`crates/core/oasis.rs`: every element kind incl. all 26 CTRAPEZOID
+  templates, all 12 repetition types, modal variables, deflate CBLOCKs,
+  forward cell references) and writer (`oasis_write.rs`: RECTANGLE / g-delta
+  POLYGON, modal layers, lattice repetitions, per-cell CBLOCKs). Both GDS
+  readers now convert PATHs to outlines — 480 in caravel and 854 in the
+  standard cells were silently missing (sky130 goldens re-baselined). Verified
+  against **KLayout as an independent oracle** (`scripts/oracle/`): on caravel,
+  our GDS read, our read of KLayout's OASIS, and KLayout's read of *our* OASIS
+  all agree cell-for-cell — 1,014 cells, 3,925,013 polygons, 462,523
+  placements. caravel: 291 MB GDS → 16.6 MB our OASIS (KLayout: 10.6 MB); in
+  the browser caravel.oas loads faster than caravel.gds (geometry in 0.88 s vs
+  1.05 s). "Open" takes .oas, "Export OASIS" writes it.
 
 **Phase 5d shipped: the editing follow-ons** on `phase5d-editing` — every
 deferred editing item named in code since Phase 3.
@@ -151,7 +167,7 @@ still byte-identical).
 | 5b — DRC hardening | `phase5b-drc-hardening` | ✅ done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine). SLICE 3: worker pool — check-visible 10.6 s → **1.7 s** (8 workers), identical results |
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
-| 6 — backend/OASIS | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS (moved from the old "Phase 5" label — see the ledger-reshape note) |
+| 6 — backend/OASIS | `phase6-backend-oasis` | ◑ SLICE 1 done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). Next: content-addressed store + persistent rooms, out-of-core chunk streaming |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -249,6 +265,12 @@ still byte-identical).
   staircase bend in caravel_core; unshielded space flagged 272 corner-across-
   interior poly configurations in the standard cells. The accepted cost: a
   corner-overlap "diagonal neck" is not a width flag (tested, documented).
+- **KLayout is the format oracle (Phase 6).** Readers/writers are verified by
+  comparing FluidEDA's reading of a file with KLayout's reading of the same
+  file — normalized polygons (vertex order/collinear points), canonicalized
+  arrays (an AREF's axes may be swapped for the same placements), per-cell
+  digests so a 2.5 M-polygon cell streams (`scripts/oracle/`). Not fixtures:
+  the real chips, both directions.
 - **Rule decks are data, drawing datatypes only.** `Deck::Sky130` (22 layers,
   basic width/space, rule ids from the manual; `dnwell` omitted — its 6.3 µm
   space would widen every tile's reach); `Deck::Blanket` (100/100 everywhere).

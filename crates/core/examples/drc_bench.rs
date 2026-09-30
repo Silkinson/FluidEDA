@@ -25,7 +25,7 @@ fn main() {
     let sweep_all = std::env::args().any(|a| a == "--all");
     let bytes = std::fs::read(&path).expect("read gds");
     let t = Instant::now();
-    let db = fluideda_core::gds::load_gds_db(&bytes).expect("parse");
+    let db = fluideda_core::load_layout_db(&bytes).expect("parse");
     println!("parsed {} in {:.1} s", path, t.elapsed().as_secs_f64());
 
     let rules = fluideda_core::Deck::from_name(&deck).map(|d| d.rules()).unwrap_or_else(DrcRules::default_table);

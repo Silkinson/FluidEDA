@@ -32,7 +32,10 @@ pub mod flatten;
 pub mod gds;
 pub mod gds_stream;
 pub mod gds_write;
+pub mod oasis;
+pub mod oasis_write;
 pub mod index;
+pub mod path;
 pub mod pick;
 pub mod serialize;
 pub mod store;
@@ -50,6 +53,7 @@ pub use drc::{
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, PlacementKey, Shape};
 pub use flatten::{flatten_hop, flatten_placement, placement_counts, FLATTEN_LIMIT};
 pub use gds_write::write_gds;
+pub use oasis_write::write_oasis;
 pub use index::ShapeIndex;
 pub use pick::{pick_composite, pick_hierarchy, pick_in_cell, point_in_polygon, CompositeHit, PickHit, PickTarget};
 pub use serialize::{deserialize, deserialize_from, serialize, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse};
@@ -60,6 +64,16 @@ pub use tess::{
 };
 pub use transform::{Bboxf, Transform};
 pub use types::{Bbox, FlatLayout, Layer, Point, Polygon, Vertex};
+
+/// Parse a layout file of either format into a `CellDb`: OASIS (by its magic
+/// string) or GDSII (Phase 6).
+pub fn load_layout_db(bytes: &[u8]) -> anyhow::Result<CellDb> {
+    if oasis::is_oasis(bytes) {
+        oasis::load_oasis_db(bytes)
+    } else {
+        gds::load_gds_db(bytes)
+    }
+}
 
 /// Convenience (Phase 0 path): bytes -> flattened per-layer meshes + bbox.
 /// Kept for the flat sample and golden-image comparisons.

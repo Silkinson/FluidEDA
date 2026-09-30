@@ -39,7 +39,7 @@ async fn run() {
         None => ("hier.gds".to_string(), HIER.to_vec()),
     };
     println!("file: {label} ({} bytes)", bytes.len());
-    let db = fluideda_core::gds::load_gds_db(&bytes).expect("parse");
+    let db = fluideda_core::load_layout_db(&bytes).expect("parse");
     let wb = db.world_bbox();
     let (cx, cy) = ((wb.min_x + wb.max_x) * 0.5, (wb.min_y + wb.max_y) * 0.5);
 

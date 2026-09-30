@@ -14,6 +14,7 @@ gds21.workspace = true
 lyon.workspace = true
 rstar.workspace = true
 i_overlay.workspace = true
+miniz_oxide.workspace = true
 
 [dev-dependencies]
 libc = "0.2"

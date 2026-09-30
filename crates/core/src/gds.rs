@@ -4,7 +4,8 @@
 //! preserve the hierarchy: each `GdsStruct` becomes a `Cell`, boundaries become
 //! its local shapes, and `SREF`/`AREF` become `Instance`s pointing at other
 //! cells. This is what lets a 10M-shape design stay a few-KB file and render by
-//! culling. Paths/boxes/text are still skipped (Phase 3+); OASIS is Phase 4.
+//! culling. Paths become outline polygons (Phase 6); boxes/text are skipped;
+//! OASIS lives in [`crate::oasis`].
 //!
 //! **Parsing is streaming** (Phase 2b step 3, [`crate::gds_stream`]): a
 //! hand-rolled record reader emits directly into the columnar store, so the
@@ -136,7 +137,21 @@ fn collect(lib: &GdsLibrary) -> Result<CellDbBuilder> {
                         },
                     });
                 }
-                // Paths, boxes, nodes, text: not yet drawn.
+                // Phase 6: paths become their outline polygons (same helper as
+                // the streaming reader, so the two stay cell-for-cell equal).
+                GdsElement::GdsPath(p) => {
+                    let center: Vec<Point> = p.xy.iter().map(|q| Point::new(q.x, q.y)).collect();
+                    if let Some(ring) = crate::path::gds_path_polygon(
+                        &center,
+                        p.width.unwrap_or(0),
+                        p.path_type.unwrap_or(0),
+                        p.begin_extn.unwrap_or(0),
+                        p.end_extn.unwrap_or(0),
+                    ) {
+                        b.cell_mut(id).shapes.push(Layer::new(p.layer as u16, p.datatype as u16), ring);
+                    }
+                }
+                // Boxes, nodes, text: not drawn.
                 _ => {}
             }
         }

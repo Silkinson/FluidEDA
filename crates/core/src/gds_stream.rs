@@ -43,8 +43,9 @@
 //! ## What we read vs skip (same set as the gds21 path)
 //!
 //! Read: BOUNDARY, SREF, AREF (with STRANS/MAG/ANGLE and AREF COLROW + 3-point
-//! XY). Skipped, but correctly consumed to ENDEL so nothing downstream is
-//! misaligned: PATH, TEXT, NODE, BOX. Paths/text/boxes are Phase 3+.
+//! XY), and (Phase 6) PATH, converted to its outline polygon
+//! ([`crate::path`]). Skipped, but correctly consumed to ENDEL so nothing
+//! downstream is misaligned: TEXT, NODE, BOX.
 
 use crate::db::{CellDb, CellDbBuilder, Instance, InstanceKind};
 use crate::transform::Transform;
@@ -71,6 +72,10 @@ const BOX: u8 = 0x2D;
 const STRANS: u8 = 0x1A;
 const MAG: u8 = 0x1B;
 const ANGLE: u8 = 0x1C;
+const WIDTH: u8 = 0x0F;
+const PATHTYPE: u8 = 0x21;
+const BGNEXTN: u8 = 0x30;
+const ENDEXTN: u8 = 0x31;
 
 /// One decoded record: type byte + a borrowed payload slice (no copy).
 struct Record<'a> {
@@ -156,9 +161,11 @@ fn fill(bytes: &[u8], b: &mut CellDbBuilder) -> Result<()> {
             BOUNDARY => acc.begin(Kind::Boundary),
             SREF => acc.begin(Kind::Sref),
             AREF => acc.begin(Kind::Aref),
+            // Phase 6: paths are converted to their outline polygons.
+            PATH => acc.begin(Kind::Path),
             // Consumed but not drawn — accumulator kind stays `Skip`, so ENDEL
             // discards them. Still parsed record-by-record so we stay aligned.
-            PATH | TEXT | NODE | BOX => acc.begin(Kind::Skip),
+            TEXT | NODE | BOX => acc.begin(Kind::Skip),
 
             // Element fields.
             LAYER => acc.layer = read_i16(r.payload, "LAYER")? as u16,
@@ -172,6 +179,10 @@ fn fill(bytes: &[u8], b: &mut CellDbBuilder) -> Result<()> {
             STRANS => acc.reflect = read_u16(r.payload, "STRANS")? & 0x8000 != 0,
             MAG => acc.mag = read_real(r.payload, "MAG")?,
             ANGLE => acc.angle = read_real(r.payload, "ANGLE")?,
+            WIDTH => acc.width = read_i32(r.payload, "WIDTH")?,
+            PATHTYPE => acc.pathtype = read_i16(r.payload, "PATHTYPE")?,
+            BGNEXTN => acc.bgnextn = read_i32(r.payload, "BGNEXTN")?,
+            ENDEXTN => acc.endextn = read_i32(r.payload, "ENDEXTN")?,
 
             ENDEL => {
                 let cell = current.ok_or_else(|| anyhow!("element outside any struct"))?;
@@ -193,6 +204,7 @@ enum Kind {
     Boundary,
     Sref,
     Aref,
+    Path,
 }
 
 /// Fields of the element currently being read, committed on ENDEL. Reused across
@@ -209,6 +221,10 @@ struct ElemAcc {
     angle: f64,
     cols: i32,
     rows: i32,
+    width: i32,
+    pathtype: i16,
+    bgnextn: i32,
+    endextn: i32,
 }
 
 impl Default for ElemAcc {
@@ -224,6 +240,10 @@ impl Default for ElemAcc {
             angle: 0.0,
             cols: 0,
             rows: 0,
+            width: 0,
+            pathtype: 0,
+            bgnextn: 0,
+            endextn: 0,
         }
     }
 }
@@ -242,6 +262,10 @@ impl ElemAcc {
         self.angle = 0.0;
         self.cols = 0;
         self.rows = 0;
+        self.width = 0;
+        self.pathtype = 0;
+        self.bgnextn = 0;
+        self.endextn = 0;
     }
 
     fn points(&self) -> impl Iterator<Item = Point> + '_ {
@@ -303,6 +327,14 @@ impl ElemAcc {
                     kind: InstanceKind::Array { cols, rows, col_step, row_step },
                 });
             }
+            Kind::Path => {
+                let center: Vec<Point> = self.points().collect();
+                if let Some(ring) =
+                    crate::path::gds_path_polygon(&center, self.width, self.pathtype, self.bgnextn, self.endextn)
+                {
+                    b.cell_mut(cell).shapes.push(Layer::new(self.layer, self.datatype), ring);
+                }
+            }
             Kind::Skip | Kind::None => {}
         }
         self.kind = Kind::None;
@@ -328,6 +360,14 @@ fn read_i16(payload: &[u8], what: &str) -> Result<i16> {
         bail!("{what} record too short ({} bytes)", payload.len());
     }
     Ok(i16::from_be_bytes([payload[0], payload[1]]))
+}
+
+fn read_i32(payload: &[u8], what: &str) -> Result<i32> {
+    let b: [u8; 4] = payload
+        .get(..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or_else(|| anyhow!("{what}: payload too short"))?;
+    Ok(i32::from_be_bytes(b))
 }
 
 fn read_u16(payload: &[u8], what: &str) -> Result<u16> {

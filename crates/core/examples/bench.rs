@@ -40,7 +40,7 @@ fn measure(name: &str, bytes: Vec<u8>) {
 
     // --- parse -> CellDb ---
     let t = Instant::now();
-    let db = match fluideda_core::gds::load_gds_db(&bytes) {
+    let db = match fluideda_core::load_layout_db(&bytes) {
         Ok(db) => db,
         Err(e) => {
             println!("  !! parse failed: {e}");

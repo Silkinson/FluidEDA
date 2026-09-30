@@ -164,7 +164,7 @@ pub fn spawn_picker(slot: LoadSlot) {
         .dyn_into::<web_sys::HtmlInputElement>()
         .unwrap();
     input.set_type("file");
-    input.set_accept(".gds,.gds2,.gdsii");
+    input.set_accept(".gds,.gds2,.gdsii,.oas,.oasis");
 
     let input_clone = input.clone();
     let cb = Closure::<dyn FnMut()>::new(move || {

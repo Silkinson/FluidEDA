@@ -98,7 +98,8 @@ mod wasm {
         console_error_panic_hook::set_once();
 
         let t0 = now_ms();
-        let db = fluideda_core::gds::load_gds_db(&bytes)
+        // GDSII or OASIS, sniffed by magic (Phase 6).
+        let db = fluideda_core::load_layout_db(&bytes)
             .map_err(|e| JsValue::from_str(&format!("parse failed: {e}")))?;
         drop(bytes); // free the raw file (278 MB on caravel) before serializing
         let parse_ms = now_ms() - t0;

@@ -1087,12 +1087,20 @@ impl FluidApp {
     /// Export the current design (base composited with the edit overlay) to GDSII
     /// and save it (web: download; native: write a file). Phase 3 SLICE 1.
     fn save_gds(&mut self) {
+        self.save_layout(false);
+    }
+
+    /// Export base ⊕ overlay as GDSII or (Phase 6) OASIS and save it.
+    fn save_layout(&mut self, oasis: bool) {
         if self.geometry_pending() {
             self.status = "still loading — save when the geometry is in".into();
             return;
         }
-        let bytes = fluideda_core::write_gds(&self.db, &self.overlay);
-        let name = out_name(&self.metrics.name);
+        let (bytes, name) = if oasis {
+            (fluideda_core::write_oasis(&self.db, &self.overlay), out_name(&self.metrics.name).replace(".gds", ".oas"))
+        } else {
+            (fluideda_core::write_gds(&self.db, &self.overlay), out_name(&self.metrics.name))
+        };
         match webio::save_bytes(&name, &bytes) {
             Ok(()) => self.status = format!("saved {name} ({} KB)", bytes.len() / 1024),
             Err(e) => self.status = format!("save failed: {e}"),
@@ -2291,10 +2299,10 @@ impl FluidApp {
             }
             ui.separator();
 
-            if ui.button("📂 Open GDS…").clicked() {
+            if ui.button("📂 Open GDS / OASIS…").clicked() {
                 webio::spawn_picker(self.load_slot.clone());
             }
-            ui.small("or drag a .gds onto the canvas");
+            ui.small("or drag a .gds / .oas onto the canvas");
             ui.small(format!("file: {}", self.metrics.name));
 
             ui.separator();
@@ -2497,9 +2505,14 @@ impl FluidApp {
                     self.do_redo();
                 }
             });
-            if ui.button("💾 Save GDS").clicked() {
-                self.save_gds();
-            }
+            ui.horizontal(|ui| {
+                if ui.button("💾 Save GDS").clicked() {
+                    self.save_gds();
+                }
+                if ui.button("Export OASIS").on_hover_text("same content, typically 10–30× smaller").clicked() {
+                    self.save_layout(true);
+                }
+            });
 
             ui.separator();
             ui.label("DRC (merge-first, intra-cell)");
@@ -2981,7 +2994,7 @@ impl FluidApp {
 /// `caravel-edited.gds`. Strips any parenthetical suffix (e.g. the embedded label).
 fn out_name(loaded: &str) -> String {
     let base = loaded.split_whitespace().next().unwrap_or("design");
-    let stem = base.strip_suffix(".gds").unwrap_or(base);
+    let stem = [".gds", ".oas", ".oasis"].iter().find_map(|x| base.strip_suffix(x)).unwrap_or(base);
     format!("{stem}-edited.gds")
 }
 
