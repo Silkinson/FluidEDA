@@ -13,7 +13,7 @@ use fluideda_core::{
     CullStats, EditOverlay, Layer, Point, Transform, VisibleSet,
 };
 use fluideda_render::Camera;
-use fluideda_sync::{color_from_id, EditKind, Marker, Presence, Session};
+use fluideda_sync::{color_from_id, BatchOp, EditKind, Marker, Presence, Session};
 use glam::Vec2;
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -203,8 +203,13 @@ pub struct FluidApp {
     /// Poly tool: the snapped vertices accumulated so far (world = TOP-local nm).
     poly_pts: Vec<Point>,
     /// The current selection — a base shape (cell **master** + index; editing it
-    /// updates every placement) or an added shape (by its stable AddId).
+    /// updates every placement) or an added shape (by its stable AddId). The
+    /// *primary* member of `selection_set`: vertex handles, moves and nudges act
+    /// on it.
     selected: Option<Selection>,
+    /// Phase 5d: every selected shape with the placement it was clicked at
+    /// (shift-click toggles members). Delete and the boolean ops act on it all.
+    selection_set: Vec<(Selection, Transform)>,
     /// World transform of the placement that was clicked, for the highlight and for
     /// mapping a world-space drag into the selected cell's local frame. Identity
     /// for a TOP-cell selection.
@@ -356,6 +361,7 @@ impl FluidApp {
             rect_anchor: None,
             poly_pts: Vec::new(),
             selected: None,
+            selection_set: Vec::new(),
             selected_tf: Transform::IDENTITY,
             move_delta: (0, 0),
             drag_move_from: None,
@@ -417,6 +423,7 @@ impl FluidApp {
         // design). Editing/undo keep working immediately.
         self.overlay = EditOverlay::new();
         self.selected = None;
+        self.selection_set.clear();
         self.selected_tf = Transform::IDENTITY;
         self.move_delta = (0, 0);
         self.drag_move_from = None;
@@ -472,30 +479,37 @@ impl FluidApp {
     /// instance hierarchy and resolves to a cell **master** + shape, plus the
     /// clicked placement's world transform.
     fn pick_at(&mut self, world: Vec2) {
-        if self.geometry_pending() {
-            return; // geometry still arriving (Phase 5c): nothing to hit-test yet
+        let hit = self.pick(world);
+        self.selection_set = hit.into_iter().collect();
+        self.set_primary(hit);
+    }
+
+    /// Shift-click (Phase 5d): toggle the shape under `world` in the selection
+    /// set. The toggled-in shape becomes the primary selection (the one vertex
+    /// handles, moves and nudges act on); toggling the primary out promotes the
+    /// most recently added remaining member.
+    fn pick_toggle(&mut self, world: Vec2) {
+        let Some((sel, tf)) = self.pick(world) else { return };
+        if let Some(pos) = self.selection_set.iter().position(|(s, _)| *s == sel) {
+            self.selection_set.remove(pos);
+            let next = self.selection_set.last().copied();
+            self.set_primary(next);
+        } else {
+            self.selection_set.push((sel, tf));
+            self.set_primary(Some((sel, tf)));
         }
-        let p = Point::new(world.x.round() as i32, world.y.round() as i32);
-        let t = web_time::Instant::now();
-        let top = self.db.top;
-        // Last-drawn wins when adds overlap (matches their draw order: on top).
-        for a in self.overlay.added.iter().rev() {
-            if a.cell == top && fluideda_core::point_in_polygon(&a.shape.points, p) {
-                self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
-                self.selected = Some(Selection::Added(a.id));
-                self.selected_tf = Transform::IDENTITY;
-                self.move_delta = (0, 0);
-                return;
-            }
-        }
-        let hit = pick_hierarchy(&self.db, p);
-        self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
+    }
+
+    /// Make `hit` the primary selection (or clear it).
+    fn set_primary(&mut self, hit: Option<(Selection, Transform)>) {
         match hit {
-            Some(h) => {
-                self.selected = Some(Selection::Base(h.id));
-                self.selected_tf = h.world_tf;
-                self.move_delta =
-                    if self.geom_edited.contains(&h.id) { (0, 0) } else { self.existing_delta(h.id) };
+            Some((sel, tf)) => {
+                self.selected = Some(sel);
+                self.selected_tf = tf;
+                self.move_delta = match sel {
+                    Selection::Base(id) if !self.geom_edited.contains(&id) => self.existing_delta(id),
+                    _ => (0, 0),
+                };
             }
             None => {
                 self.selected = None;
@@ -503,6 +517,29 @@ impl FluidApp {
                 self.move_delta = (0, 0);
             }
         }
+    }
+
+    /// The shape under world point `world` and the placement it was hit at:
+    /// drawn (TOP) shapes first — they draw on top — then the base hierarchy,
+    /// resolved to a cell master + shape.
+    fn pick(&mut self, world: Vec2) -> Option<(Selection, Transform)> {
+        if self.geometry_pending() {
+            return None; // geometry still arriving (Phase 5c): nothing to hit-test yet
+        }
+        let p = Point::new(world.x.round() as i32, world.y.round() as i32);
+        let t = web_time::Instant::now();
+        let top = self.db.top;
+        // Last-drawn wins when adds overlap (matches their draw order: on top).
+        let added = self
+            .overlay
+            .added
+            .iter()
+            .rev()
+            .find(|a| a.cell == top && fluideda_core::point_in_polygon(&a.shape.points, p))
+            .map(|a| (Selection::Added(a.id), Transform::IDENTITY));
+        let hit = added.or_else(|| pick_hierarchy(&self.db, p).map(|h| (Selection::Base(h.id), h.world_tf)));
+        self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
+        hit
     }
 
     /// Does world point `w` land inside the selection's *current* geometry? Tests
@@ -786,15 +823,124 @@ impl FluidApp {
     /// a base shape's chunk re-tessellates without it; an added shape's record
     /// tombstones by its AddId.
     fn delete_shape(&mut self, sel: Selection) {
-        match sel {
-            Selection::Base(id) => self.session.set_edit(id, EditKind::Delete),
-            Selection::Added(id) => self.session.delete_added(id),
-        }
+        // Phase 5d: with a multi-selection holding `sel`, delete all of it — one
+        // CRDT transaction, so one undo brings every shape back.
+        let targets: Vec<Selection> = if self.selection_set.iter().any(|(s, _)| *s == sel) {
+            self.selection_set.iter().map(|(s, _)| *s).collect()
+        } else {
+            vec![sel]
+        };
+        let ops = targets
+            .iter()
+            .map(|s| match *s {
+                Selection::Base(id) => BatchOp::Edit(id, EditKind::Delete),
+                Selection::Added(id) => BatchOp::DeleteAdded(id),
+            })
+            .collect();
+        self.session.apply_batch(ops);
         self.reconcile_edits();
-        if self.selected == Some(sel) {
-            self.selected = None;
-            self.move_delta = (0, 0);
+        self.selection_set.retain(|(s, _)| !targets.contains(s));
+        if self.selected.is_some_and(|s| targets.contains(&s)) {
+            self.set_primary(None);
         }
+    }
+
+    // --- Phase 5d SLICE 2: boolean edit ops ----------------------------------
+
+    /// The cell a selection lives in (its coordinate frame).
+    fn sel_cell(&self, sel: Selection) -> Option<CellId> {
+        match sel {
+            Selection::Base(id) => Some(id.0),
+            Selection::Added(id) => self.overlay.find_added(id).map(|a| a.cell),
+        }
+    }
+
+    /// Replace the selection with `op` applied to it (the primary is the first
+    /// operand — `Subtract` removes the others from it and keeps them; the other
+    /// ops consume every operand). All shapes must share one cell (one frame)
+    /// and one layer. The inputs' deletes and the result's adds commit as ONE
+    /// transaction (one undo step); results with holes are keyholed into single
+    /// rings, since a GDS boundary cannot hold a hole.
+    fn apply_boolean(&mut self, op: fluideda_core::boolean::BoolOp) {
+        use fluideda_core::boolean::{boolean, keyhole, BoolOp};
+        let Some(primary) = self.selected else { return };
+        let mut order: Vec<Selection> = vec![primary];
+        order.extend(self.selection_set.iter().map(|(s, _)| *s).filter(|s| *s != primary));
+        if order.len() < 2 {
+            self.status = "boolean: select two or more shapes (shift-click)".into();
+            return;
+        }
+        let mut geo: Vec<(Selection, CellId, Layer, Vec<Point>)> = Vec::new();
+        for sel in &order {
+            match (self.sel_cell(*sel), self.selection_geometry(*sel)) {
+                (Some(c), Some((l, pts))) => geo.push((*sel, c, l, pts)),
+                _ => return,
+            }
+        }
+        let (cell, layer) = (geo[0].1, geo[0].2);
+        if geo.iter().any(|g| g.1 != cell) {
+            self.status = "boolean: shapes must be in the same cell".into();
+            return;
+        }
+        if geo.iter().any(|g| g.2 != layer) {
+            self.status = "boolean: shapes must be on the same layer".into();
+            return;
+        }
+        let first: Vec<&[Point]> = vec![geo[0].3.as_slice()];
+        let rest: Vec<&[Point]> = geo[1..].iter().map(|g| g.3.as_slice()).collect();
+        let all: Vec<&[Point]> = geo.iter().map(|g| g.3.as_slice()).collect();
+        let region = match op {
+            BoolOp::Union => boolean(&all, &[], BoolOp::Union),
+            BoolOp::Difference => boolean(&first, &rest, BoolOp::Difference),
+            // N-ary intersect / xor fold pairwise; intermediate results are
+            // keyholed so their holes survive being fed back in as rings.
+            BoolOp::Intersect | BoolOp::Xor => {
+                let mut acc: Vec<Vec<Point>> = vec![geo[0].3.clone()];
+                for g in &geo[1..] {
+                    let a: Vec<&[Point]> = acc.iter().map(|r| r.as_slice()).collect();
+                    acc = boolean(&a, &[g.3.as_slice()], op).iter().map(keyhole).collect();
+                }
+                let a: Vec<&[Point]> = acc.iter().map(|r| r.as_slice()).collect();
+                boolean(&a, &[], BoolOp::Union)
+            }
+        };
+        if region.is_empty() && op == BoolOp::Intersect {
+            self.status = "intersect: the shapes don't overlap — nothing changed".into();
+            return;
+        }
+        let consumed: Vec<Selection> = if op == BoolOp::Difference { vec![primary] } else { order.clone() };
+        let mut ops: Vec<BatchOp> = consumed
+            .iter()
+            .map(|s| match *s {
+                Selection::Base(id) => BatchOp::Edit(id, EditKind::Delete),
+                Selection::Added(id) => BatchOp::DeleteAdded(id),
+            })
+            .collect();
+        for poly in &region {
+            let mut ring = keyhole(poly);
+            if ring.len() < 3 {
+                continue;
+            }
+            ring.push(ring[0]); // GDS boundary convention: closed
+            ops.push(BatchOp::Add { cell, layer, points: ring });
+        }
+        let minted = self.session.apply_batch(ops);
+        self.reconcile_edits();
+        let tf = self.selected_tf;
+        let old_set = std::mem::take(&mut self.selection_set);
+        let mut new_set: Vec<(Selection, Transform)> = minted.iter().map(|&id| (Selection::Added(id), tf)).collect();
+        if op == BoolOp::Difference {
+            // Keep the cutters selected too (they were not consumed), at the
+            // placements they were clicked at.
+            for s in &order[1..] {
+                let t = old_set.iter().find(|(x, _)| x == s).map_or(tf, |(_, t)| *t);
+                new_set.push((*s, t));
+            }
+        }
+        self.selection_set = new_set;
+        let first_new = minted.first().map(|&id| (Selection::Added(id), tf));
+        self.set_primary(first_new);
+        self.status = format!("{op:?}: {} shape(s) → {} shape(s)", consumed.len(), minted.len());
     }
 
     // --- Phase 5 SLICE 1: draw tools -----------------------------------------
@@ -860,6 +1006,7 @@ impl FluidApp {
     fn do_undo(&mut self) {
         if self.session.undo() {
             self.selected = None;
+            self.selection_set.clear();
             self.reconcile_edits();
         }
     }
@@ -868,6 +1015,7 @@ impl FluidApp {
     fn do_redo(&mut self) {
         if self.session.redo() {
             self.selected = None;
+            self.selection_set.clear();
             self.reconcile_edits();
         }
     }
@@ -1470,6 +1618,13 @@ impl FluidApp {
             }
             None => {}
         }
+        // Drop multi-selection members that no longer exist (a peer deleted
+        // them, or an undo removed an add).
+        let overlay = &self.overlay;
+        self.selection_set.retain(|(s, _)| match *s {
+            Selection::Added(id) => overlay.find_added(id).is_some(),
+            Selection::Base(id) => !overlay.deleted.contains(&id) || overlay.edited.contains_key(&id),
+        });
     }
 
     /// Build an `EditOverlay` from the CRDT's edit records, translating each move
@@ -1657,7 +1812,7 @@ impl FluidApp {
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -1676,6 +1831,7 @@ impl FluidApp {
             self.selected
                 .and_then(|sel| self.selection_geometry(sel))
                 .map_or(-1i64, |(_, pts)| fluideda_core::edit::vertex_count(&pts) as i64),
+            self.selection_set.len(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -1706,8 +1862,51 @@ impl FluidApp {
                 };
                 if cell < self.db.cells.len() && (idx as usize) < self.db.cell(cell).shapes.len() {
                     self.selected = Some(Selection::Base((cell, idx)));
+                    self.selection_set = vec![(Selection::Base((cell, idx)), Transform::IDENTITY)];
                     self.selected_tf = Transform::IDENTITY;
                     self.move_delta = self.existing_delta((cell, idx));
+                }
+            }
+            Some("select_add") => {
+                // `select_add <cell> <idx>` — add a base shape to the
+                // multi-selection and make it primary (Phase 5d; a shift-click).
+                let c = parts.next().and_then(|s| s.parse::<usize>().ok());
+                let i = parts.next().and_then(|s| s.parse::<u32>().ok());
+                if let (Some(c), Some(i)) = (c, i) {
+                    if c < self.db.cells.len() && (i as usize) < self.db.cell(c).shapes.len() {
+                        let hit = (Selection::Base((c, i)), Transform::IDENTITY);
+                        if !self.selection_set.contains(&hit) {
+                            self.selection_set.push(hit);
+                        }
+                        self.set_primary(Some(hit));
+                    }
+                }
+            }
+            Some("select_added_add") => {
+                // `select_added_add <i>` — add the i-th live added shape to the
+                // multi-selection and make it primary (Phase 5d).
+                if let Some(i) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
+                    if let Some(a) = self.overlay.added.get(i) {
+                        let hit = (Selection::Added(a.id), Transform::IDENTITY);
+                        if !self.selection_set.contains(&hit) {
+                            self.selection_set.push(hit);
+                        }
+                        self.set_primary(Some(hit));
+                    }
+                }
+            }
+            Some("boolean") => {
+                // `boolean union|subtract|intersect|xor` over the multi-selection.
+                use fluideda_core::boolean::BoolOp;
+                let op = match parts.next() {
+                    Some("union") => Some(BoolOp::Union),
+                    Some("subtract") => Some(BoolOp::Difference),
+                    Some("intersect") => Some(BoolOp::Intersect),
+                    Some("xor") => Some(BoolOp::Xor),
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    self.apply_boolean(op);
                 }
             }
             Some("select_added") => {
@@ -1717,6 +1916,7 @@ impl FluidApp {
                 if let Some(i) = parts.next().and_then(|s| s.parse::<usize>().ok()) {
                     if let Some(a) = self.overlay.added.get(i) {
                         self.selected = Some(Selection::Added(a.id));
+                        self.selection_set = vec![(Selection::Added(a.id), Transform::IDENTITY)];
                         self.selected_tf = Transform::IDENTITY;
                         self.move_delta = (0, 0);
                     }
@@ -2079,10 +2279,28 @@ impl FluidApp {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Delete").clicked() { self.delete_shape(sel); }
-                    if ui.button("Deselect").clicked() { self.selected = None; }
+                    if ui.button("Deselect").clicked() {
+                        self.selected = None;
+                        self.selection_set.clear();
+                    }
                 });
                 ui.small(format!("move Δ: ({}, {}) nm", self.move_delta.0, self.move_delta.1));
                 ui.small("double-click a vertex: delete it · an edge: add one");
+                // Phase 5d: booleans over the multi-selection (shift-click).
+                if self.selection_set.len() >= 2 {
+                    use fluideda_core::boolean::BoolOp;
+                    ui.label(format!("{} shapes selected", self.selection_set.len()));
+                    ui.horizontal(|ui| {
+                        if ui.button("Union").clicked() { self.apply_boolean(BoolOp::Union); }
+                        if ui.button("Subtract").on_hover_text("primary minus the others").clicked() {
+                            self.apply_boolean(BoolOp::Difference);
+                        }
+                        if ui.button("Intersect").clicked() { self.apply_boolean(BoolOp::Intersect); }
+                        if ui.button("Xor").clicked() { self.apply_boolean(BoolOp::Xor); }
+                    });
+                } else {
+                    ui.small("shift-click to select more (booleans)");
+                }
             }
             if self.last_pick_us > 0.0 {
                 ui.small(format!("last hit-test: {:.0} µs", self.last_pick_us));
@@ -2397,8 +2615,11 @@ impl FluidApp {
                     }
                 } else if resp.clicked() {
                     if let Some(p) = resp.interact_pointer_pos() {
-                        if !on_outline(self, p) {
-                            let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
+                        let local = Vec2::new(p.x - rect.min.x, p.y - rect.min.y);
+                        if shift {
+                            // Shift-click builds a multi-selection (Phase 5d).
+                            self.pick_toggle(self.camera.screen_to_world(local));
+                        } else if !on_outline(self, p) {
                             self.pick_at(self.camera.screen_to_world(local));
                         }
                     }
@@ -2443,6 +2664,29 @@ impl FluidApp {
                 if screen.len() >= 2 {
                     let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 230, 0));
                     painter.add(egui::Shape::closed_line(screen, stroke));
+                }
+            }
+
+            // Phase 5d: the rest of a multi-selection, thinner, at the placements
+            // they were clicked at.
+            for &(sel, tf) in &self.selection_set {
+                if Some(sel) == self.selected {
+                    continue;
+                }
+                if let Some((_, pts)) = self.selection_geometry(sel) {
+                    let screen: Vec<egui::Pos2> = pts
+                        .iter()
+                        .map(|p| {
+                            let (wx, wy) = tf.apply_point(*p);
+                            self.world_to_screen(Vec2::new(wx as f32, wy as f32), rect)
+                        })
+                        .collect();
+                    if screen.len() >= 2 {
+                        painter.add(egui::Shape::closed_line(
+                            screen,
+                            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 170, 0)),
+                        ));
+                    }
                 }
             }
 

@@ -184,6 +184,30 @@ async function main() {
     const b14 = await waitFor(B, (s) => s.sel_points === before, 'B deleted the vertex');
     const a14 = await waitFor(A, (s) => s.sel_points === before, "A sees B's vertex delete");
     check(a14.sel_points === before && b14.sel_points === before, 'delete-vertex converges B→A');
+
+    // --- Phase 5d: boolean ops -------------------------------------------------
+
+    // 15. A draws two overlapping rects on one layer, multi-selects them, and
+    //     unions them: two adds become one, as ONE transaction — B converges,
+    //     and a single undo in A brings both inputs back everywhere.
+    await cmd(A, 'layer 0'); await sleep(100);
+    const adds0 = (await state(A)).adds;
+    await cmd(A, 'draw_rect 20000 20000 22000 21000');
+    const r1 = await waitFor(A, (s) => s.adds === adds0 + 1, 'A drew rect 1');
+    await cmd(A, 'draw_rect 21000 20500 23000 22000');
+    const r2 = await waitFor(A, (s) => s.adds === adds0 + 2, 'A drew rect 2');
+    await cmd(A, `select_added ${r1.selected_added}`); await sleep(100);
+    await cmd(A, `select_added_add ${r2.selected_added}`);
+    await waitFor(A, (s) => s.sel_count === 2, 'A multi-selected both rects');
+    await waitFor(B, (s) => s.adds === adds0 + 2, 'B sees both rects');
+    await cmd(A, 'boolean union');
+    const a15 = await waitFor(A, (s) => s.adds === adds0 + 1, 'A: union replaced 2 shapes with 1');
+    const b15 = await waitFor(B, (s) => s.adds === adds0 + 1, "B converges on A's union");
+    check(a15.adds === b15.adds, `boolean union converges A→B (${adds0 + 2} → ${b15.adds} drawn shapes)`);
+    await cmd(A, 'undo');
+    const a16 = await waitFor(A, (s) => s.adds === adds0 + 2, 'A undid the union in one step');
+    const b16 = await waitFor(B, (s) => s.adds === adds0 + 2, "B sees A's undo of the union");
+    check(a16.adds === adds0 + 2 && b16.adds === adds0 + 2, 'one undo restores both boolean inputs everywhere');
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

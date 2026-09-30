@@ -232,22 +232,41 @@ impl Session {
     /// on one entry; editing *different* shapes keeps both.
     pub fn set_edit(&mut self, id: BaseShapeId, kind: EditKind) {
         let key = key_of(id);
-        let value = match kind {
-            EditKind::Move { dx, dy } => format!("M {dx} {dy}"),
-            EditKind::Delete => "D".to_string(),
-            EditKind::SetPoints(pts) => {
-                let mut v = String::from("P");
-                for p in &pts {
-                    v.push_str(&format!(" {} {}", p.x, p.y));
-                }
-                v
-            }
-        };
+        let value = edit_value(&kind);
         {
             let mut txn = self.doc.transact_mut_with(self.origin.clone());
             self.edits.insert(&mut txn, key, value);
         }
         self.broadcast_local();
+    }
+
+    /// Apply several edits as ONE transaction — one broadcast, and one step on
+    /// this user's undo stack (Phase 5d: a boolean replaces N shapes with M,
+    /// and undo must restore all of them at once). Returns the `AddId`s minted
+    /// for the batch's `Add` ops, in order.
+    pub fn apply_batch(&mut self, ops: Vec<BatchOp>) -> Vec<AddId> {
+        let mut minted = Vec::new();
+        {
+            let mut txn = self.doc.transact_mut_with(self.origin.clone());
+            for op in ops {
+                match op {
+                    BatchOp::Edit(id, kind) => {
+                        self.edits.insert(&mut txn, key_of(id), edit_value(&kind));
+                    }
+                    BatchOp::DeleteAdded(id) => {
+                        self.edits.insert(&mut txn, add_key_of(id), "X".to_string());
+                    }
+                    BatchOp::Add { cell, layer, points } => {
+                        let id: AddId = (self.client_id, self.next_add_seq);
+                        self.next_add_seq += 1;
+                        self.edits.insert(&mut txn, add_key_of(id), add_value(cell, layer, &points));
+                        minted.push(id);
+                    }
+                }
+            }
+        }
+        self.broadcast_local();
+        minted
     }
 
     /// Every edit currently in the CRDT, parsed. The app rebuilds its overlay
@@ -301,10 +320,7 @@ impl Session {
     }
 
     fn write_add(&mut self, id: AddId, cell: CellId, layer: Layer, points: &[Point]) {
-        let mut value = format!("A {} {} {}", cell, layer.layer, layer.datatype);
-        for p in points {
-            value.push_str(&format!(" {} {}", p.x, p.y));
-        }
+        let value = add_value(cell, layer, points);
         {
             let mut txn = self.doc.transact_mut_with(self.origin.clone());
             self.edits.insert(&mut txn, add_key_of(id), value);
@@ -415,6 +431,41 @@ impl Session {
         }
         changed
     }
+}
+
+/// One op of [`Session::apply_batch`].
+#[derive(Debug, Clone)]
+pub enum BatchOp {
+    /// A base-shape edit (move / delete / set points).
+    Edit(BaseShapeId, EditKind),
+    /// Tombstone an added shape.
+    DeleteAdded(AddId),
+    /// A new shape (its id is minted by the batch).
+    Add { cell: CellId, layer: Layer, points: Vec<Point> },
+}
+
+/// The CRDT value of a base-shape edit.
+fn edit_value(kind: &EditKind) -> String {
+    match kind {
+        EditKind::Move { dx, dy } => format!("M {dx} {dy}"),
+        EditKind::Delete => "D".to_string(),
+        EditKind::SetPoints(pts) => {
+            let mut v = String::from("P");
+            for p in pts {
+                v.push_str(&format!(" {} {}", p.x, p.y));
+            }
+            v
+        }
+    }
+}
+
+/// The CRDT value of an added shape's geometry.
+fn add_value(cell: CellId, layer: Layer, points: &[Point]) -> String {
+    let mut value = format!("A {} {} {}", cell, layer.layer, layer.datatype);
+    for p in points {
+        value.push_str(&format!(" {} {}", p.x, p.y));
+    }
+    value
 }
 
 fn key_of(id: BaseShapeId) -> String {
@@ -631,6 +682,28 @@ mod tests {
 
     fn tri(x: i32, y: i32) -> Vec<Point> {
         vec![Point::new(x, y), Point::new(x + 100, y), Point::new(x + 100, y + 80), Point::new(x, y)]
+    }
+
+    #[test]
+    fn batch_is_one_undo_step() {
+        let mut s = Session::new(Presence { cursor: Vec2::ZERO, name: "t".into(), color: [1.0; 4] });
+        let a = s.add_shape(0, Layer::new(1, 0), &[Point::new(0, 0), Point::new(10, 0), Point::new(10, 10)]);
+        let tri = vec![Point::new(0, 0), Point::new(5, 0), Point::new(5, 5)];
+        let minted = s.apply_batch(vec![
+            BatchOp::Edit((0, 3), EditKind::Delete),
+            BatchOp::DeleteAdded(a),
+            BatchOp::Add { cell: 0, layer: Layer::new(1, 0), points: tri.clone() },
+            BatchOp::Add { cell: 0, layer: Layer::new(1, 0), points: tri },
+        ]);
+        assert_eq!(minted.len(), 2);
+        assert_ne!(minted[0], minted[1]);
+        assert_eq!(s.edits().len(), 1, "the base delete");
+        assert_eq!(s.adds().iter().filter(|(_, g)| g.is_some()).count(), 2, "two new adds, the old one tombstoned");
+        // ONE undo reverts the whole batch.
+        assert!(s.undo());
+        assert!(s.edits().is_empty());
+        let live: Vec<AddId> = s.adds().into_iter().filter(|(_, g)| g.is_some()).map(|(id, _)| id).collect();
+        assert_eq!(live, vec![a], "the original add is back, the batch's adds are gone");
     }
 
     #[test]

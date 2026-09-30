@@ -155,6 +155,112 @@ pub fn boolean(a: &[&[Point]], b: &[&[Point]], op: BoolOp) -> Region {
     to_region(ov.overlay(rule, FillRule::NonZero), origin)
 }
 
+/// One polygon with holes → ONE ring, for formats that cannot hold holes (a GDS
+/// BOUNDARY): each hole is bridged into the outer ring along a zero-width slit
+/// between existing vertices (no new coordinates, so everything stays on the
+/// nm grid). Holes are taken leftmost-first; each is joined from its leftmost
+/// vertex to the nearest vertex of the ring built so far that it can *see* —
+/// the bridge crosses no edge, touches no other vertex, and runs through the
+/// polygon's interior. Returns the open ring (CCW, like the outer input).
+///
+/// Every renderer / boolean in FluidEDA reads the slit as intended: the two
+/// bridge edges coincide in opposite directions and cancel under any fill rule.
+pub fn keyhole(poly: &Polygon) -> Vec<Point> {
+    let Some(outer) = poly.first() else { return Vec::new() };
+    let mut ring = outer.clone();
+    let mut holes: Vec<&Vec<Point>> = poly[1..].iter().filter(|h| h.len() >= 3).collect();
+    holes.sort_by_key(|h| h.iter().map(|p| (p.x, p.y)).min().unwrap());
+    for (k, hole) in holes.iter().enumerate() {
+        // Leftmost (then lowest) vertex of the hole.
+        let hi = (0..hole.len()).min_by_key(|&i| (hole[i].x, hole[i].y)).unwrap();
+        let h = hole[hi];
+        // Every edge currently in play: the ring so far + all holes still open.
+        let mut edges: Vec<(Point, Point)> = Vec::new();
+        let mut push_ring = |r: &[Point]| {
+            for i in 0..r.len() {
+                edges.push((r[i], r[(i + 1) % r.len()]));
+            }
+        };
+        push_ring(&ring);
+        for other in &holes[k..] {
+            push_ring(other);
+        }
+        // Candidate ring vertices nearest first; take the first with a clear,
+        // interior line of sight to `h`.
+        let mut cand: Vec<usize> = (0..ring.len()).collect();
+        cand.sort_by_key(|&i| {
+            let (dx, dy) = ((ring[i].x - h.x) as i64, (ring[i].y - h.y) as i64);
+            dx * dx + dy * dy
+        });
+        let visible = |v: Point| -> bool {
+            edges.iter().all(|&(a, b)| !seg_blocks(h, v, a, b))
+                && inside_region(mid(h, v), &ring, &holes[k..])
+        };
+        let Some(&vi) = cand.iter().find(|&&i| ring[i] != h && visible(ring[i])) else {
+            continue; // no bridge found (degenerate input): leave this hole out
+        };
+        // ring[..=vi] → h → around the hole → h → ring[vi] → ring[vi+1..]
+        let v = ring[vi];
+        let mut out = Vec::with_capacity(ring.len() + hole.len() + 3);
+        out.extend_from_slice(&ring[..=vi]);
+        for j in 0..=hole.len() {
+            out.push(hole[(hi + j) % hole.len()]);
+        }
+        out.push(v);
+        out.extend_from_slice(&ring[vi + 1..]);
+        ring = out;
+    }
+    ring
+}
+
+fn mid(a: Point, b: Point) -> (f64, f64) {
+    ((a.x as f64 + b.x as f64) / 2.0, (a.y as f64 + b.y as f64) / 2.0)
+}
+
+/// Does edge `ab` block the bridge `hv`? Any contact other than a shared
+/// endpoint blocks it (a crossing, or `ab` touching the bridge's interior).
+fn seg_blocks(h: Point, v: Point, a: Point, b: Point) -> bool {
+    let orient = |p: Point, q: Point, r: Point| -> i128 {
+        ((q.x - p.x) as i128 * (r.y - p.y) as i128 - (q.y - p.y) as i128 * (r.x - p.x) as i128).signum()
+    };
+    let on = |p: Point, q: Point, r: Point| {
+        r.x >= p.x.min(q.x) && r.x <= p.x.max(q.x) && r.y >= p.y.min(q.y) && r.y <= p.y.max(q.y)
+    };
+    let shared = |p: Point| p == h || p == v;
+    let (o1, o2, o3, o4) = (orient(h, v, a), orient(h, v, b), orient(a, b, h), orient(a, b, v));
+    // Endpoint-only contact is fine.
+    if o1 == 0 && on(h, v, a) && !shared(a) {
+        return true;
+    }
+    if o2 == 0 && on(h, v, b) && !shared(b) {
+        return true;
+    }
+    if (o3 == 0 && on(a, b, h) && !shared(a) && !shared(b)) || (o4 == 0 && on(a, b, v) && !shared(a) && !shared(b)) {
+        return true;
+    }
+    o1 * o2 < 0 && o3 * o4 < 0
+}
+
+/// Is `p` inside the outer `ring` and outside every hole? (Even-odd, f64.)
+fn inside_region(p: (f64, f64), ring: &[Point], holes: &[&Vec<Point>]) -> bool {
+    let inside = |r: &[Point]| {
+        let mut c = false;
+        let n = r.len();
+        for i in 0..n {
+            let (a, b) = (r[i], r[(i + n - 1) % n]);
+            let (ay, by) = (a.y as f64, b.y as f64);
+            if (ay > p.1) != (by > p.1) {
+                let x = a.x as f64 + (p.1 - ay) * (b.x as f64 - a.x as f64) / (by - ay);
+                if p.0 < x {
+                    c = !c;
+                }
+            }
+        }
+        c
+    };
+    inside(ring) && !holes.iter().any(|h| inside(h))
+}
+
 /// Total area of a region (nm², holes subtracted). For tests and sanity checks.
 pub fn region_area2(region: &Region) -> i128 {
     region.iter().flat_map(|poly| poly.iter()).map(|r| signed_area2(r)).sum()
@@ -215,6 +321,31 @@ mod tests {
         for p in &r[0][0] {
             assert!(p.x >= 0 && p.x <= 1000, "clipped to window: {p:?}");
         }
+    }
+
+    #[test]
+    fn keyhole_joins_holes_into_one_ring_with_the_same_area() {
+        // A square with two square holes (the `Difference` output shape).
+        let outer = rect(0, 0, 1000, 1000);
+        let h1 = rect(100, 100, 200, 200);
+        let h2 = rect(600, 500, 300, 300);
+        let r = boolean(&[outer.as_slice()], &[h1.as_slice(), h2.as_slice()], BoolOp::Difference);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].len(), 3, "outer + 2 holes");
+        let ring = keyhole(&r[0]);
+        assert_eq!(ring.len(), 4 + 2 * (4 + 2), "outer + each hole + its two bridge points");
+        // Same area (the slits have none), and the union of the keyholed ring
+        // recovers the original polygon with its holes.
+        assert_eq!(signed_area2(&ring), region_area2(&r));
+        let back = union_clipped([ring.as_slice()], None, Point::new(0, 0));
+        assert_eq!(region_area2(&back), region_area2(&r));
+        assert_eq!(back[0].len(), 3, "the holes come back out of the slit ring");
+    }
+
+    #[test]
+    fn keyhole_of_a_holeless_polygon_is_its_outer_ring() {
+        let r = union_clipped([rect(0, 0, 10, 10).as_slice()], None, Point::new(0, 0));
+        assert_eq!(keyhole(&r[0]), r[0][0]);
     }
 
     #[test]
