@@ -169,10 +169,12 @@ async function main() {
 
     // --- Phase 5d: insert / delete vertex --------------------------------------
 
-    // 13. A inserts a vertex on a fresh TOP shape (5): the ring grows by one and
-    //     ships whole (SetPoints), so B must see the same count.
-    await cmd(A, 'select 5'); await sleep(150);
-    await cmd(B, 'select 5'); await sleep(150);
+    // 13. A inserts a vertex on an untouched TOP shape (3, a 4-vertex strip):
+    //     the ring grows by one and ships whole (SetPoints), so B must see the
+    //     same count.
+    await cmd(A, 'select 3'); await sleep(150);
+    await cmd(B, 'select 3'); await sleep(150);
+    await waitFor(A, (s) => s.selected === 3 && s.sel_points === 4, 'A selected TOP shape 3');
     const before = (await state(A)).sel_points;
     await cmd(A, 'vertex_insert 0 1 1');
     const a13 = await waitFor(A, (s) => s.sel_points === before + 1, 'A inserted a vertex');
@@ -208,6 +210,25 @@ async function main() {
     const a16 = await waitFor(A, (s) => s.adds === adds0 + 2, 'A undid the union in one step');
     const b16 = await waitFor(B, (s) => s.adds === adds0 + 2, "B sees A's undo of the union");
     check(a16.adds === adds0 + 2 && b16.adds === adds0 + 2, 'one undo restores both boolean inputs everywhere');
+
+    // --- Phase 5d: drawing into an instanced master ----------------------------
+
+    // 17. A draws into the LEAF master (cell 0) at its placement (200, 4200) in
+    //     TOP. The add carries cell 0, converges, and — master semantics — is
+    //     part of LEAF wherever LEAF is placed.
+    await cmd(A, 'draw_into 0 200 4200'); await sleep(100);
+    await cmd(A, 'layer 0'); await sleep(100);
+    await cmd(A, 'draw_rect 20 20 180 60'); // LEAF-local coordinates
+    const a17 = await waitFor(A, (s) => s.adds_nontop === 1, 'A drew into the LEAF master');
+    const b17 = await waitFor(B, (s) => s.adds_nontop === 1, "B sees A's add in LEAF");
+    check(a17.adds_nontop === 1 && b17.adds_nontop === 1, 'a shape drawn into a master converges A→B (cell-scoped add)');
+    await cmd(A, 'draw_into top');
+
+    // 18. B clicks it at LEAF's placement: the composite pick resolves the drawn
+    //     shape (smaller than LEAF's base tile under the same point).
+    await cmd(B, 'pick 300 4240');
+    const b18 = await waitFor(B, (s) => s.selected_added >= 0, 'B picked the master add at its placement');
+    check(b18.selected_added >= 0 && b18.selected === -1, 'a shape drawn into a master is pickable at its placement');
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

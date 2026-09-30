@@ -16,6 +16,7 @@ use crate::chunk::ChunkId;
 use crate::db::{CellDb, CellId, InstanceKind};
 use crate::edit::{EditOverlay, Shape};
 use crate::transform::{Bboxf, Transform};
+use crate::types::Bbox;
 use std::collections::HashMap;
 
 /// One instanced draw: a **chunk** of a cell def, and every world transform at
@@ -114,6 +115,24 @@ fn cull_inner(
     count_visible: bool,
     overlay: Option<&EditOverlay>,
 ) -> VisibleSet {
+    // Phase 5d: each edited cell's footprint grown by its own overlay geometry,
+    // so a shape drawn beyond a cell's load-time extent — or into a cell with
+    // no geometry at all — is not culled with the old bbox. O(overlay), once.
+    let mut grown: HashMap<CellId, Bbox> = HashMap::new();
+    if let Some(o) = overlay {
+        let mut grow = |cell: CellId, pts: &[crate::types::Point]| {
+            let b = grown.entry(cell).or_insert_with(|| db.local_bbox(cell));
+            for p in pts {
+                b.expand(*p);
+            }
+        };
+        for (&(c, _), sh) in &o.edited {
+            grow(c, &sh.points);
+        }
+        for a in &o.added {
+            grow(a.cell, &a.shape.points);
+        }
+    }
     let mut ctx = CullCtx {
         db,
         view: *view,
@@ -121,6 +140,7 @@ fn cull_inner(
         min_pixel,
         count_visible,
         overlay,
+        grown,
         grouped: HashMap::new(),
         dirty_cells: std::collections::HashSet::new(),
         edited_placements: HashMap::new(),
@@ -227,6 +247,8 @@ struct CullCtx<'a> {
     count_visible: bool,
     /// Phase 3 overlay, or `None` for the pristine Phase 2b path.
     overlay: Option<&'a EditOverlay>,
+    /// Edited cells' bboxes grown by their overlay geometry (see `cull_inner`).
+    grown: HashMap<CellId, Bbox>,
     grouped: HashMap<(CellId, ChunkId), Vec<Transform>>,
     /// Cells emitted this frame that the overlay edits — their base chunks are
     /// marked `dirty` so tessellation drops the suppressed shapes.
@@ -242,7 +264,7 @@ impl CullCtx<'_> {
     fn walk(&mut self, id: CellId, world_tf: Transform) {
         self.set.stats.nodes_visited += 1;
 
-        let local_bb = self.db.local_bbox(id);
+        let local_bb = self.grown.get(&id).copied().unwrap_or_else(|| self.db.local_bbox(id));
         // Empty cell (no geometry anywhere): nothing to do.
         if local_bb.min.x > local_bb.max.x {
             return;
@@ -262,20 +284,23 @@ impl CullCtx<'_> {
 
         let cell = self.db.cell(id);
 
+        // Phase 3: flag cells the overlay edits so their base chunks are
+        // re-tessellated with suppressed shapes removed, and record this
+        // placement so the overlay's moved/added geometry is drawn here too.
+        // One hash lookup, only for visited cells and only when an overlay is
+        // present — the pristine path (overlay = None) never runs this. Phase
+        // 5d: recorded even for a cell with no base shapes of its own, so a
+        // shape drawn into a pure-hierarchy cell draws at its placements.
+        if self.overlay.map_or(false, |o| o.edits_cell(id)) {
+            self.dirty_cells.insert(id);
+            self.edited_placements.entry(id).or_default().push(world_tf);
+        }
+
         // Emit this cell's visible chunks as instanced draws at `world_tf`. Only
         // when explicitly counting do we query the index for the visible-shape
         // metric — that query (and the lazy index build it triggers) is the bulk
         // of a fit-view frame on a real chip, and the renderer never needs it.
         if !cell.chunks.is_empty() {
-            // Phase 3: flag cells the overlay edits so their base chunks are
-            // re-tessellated with suppressed shapes removed, and record this
-            // placement so the overlay's moved/added geometry is drawn here too.
-            // One hash lookup, only for emitted cells and only when an overlay is
-            // present — the pristine path (overlay = None) never runs this.
-            if self.overlay.map_or(false, |o| o.edits_cell(id)) {
-                self.dirty_cells.insert(id);
-                self.edited_placements.entry(id).or_default().push(world_tf);
-            }
             if self.count_visible {
                 let local_view = world_tf.inverse().apply_bboxf(&self.view);
                 self.set.stats.visible_shapes += cell.index().count(&local_view) as u64;
@@ -472,4 +497,44 @@ fn clip(b: &Bboxf, view: &Bboxf) -> Bboxf {
         b.max_x.min(view.max_x),
         b.max_y.min(view.max_y),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{CellDbBuilder, Instance, InstanceKind};
+    use crate::edit::{EditOverlay, Shape};
+    use crate::types::{Layer, Point};
+
+    /// Phase 5d: a shape drawn into a cell that has NO geometry of its own (and
+    /// so an empty load-time bbox) is emitted at every placement of that cell.
+    #[test]
+    fn drawn_shape_in_an_empty_cell_shows_at_every_placement() {
+        let mut b = CellDbBuilder::new();
+        let top = b.intern("TOP");
+        let empty = b.intern("EMPTY");
+        b.cell_mut(top).shapes.push(Layer::new(1, 0), [
+            Point::new(0, 0),
+            Point::new(10_000, 0),
+            Point::new(10_000, 10_000),
+            Point::new(0, 10_000),
+        ]);
+        for x in [1_000.0, 6_000.0] {
+            b.cell_mut(top).instances.push(Instance {
+                child: empty,
+                transform: Transform::translate(x, 1_000.0),
+                kind: InstanceKind::Single,
+            });
+        }
+        let db = b.build().unwrap();
+        let mut o = EditOverlay::new();
+        let sq = vec![Point::new(0, 0), Point::new(500, 0), Point::new(500, 500), Point::new(0, 500), Point::new(0, 0)];
+        o.add((1, 0), empty, Shape { layer: Layer::new(2, 0), points: sq });
+        let view = Bboxf::new(-1_000.0, -1_000.0, 11_000.0, 11_000.0);
+        let vs = cull_with_overlay(&db, &view, 0.1, 0.5, &o);
+        assert_eq!(vs.overlay.len(), 2, "one world copy per placement");
+        let mut xs: Vec<i32> = vs.overlay.iter().map(|s| s.points[0].x).collect();
+        xs.sort();
+        assert_eq!(xs, vec![1_000, 6_000]);
+    }
 }

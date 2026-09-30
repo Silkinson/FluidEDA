@@ -49,7 +49,7 @@ pub use drc::{
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, Shape};
 pub use gds_write::write_gds;
 pub use index::ShapeIndex;
-pub use pick::{pick_hierarchy, pick_in_cell, point_in_polygon, PickHit};
+pub use pick::{pick_composite, pick_hierarchy, pick_in_cell, point_in_polygon, CompositeHit, PickHit, PickTarget};
 pub use serialize::{deserialize, deserialize_from, serialize, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse};
 pub use store::ShapeStore;
 pub use tess::{

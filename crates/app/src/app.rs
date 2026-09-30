@@ -9,7 +9,7 @@ use crate::paint::{init_renderer, renderer_mut, LayoutPaint};
 use crate::webio::{self, LoadSlot};
 use eframe::egui;
 use fluideda_core::{
-    cull, cull_with_overlay, pick_hierarchy, AddId, BaseShapeId, CellDb, CellId, ChunkId,
+    cull, cull_with_overlay, AddId, BaseShapeId, CellDb, CellId, ChunkId,
     CullStats, EditOverlay, Layer, Point, Transform, VisibleSet,
 };
 use fluideda_render::Camera;
@@ -198,10 +198,15 @@ pub struct FluidApp {
     tool: Tool,
     /// Index into `layers` of the layer new shapes are drawn on.
     active_layer: usize,
-    /// Rect tool: the snapped world anchor of an in-progress corner drag.
+    /// Rect tool: the snapped anchor of an in-progress corner drag, in the draw
+    /// target's local nm.
     rect_anchor: Option<Point>,
-    /// Poly tool: the snapped vertices accumulated so far (world = TOP-local nm).
+    /// Poly tool: the snapped vertices accumulated so far, in the draw target's
+    /// local nm.
     poly_pts: Vec<Point>,
+    /// Phase 5d: the draw target — a cell and the world transform of the
+    /// placement being drawn in. `None` = TOP at identity.
+    draw_ctx: Option<(CellId, Transform)>,
     /// The current selection — a base shape (cell **master** + index; editing it
     /// updates every placement) or an added shape (by its stable AddId). The
     /// *primary* member of `selection_set`: vertex handles, moves and nudges act
@@ -360,6 +365,7 @@ impl FluidApp {
             active_layer: 0,
             rect_anchor: None,
             poly_pts: Vec::new(),
+            draw_ctx: None,
             selected: None,
             selection_set: Vec::new(),
             selected_tf: Transform::IDENTITY,
@@ -440,6 +446,7 @@ impl FluidApp {
         self.active_layer = 0;
         self.rect_anchor = None;
         self.poly_pts.clear();
+        self.draw_ctx = None;
         self.dirty_keys.clear();
         self.renderer_drop_cells.clear();
         self.overlay_dirty = false;
@@ -519,27 +526,49 @@ impl FluidApp {
         }
     }
 
-    /// The shape under world point `world` and the placement it was hit at:
-    /// drawn (TOP) shapes first — they draw on top — then the base hierarchy,
-    /// resolved to a cell master + shape.
+    /// The shape under world point `world` and the placement it was hit at —
+    /// what is *drawn* there (Phase 5d composite pick): base shapes minus
+    /// tombstones, moved / vertex-edited copies where they now are, and drawn
+    /// shapes in any cell at any placement, resolved to a cell master.
     fn pick(&mut self, world: Vec2) -> Option<(Selection, Transform)> {
         if self.geometry_pending() {
             return None; // geometry still arriving (Phase 5c): nothing to hit-test yet
         }
         let p = Point::new(world.x.round() as i32, world.y.round() as i32);
         let t = web_time::Instant::now();
-        let top = self.db.top;
-        // Last-drawn wins when adds overlap (matches their draw order: on top).
-        let added = self
-            .overlay
-            .added
-            .iter()
-            .rev()
-            .find(|a| a.cell == top && fluideda_core::point_in_polygon(&a.shape.points, p))
-            .map(|a| (Selection::Added(a.id), Transform::IDENTITY));
-        let hit = added.or_else(|| pick_hierarchy(&self.db, p).map(|h| (Selection::Base(h.id), h.world_tf)));
+        let hit = fluideda_core::pick_composite(&self.db, &self.overlay, p).map(|h| {
+            let sel = match h.target {
+                fluideda_core::PickTarget::Base(id) => Selection::Base(id),
+                fluideda_core::PickTarget::Added(id) => Selection::Added(id),
+            };
+            (sel, h.world_tf)
+        });
         self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
         hit
+    }
+
+    // --- Phase 5d SLICE 3: drawing into an instanced master -------------------
+
+    /// Where the draw tools author: the context cell and the world transform of
+    /// the placement being drawn in (TOP at identity by default).
+    fn draw_target(&self) -> (CellId, Transform) {
+        self.draw_ctx.unwrap_or((self.db.top, Transform::IDENTITY))
+    }
+
+    /// A world pointer position mapped into the draw target's local frame and
+    /// snapped to the grid there (so a shape drawn into a master sits on the
+    /// master's grid whatever the placement's offset).
+    fn to_draw_local(&self, w: Vec2) -> Point {
+        let (_, tf) = self.draw_target();
+        let (lx, ly) = tf.inverse().apply(w.x as f64, w.y as f64);
+        Point::new(snap_nm(lx as f32), snap_nm(ly as f32))
+    }
+
+    /// Draw-target-local point → screen (for the rect / poly previews).
+    fn draw_local_to_screen(&self, q: Point, rect: egui::Rect) -> egui::Pos2 {
+        let (_, tf) = self.draw_target();
+        let (wx, wy) = tf.apply_point(q);
+        self.world_to_screen(Vec2::new(wx as f32, wy as f32), rect)
     }
 
     /// Does world point `w` land inside the selection's *current* geometry? Tests
@@ -973,17 +1002,19 @@ impl FluidApp {
         self.commit_add(pts);
     }
 
-    /// Commit a brand-new TOP-cell shape on the active layer: mint its AddId via
-    /// the CRDT (full geometry — the documented amendment), reconcile so the
-    /// overlay/upload paths pick it up, and select it.
+    /// Commit a brand-new shape (points in the draw target's local frame) on
+    /// the active layer into the draw target — TOP, or a master drawn into at
+    /// one of its placements (Phase 5d: the shape then appears at EVERY
+    /// placement, master semantics). Mints its AddId via the CRDT (full
+    /// geometry — the documented amendment), reconciles, and selects it.
     fn commit_add(&mut self, pts: Vec<Point>) {
         let layer = self.layers.get(self.active_layer).copied().unwrap_or(Layer::new(1, 0));
-        let top = self.db.top;
-        let id = self.session.add_shape(top, layer, &pts);
+        let (cell, tf) = self.draw_target();
+        let id = self.session.add_shape(cell, layer, &pts);
         self.reconcile_edits();
-        self.selected = Some(Selection::Added(id));
-        self.selected_tf = Transform::IDENTITY;
-        self.move_delta = (0, 0);
+        let hit = (Selection::Added(id), tf);
+        self.selection_set = vec![hit];
+        self.set_primary(Some(hit));
     }
 
     /// Export the current design (base composited with the edit overlay) to GDSII
@@ -1812,7 +1843,7 @@ impl FluidApp {
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -1832,6 +1863,7 @@ impl FluidApp {
                 .and_then(|sel| self.selection_geometry(sel))
                 .map_or(-1i64, |(_, pts)| fluideda_core::edit::vertex_count(&pts) as i64),
             self.selection_set.len(),
+            self.overlay.added.iter().filter(|a| a.cell != top).count(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -1879,6 +1911,21 @@ impl FluidApp {
                             self.selection_set.push(hit);
                         }
                         self.set_primary(Some(hit));
+                    }
+                }
+            }
+            Some("draw_into") => {
+                // `draw_into <cell> [tx ty]` — draw into a master at a placement
+                // translated by (tx, ty) (Phase 5d); `draw_into top` resets.
+                match parts.next() {
+                    Some("top") | None => self.draw_ctx = None,
+                    Some(c) => {
+                        let c = c.parse::<usize>().ok().filter(|&c| c < self.db.cells.len());
+                        let tx = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                        let ty = parts.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                        if let Some(c) = c {
+                            self.draw_ctx = Some((c, Transform::translate(tx, ty)));
+                        }
                     }
                 }
             }
@@ -1944,6 +1991,8 @@ impl FluidApp {
             Some("draw_rect") => {
                 // `draw_rect x0 y0 x1 y1` — commit a rectangle directly (dodges
                 // pixel-accurate synthetic drags, same stance as `select`).
+                // Coordinates are in the draw target's local frame (world, for
+                // TOP — see `draw_into`).
                 let mut n = || parts.next().and_then(|s| s.parse::<i32>().ok());
                 if let (Some(x0), Some(y0), Some(x1), Some(y1)) = (n(), n(), n(), n()) {
                     self.commit_rect(
@@ -2261,6 +2310,29 @@ impl FluidApp {
                         ui.small("drag corner-to-corner");
                     }
                     ui.small(format!("snap: {SNAP_NM} nm grid"));
+                    // Phase 5d: draw into a master at one of its placements.
+                    let (cell, _) = self.draw_target();
+                    let name = self.db.cell(cell).name.clone();
+                    ui.small(format!("drawing into: {name}{}", if cell == self.db.top { " (top)" } else { " — every placement" }));
+                    ui.horizontal(|ui| {
+                        let sel_cell = self.selected.and_then(|s| self.sel_cell(s)).filter(|&c| c != self.db.top);
+                        if ui
+                            .add_enabled(sel_cell.is_some(), egui::Button::new("Draw into selection's cell"))
+                            .on_hover_text("at the placement you clicked the selection in")
+                            .clicked()
+                        {
+                            if let Some(c) = sel_cell {
+                                self.draw_ctx = Some((c, self.selected_tf));
+                                self.poly_pts.clear();
+                                self.rect_anchor = None;
+                            }
+                        }
+                        if ui.add_enabled(self.draw_ctx.is_some(), egui::Button::new("Top")).clicked() {
+                            self.draw_ctx = None;
+                            self.poly_pts.clear();
+                            self.rect_anchor = None;
+                        }
+                    });
                 }
             }
             match self.selected {
@@ -2426,13 +2498,14 @@ impl FluidApp {
                         if resp.drag_started() {
                             if let Some(p) = resp.interact_pointer_pos() {
                                 let w = world_at(p, &self.camera);
-                                self.rect_anchor = Some(Point::new(snap_nm(w.x), snap_nm(w.y)));
+                                self.rect_anchor = Some(self.to_draw_local(w));
                             }
                         }
                         if resp.drag_stopped() {
                             if let (Some(a), Some(p)) = (self.rect_anchor.take(), resp.interact_pointer_pos()) {
                                 let w = world_at(p, &self.camera);
-                                self.commit_rect(a, Point::new(snap_nm(w.x), snap_nm(w.y)));
+                                let b = self.to_draw_local(w);
+                                self.commit_rect(a, b);
                             }
                         }
                     }
@@ -2442,7 +2515,7 @@ impl FluidApp {
                         } else if resp.clicked() {
                             if let Some(p) = resp.interact_pointer_pos() {
                                 let w = world_at(p, &self.camera);
-                                let v = Point::new(snap_nm(w.x), snap_nm(w.y));
+                                let v = self.to_draw_local(w);
                                 if self.poly_pts.last() != Some(&v) {
                                     self.poly_pts.push(v);
                                 }
@@ -2520,10 +2593,11 @@ impl FluidApp {
                             }
                         }
                         Selection::Added(id) => {
-                            // TOP-cell adds: world == local. Preview by translating
-                            // the drag-start snapshot; the CRDT write happens once,
-                            // on release.
-                            let (ddx, ddy) = (d.x.round() as i32, d.y.round() as i32);
+                            // World drag delta → the shape's cell frame (identity
+                            // for TOP; exact under the placement's transform for a
+                            // shape drawn into a master). Preview by translating the
+                            // drag-start snapshot; the CRDT write happens on release.
+                            let (ddx, ddy) = self.world_delta_to_local(d.x as f64, d.y as f64);
                             if let Some(start) = self.drag_geom_start.clone() {
                                 if let Some(a) = self.overlay.find_added_mut(id) {
                                     a.shape.points =
@@ -2757,21 +2831,17 @@ impl FluidApp {
             let preview_stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 220, 255));
             if let Some(a) = self.rect_anchor {
                 if let Some(p) = resp.interact_pointer_pos().or_else(|| resp.hover_pos()) {
-                    let w = world_at(p, &self.camera);
-                    let b = Point::new(snap_nm(w.x), snap_nm(w.y));
-                    let r = egui::Rect::from_two_pos(
-                        self.world_to_screen(Vec2::new(a.x as f32, a.y as f32), rect),
-                        self.world_to_screen(Vec2::new(b.x as f32, b.y as f32), rect),
-                    );
-                    painter.rect_stroke(r, 0.0, preview_stroke, egui::StrokeKind::Outside);
+                    // Corners in the draw target's frame (an axis-aligned local
+                    // rect — under a rotated placement it shows rotated).
+                    let b = self.to_draw_local(world_at(p, &self.camera));
+                    let corners = [a, Point::new(b.x, a.y), b, Point::new(a.x, b.y)];
+                    let screen: Vec<egui::Pos2> = corners.iter().map(|q| self.draw_local_to_screen(*q, rect)).collect();
+                    painter.add(egui::Shape::closed_line(screen, preview_stroke));
                 }
             }
             if !self.poly_pts.is_empty() {
-                let mut screen: Vec<egui::Pos2> = self
-                    .poly_pts
-                    .iter()
-                    .map(|q| self.world_to_screen(Vec2::new(q.x as f32, q.y as f32), rect))
-                    .collect();
+                let mut screen: Vec<egui::Pos2> =
+                    self.poly_pts.iter().map(|q| self.draw_local_to_screen(*q, rect)).collect();
                 if let Some(p) = resp.hover_pos() {
                     screen.push(p); // rubber band to the cursor
                 }

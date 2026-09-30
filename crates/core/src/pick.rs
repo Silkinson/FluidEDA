@@ -42,12 +42,20 @@ pub struct PickHit {
 /// Chunk-bbox prefilter + linear scan of the containing chunk(s) — no R-tree
 /// build (see the module note).
 pub fn pick_in_cell(cell: &Cell, p: Point) -> Option<u32> {
+    pick_in_cell_except(cell, p, None)
+}
+
+/// [`pick_in_cell`] skipping base shapes in `skip` (tombstoned / moved away).
+fn pick_in_cell_except(cell: &Cell, p: Point, skip: Option<&std::collections::HashSet<u32>>) -> Option<u32> {
     let mut best: Option<(u32, i64)> = None;
     for chunk in &cell.chunks {
         if !bbox_contains(&chunk.bbox, p) {
             continue; // point outside this chunk's (loose) bbox
         }
         for i in chunk.start..chunk.end {
+            if skip.is_some_and(|s| s.contains(&i)) {
+                continue;
+            }
             let pts = cell.shapes.points(i as usize);
             // Cheap per-shape bbox reject before the full point-in-polygon test.
             if !shape_bbox_contains(pts, p) {
@@ -127,6 +135,118 @@ fn walk_pick(
                     for c in c0..=c1 {
                         let t = world_tf.then(&crate::cull::placement(&inst.transform, col_step, row_step, c, r));
                         walk_pick(db, inst.child, t, world, best);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What a [`pick_composite`] resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickTarget {
+    /// A base shape — or its moved / vertex-edited copy (same id).
+    Base(crate::edit::BaseShapeId),
+    /// A drawn shape, in whatever cell it was drawn into.
+    Added(crate::edit::AddId),
+}
+
+/// A composite hit: the target and the world transform of the placement it
+/// was hit at (identity for the TOP cell).
+#[derive(Debug, Clone, Copy)]
+pub struct CompositeHit {
+    pub target: PickTarget,
+    pub world_tf: Transform,
+}
+
+/// Pick what is *drawn* under a world point — Phase 5d: base shapes minus
+/// tombstones, moved / vertex-edited copies at their **current** position, and
+/// drawn shapes in **any** cell (a shape drawn into a master is hit at every
+/// placement) — walking the instance hierarchy like [`pick_hierarchy`]. The
+/// smallest world-area candidate wins; on a tie the overlay (drawn on top)
+/// wins. A cell's footprint for pruning is its load-time bbox grown by its own
+/// overlay geometry, so a shape drawn just past a cell's original extent is
+/// still hit (an ancestor's precomputed bbox is not grown — a documented edge).
+pub fn pick_composite(db: &CellDb, overlay: &crate::edit::EditOverlay, world: Point) -> Option<CompositeHit> {
+    let mut grown: std::collections::HashMap<CellId, Bbox> = std::collections::HashMap::new();
+    let mut grow = |cell: CellId, pts: &[Point]| {
+        let b = grown.entry(cell).or_insert_with(|| db.local_bbox(cell));
+        for p in pts {
+            b.expand(*p);
+        }
+    };
+    for (&(c, _), s) in &overlay.edited {
+        grow(c, &s.points);
+    }
+    for a in &overlay.added {
+        grow(a.cell, &a.shape.points);
+    }
+    let mut best: Option<(CompositeHit, f64)> = None;
+    walk_composite(db, overlay, &grown, db.top, Transform::IDENTITY, world, &mut best);
+    best.map(|(h, _)| h)
+}
+
+fn walk_composite(
+    db: &CellDb,
+    overlay: &crate::edit::EditOverlay,
+    grown: &std::collections::HashMap<CellId, Bbox>,
+    id: CellId,
+    world_tf: Transform,
+    world: Point,
+    best: &mut Option<(CompositeHit, f64)>,
+) {
+    let local_bb = grown.get(&id).copied().unwrap_or_else(|| db.local_bbox(id));
+    if local_bb.min.x > local_bb.max.x {
+        return;
+    }
+    if !bboxf_contains(&world_tf.apply_bbox(&local_bb), world) {
+        return;
+    }
+    let cell = db.cell(id);
+    let (lx, ly) = world_tf.inverse().apply_point(world);
+    let local = Point::new(lx.round() as i32, ly.round() as i32);
+    let scale = world_tf.det().abs();
+    let mut offer = |target: PickTarget, pts: &[Point], overlay_wins_ties: bool| {
+        let area = bbox_area(pts) as f64 * scale;
+        let better = best.as_ref().map_or(true, |&(_, a)| if overlay_wins_ties { area <= a } else { area < a });
+        if better {
+            *best = Some((CompositeHit { target, world_tf }, area));
+        }
+    };
+    if let Some(idx) = pick_in_cell_except(cell, local, overlay.suppressed_in(id)) {
+        offer(PickTarget::Base((id, idx)), cell.shapes.points(idx as usize), false);
+    }
+    if overlay.edits_cell(id) {
+        for (&(c, i), s) in &overlay.edited {
+            if c == id && shape_bbox_contains(&s.points, local) && point_in_polygon(&s.points, local) {
+                offer(PickTarget::Base((c, i)), &s.points, true);
+            }
+        }
+        for a in overlay.added.iter().filter(|a| a.cell == id) {
+            if shape_bbox_contains(&a.shape.points, local) && point_in_polygon(&a.shape.points, local) {
+                offer(PickTarget::Added(a.id), &a.shape.points, true);
+            }
+        }
+    }
+    for inst in &cell.instances {
+        match inst.kind {
+            crate::db::InstanceKind::Single => {
+                walk_composite(db, overlay, grown, inst.child, world_tf.then(&inst.transform), world, best);
+            }
+            crate::db::InstanceKind::Array { cols, rows, col_step, row_step } => {
+                if cols <= 0 || rows <= 0 {
+                    continue;
+                }
+                let (wp, hp) = (world.x as f64, world.y as f64);
+                let dot = crate::transform::Bboxf::new(wp - 1.0, hp - 1.0, wp + 1.0, hp + 1.0);
+                let child_bb = grown.get(&inst.child).copied().unwrap_or_else(|| db.local_bbox(inst.child));
+                let (c0, c1, r0, r1) = crate::cull::visible_range(
+                    &dot, world_tf, inst.transform, &child_bb, col_step, row_step, cols, rows,
+                );
+                for r in r0..=r1 {
+                    for c in c0..=c1 {
+                        let t = world_tf.then(&crate::cull::placement(&inst.transform, col_step, row_step, c, r));
+                        walk_composite(db, overlay, grown, inst.child, t, world, best);
                     }
                 }
             }
@@ -262,6 +382,42 @@ mod tests {
         assert_eq!(hit2.id.0, leaf);
         let (ox2, _) = hit2.world_tf.apply(0.0, 0.0);
         assert!((ox2 - 5_002_000.0).abs() < 1.0, "picked the wrong AREF column");
+    }
+
+    /// The composite pick sees the overlay: a moved shape is hit where it IS,
+    /// a deleted one not at all, and a shape drawn into a master is hit at an
+    /// arbitrary placement with that placement's transform.
+    #[test]
+    fn composite_pick_follows_the_overlay_through_the_hierarchy() {
+        use crate::edit::{EditOverlay, Shape};
+        let db = crate::gds::load_gds_db(HIER).unwrap();
+        let leaf = db.id_of("LEAF").expect("LEAF cell");
+        let at = Point::new(5_000_100, 5_000_100); // inside element (0,0)'s base tile
+        let base = pick_hierarchy(&db, at).unwrap().id;
+
+        // Delete that base shape: whatever is hit now, it is not the deleted one.
+        let mut del = EditOverlay::new();
+        del.delete(base);
+        let h = pick_composite(&db, &del, at);
+        assert!(h.map_or(true, |h| h.target != PickTarget::Base(base)), "a deleted shape is not pickable");
+
+        // Move it +50 000 nm in x (LEAF-local): hit at its new place, not the old.
+        let mut mv = EditOverlay::new();
+        let c = db.cell(leaf);
+        mv.move_shape(base, crate::edit::translate(c.shapes.layer(base.1 as usize), c.shapes.points(base.1 as usize), 50_000, 0));
+        let moved_at = Point::new(at.x + 50_000, at.y);
+        let h = pick_composite(&db, &mv, moved_at).expect("hit the moved copy");
+        assert_eq!(h.target, PickTarget::Base(base));
+
+        // Draw a 100 nm square into LEAF at local (50,50): hit through element
+        // (2,0) of the array, with that element's transform.
+        let mut add = EditOverlay::new();
+        let sq = vec![Point::new(50, 50), Point::new(150, 50), Point::new(150, 150), Point::new(50, 150), Point::new(50, 50)];
+        add.add((7, 0), leaf, Shape { layer: crate::types::Layer::new(9, 0), points: sq });
+        let h = pick_composite(&db, &add, Point::new(5_002_100, 5_000_100)).expect("hit the drawn shape");
+        assert_eq!(h.target, PickTarget::Added((7, 0)));
+        let (ox, _) = h.world_tf.apply(0.0, 0.0);
+        assert!((ox - 5_002_000.0).abs() < 1.0, "resolved at element (2,0)");
     }
 
     #[test]
