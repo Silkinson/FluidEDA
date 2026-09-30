@@ -16,6 +16,22 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 
 ## Where we are
 
+**Phase 5c shipped: load performance + the rendering stack** on
+`phase5c-load-perf` (write-up: `docs/phase5c-findings.md`) — the Phase 4
+performance queue.
+
+* **SLICE 1 — single-copy, budgeted design swap.** The parse worker fetches
+  the file itself; each cell's columns are copied once, straight from the
+  transferred buffers (no concatenated intermediate: main heap 434 → 254 MB);
+  the rebuild is budgeted across frames.
+* **SLICE 2 — progressive load, skeleton first.** The 24.6 MB metadata blob is
+  parsed in slices into a skeleton design that installs at once (proxies), then
+  geometry fills in, on-screen cells first. Longest load frame 76–176 → ~50 ms;
+  fit-view first frame 2.7 → 1.7 s.
+* **SLICE 3 — wgpu 30 + egui/eframe 0.36.** Real WebGPU in the browser, first
+  measured: sky130 fit 22 → 60 fps (vs WebGL2-on-Metal); caravel fit 51 → 44
+  (GPU-bound, Dawn trails ANGLE ~14%).
+
 **Phase 5b shipped: DRC hardening** on `phase5b-drc-hardening` — the three
 follow-ups Phase 5's own DRC measurements named, each built and measured (full
 write-up: `docs/phase5b-findings.md`).
@@ -106,6 +122,7 @@ still byte-identical).
 | 4 — integrate + fit-view offload | `phase4` | ✅ done | STEP 1: merged parse-worker + real-editing onto the trunk (build + 39 core + golden green). STEP 2: fit-view tessellation offloaded to a worker (bbox proxy → stream). Longest fit frame ~1.1–1.35 s → **62–64 ms** (caravel / caravan-signoff), leaf unchanged, edit < 2 ms |
 | 5 — authoring + DRC | `phase5-authoring-drc` | ✅ done | SLICE 1: rect/poly draw tools, geometry-carrying CRDT adds with stable `(client, seq)` ids — concurrent adds converge; export covers adds (0 px round-trip). SLICE 2: vertex editing via `SetPoints` (LWW on same shape), non-TOP masters. SLICE 3: intra-cell DRC (exact spacing, per-shape width), overlay-composited, 8 ms/frame budget; caravel_core 10.3 s cold / 9.6 s warm (wasm) |
 | 5b — DRC hardening | `phase5b-drc-hardening` | ✅ done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine). SLICE 3: worker pool — check-visible 10.6 s → **1.7 s** (8 workers), identical results |
+| 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 6 — backend/OASIS | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS (moved from the old "Phase 5" label — see the ledger-reshape note) |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
