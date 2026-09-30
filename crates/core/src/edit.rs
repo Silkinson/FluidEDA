@@ -64,6 +64,12 @@ pub type BaseShapeId = (CellId, u32);
 /// Plain data — core stays network-free; the sync crate maps this to a CRDT key.
 pub type AddId = (u64, u32);
 
+/// One placement of a child cell inside a parent: `(parent cell, index into the
+/// parent's instance list, AREF column, AREF row)` — `(…, 0, 0)` for an SREF.
+/// Stable across peers for the same file (instance order is file order), like
+/// `BaseShapeId`, so a hidden placement is a tiny CRDT op (Phase 5d).
+pub type PlacementKey = (CellId, u32, i32, i32);
+
 /// An overlay polygon (a moved copy or an added shape), in its cell's local nm.
 /// Aliased to [`Polygon`] so the existing tessellator consumes it directly.
 pub type Shape = Polygon;
@@ -92,6 +98,10 @@ pub struct EditOverlay {
     pub edited: HashMap<BaseShapeId, Shape>,
     /// Tombstoned base shapes — a delete, and the base half of every move.
     pub deleted: HashSet<BaseShapeId>,
+    /// Placements hidden by "edit this placement only" (Phase 5d): the element
+    /// is not drawn, picked or exported; its geometry lives on as added shapes
+    /// in the parent (see [`crate::flatten_placement`]).
+    pub hidden: HashSet<PlacementKey>,
 
     /// Cells with any overlay entry. Derived, kept in sync by the mutators; it is
     /// the fast "does this cell need compositing?" flag that keeps every untouched
@@ -108,7 +118,25 @@ impl EditOverlay {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.edited.is_empty() && self.deleted.is_empty()
+        self.added.is_empty() && self.edited.is_empty() && self.deleted.is_empty() && self.hidden.is_empty()
+    }
+
+    /// Hide one placement (Phase 5d). Flags the parent so cull/pick consult
+    /// the hidden set when walking its instances.
+    pub fn hide_placement(&mut self, key: PlacementKey) {
+        self.hidden.insert(key);
+        self.edited_cells.insert(key.0);
+    }
+
+    /// Is this placement hidden?
+    pub fn is_hidden(&self, key: PlacementKey) -> bool {
+        !self.hidden.is_empty() && self.hidden.contains(&key)
+    }
+
+    /// Does `parent` have any hidden placement? (The cheap guard before
+    /// per-element checks.)
+    pub fn hides_in(&self, parent: CellId) -> bool {
+        !self.hidden.is_empty() && self.hidden.iter().any(|k| k.0 == parent)
     }
 
     /// Does this cell carry any overlay entry? A single hash lookup — the guard
@@ -226,7 +254,8 @@ impl EditOverlay {
         }
         let touched = !idxs.is_empty()
             || self.edited.keys().any(|&(c, _)| c == cell)
-            || self.added.iter().any(|a| a.cell == cell);
+            || self.added.iter().any(|a| a.cell == cell)
+            || self.hidden.iter().any(|k| k.0 == cell);
         if idxs.is_empty() {
             self.suppressed.remove(&cell);
         } else {

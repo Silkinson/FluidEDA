@@ -229,6 +229,23 @@ async function main() {
     await cmd(B, 'pick 300 4240');
     const b18 = await waitFor(B, (s) => s.selected_added >= 0, 'B picked the master add at its placement');
     check(b18.selected_added >= 0 && b18.selected === -1, 'a shape drawn into a master is pickable at its placement');
+
+    // --- Phase 5d: edit one placement only (flatten) ---------------------------
+
+    // 19. B flattens LEAF's placement (TOP is placed once ⇒ the TOP→LEAF hop):
+    //     the placement is hidden and its composite — LEAF's 2 base shapes plus
+    //     the shape A drew into LEAF — becomes 3 TOP shapes, in ONE transaction.
+    const s0 = await state(A);
+    await cmd(B, 'flatten_at 300 4300'); // inside LEAF's inner box at the placement
+    const b19 = await waitFor(B, (s) => s.hidden === 1, 'B flattened the placement');
+    const a19 = await waitFor(A, (s) => s.hidden === 1 && s.adds === b19.adds, 'A converges on the flatten');
+    check(b19.adds === s0.adds + 3 && a19.adds === b19.adds, `flatten converges: placement hidden, +3 TOP shapes (${s0.adds} → ${a19.adds})`);
+    check(a19.edited === s0.edited, 'the LEAF master is untouched (no base edits)');
+
+    // 20. One undo in B restores the placement everywhere.
+    await cmd(B, 'undo');
+    const a20 = await waitFor(A, (s) => s.hidden === 0 && s.adds === s0.adds, "A sees B's undo of the flatten");
+    check(a20.hidden === 0 && a20.adds === s0.adds, 'one undo restores the flattened placement everywhere');
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

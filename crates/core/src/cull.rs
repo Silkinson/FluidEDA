@@ -325,9 +325,15 @@ impl CullCtx<'_> {
         }
 
         // Descend into child instances.
-        for inst in &cell.instances {
+        // Phase 5d: placements hidden by "edit this placement only" are skipped
+        // (their geometry is drawn as the parent's added shapes instead).
+        let hides = self.overlay.is_some_and(|o| o.hides_in(id));
+        for (ii, inst) in cell.instances.iter().enumerate() {
             match inst.kind {
                 InstanceKind::Single => {
+                    if hides && self.overlay.is_some_and(|o| o.is_hidden((id, ii as u32, 0, 0))) {
+                        continue;
+                    }
                     self.walk(inst.child, world_tf.then(&inst.transform));
                 }
                 InstanceKind::Array {
@@ -336,7 +342,8 @@ impl CullCtx<'_> {
                     col_step,
                     row_step,
                 } => {
-                    self.walk_array(inst.child, world_tf, inst.transform, cols, rows, col_step, row_step);
+                    let hidden_in = hides.then_some((id, ii as u32));
+                    self.walk_array(inst.child, world_tf, inst.transform, cols, rows, col_step, row_step, hidden_in);
                 }
             }
         }
@@ -354,11 +361,12 @@ impl CullCtx<'_> {
         rows: i32,
         col_step: [f64; 2],
         row_step: [f64; 2],
+        hidden_in: Option<(CellId, u32)>,
     ) {
         if cols <= 0 || rows <= 0 {
             return;
         }
-        let child_bb = self.db.local_bbox(child);
+        let child_bb = self.grown.get(&child).copied().unwrap_or_else(|| self.db.local_bbox(child));
         if child_bb.min.x > child_bb.max.x {
             return;
         }
@@ -390,6 +398,11 @@ impl CullCtx<'_> {
             visible_range(&self.view, parent_world, base, &child_bb, col_step, row_step, cols, rows);
         for r in r0..=r1 {
             for c in c0..=c1 {
+                if let (Some((p, ii)), Some(o)) = (hidden_in, self.overlay) {
+                    if o.is_hidden((p, ii, c, r)) {
+                        continue; // this element was flattened into the parent
+                    }
+                }
                 let t = parent_world.then(&placement(&base, col_step, row_step, c, r));
                 self.walk(child, t);
             }

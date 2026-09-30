@@ -28,6 +28,7 @@ pub mod cull;
 pub mod db;
 pub mod drc;
 pub mod edit;
+pub mod flatten;
 pub mod gds;
 pub mod gds_stream;
 pub mod gds_write;
@@ -46,7 +47,8 @@ pub use drc::{
     build_grid, cell_tiles, check_cell, check_tile, check_tile_columns, gather_tile, Deck, DrcDriver, DrcGrid,
     DrcGridBuilder, DrcKind, DrcRules, DrcStep, LayerRule, PassStats, TileInput, TileJob, TileKey, Violation,
 };
-pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, Shape};
+pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, PlacementKey, Shape};
+pub use flatten::{flatten_hop, flatten_placement, placement_counts, FLATTEN_LIMIT};
 pub use gds_write::write_gds;
 pub use index::ShapeIndex;
 pub use pick::{pick_composite, pick_hierarchy, pick_in_cell, point_in_polygon, CompositeHit, PickHit, PickTarget};

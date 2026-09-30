@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-09-30 · current branch: `phase5c-load-perf` (off `phase5b-drc-hardening`)_
+_Last updated: 2026-09-30 · current branch: `phase5d-editing` (off `phase5c-load-perf`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -15,6 +15,33 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 `docs/AtomicStudio_Implementation_Plan.md`.
 
 ## Where we are
+
+**Phase 5d shipped: the editing follow-ons** on `phase5d-editing` — every
+deferred editing item named in code since Phase 3.
+
+* **SLICE 1 — insert / delete vertex.** Double-click a handle to delete it, an
+  outline to insert one (snapped); rings stay GDS-closed, degenerate results
+  are refused. Vertex edits already ship whole rings, so no new CRDT kind.
+* **SLICE 2 — boolean edit ops + multi-selection.** Shift-click builds a set;
+  Union / Subtract / Intersect / Xor over same-cell same-layer shapes via the
+  Phase 5b kernel; holes are keyholed into single rings (a GDS boundary has
+  none). `Session::apply_batch` makes a boolean — or a multi-delete — one
+  transaction, one undo step.
+* **SLICE 3 — draw into an instanced master.** The draw tools author into a
+  chosen cell at a chosen placement (pointer → placement-inverse → the cell's
+  own grid); the shape appears at every placement. `pick_composite` picks what
+  is *drawn* — tombstones skipped, moved copies where they are, drawn shapes in
+  any cell — so a moved shape is now selectable at its new position.
+* **SLICE 4 — edit one placement only.** "Edit this placement only" hides the
+  clicked placement at the deepest hop whose parent is placed exactly once
+  (a caravel standard cell → flattened into caravel_core: 52 shapes, 0.01 ms)
+  and copies its composite subtree into the parent as ordinary shapes, capped
+  at 50 k. Hidden placements are a tiny CRDT record; cull/pick skip them;
+  export splits an AREF around hidden elements (re-import through our reader
+  AND gds21 flattens to exactly what was drawn).
+
+All of it converges in the two-browser test (insert/delete vertex, union + one
+undo, draw into LEAF + pick it at its placement, flatten + one undo).
 
 **Phase 5c shipped: load performance + the rendering stack** on
 `phase5c-load-perf` (write-up: `docs/phase5c-findings.md`) — the Phase 4
@@ -123,6 +150,7 @@ still byte-identical).
 | 5 — authoring + DRC | `phase5-authoring-drc` | ✅ done | SLICE 1: rect/poly draw tools, geometry-carrying CRDT adds with stable `(client, seq)` ids — concurrent adds converge; export covers adds (0 px round-trip). SLICE 2: vertex editing via `SetPoints` (LWW on same shape), non-TOP masters. SLICE 3: intra-cell DRC (exact spacing, per-shape width), overlay-composited, 8 ms/frame budget; caravel_core 10.3 s cold / 9.6 s warm (wasm) |
 | 5b — DRC hardening | `phase5b-drc-hardening` | ✅ done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid; full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms. SLICE 2: sky130 deck (22 drawing layers, named rules, datatype-filtered, auto-detected) + shielding + projection width. caravel_core **611,680 → 0 flags**; stdcell library 4 (genuine). SLICE 3: worker pool — check-visible 10.6 s → **1.7 s** (8 workers), identical results |
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
+| 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS (moved from the old "Phase 5" label — see the ledger-reshape note) |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
@@ -173,6 +201,16 @@ still byte-identical).
   duplicates geometry and breaks alpha-blended golden match.
 - **`CHUNK_MIN_SHAPES=100k`, `CHUNK_TARGET_SHAPES=16k`** — swept, not guessed. Only
   die-spanning cells get chunked; dense-but-small cells don't.
+- **One placement is edited by flattening it (Phase 5d).** Not cell variants:
+  the clicked placement is hidden (`PlacementKey = (parent, inst, col, row)`,
+  a tiny LWW record) and its composite subtree becomes the parent's ordinary
+  added shapes, so every edit tool, DRC and export already handle it. The hop
+  is the deepest with a parent placed exactly once — hiding an element inside
+  a multiply-placed cell would change every placement of that cell. Capped at
+  `FLATTEN_LIMIT` = 50 k shapes.
+- **Multi-shape edits are one CRDT transaction (Phase 5d).**
+  `Session::apply_batch` — a boolean, a multi-delete or a flatten is one undo
+  step and one broadcast.
 - **Editing is a copy-on-write overlay; the base store is never mutated.** A move
   tombstones the base AND records a moved copy (not an in-place coord rewrite), so
   it builds the same tombstone+add path add/vertex-edit will need. (phase3)
@@ -362,10 +400,10 @@ budgeted design swap, progressive skeleton-first load, wgpu 30 with real
 WebGPU). The renderer's next measured question: why the GPU-bound caravel fit is
 ~14% slower on Dawn-Metal than on ANGLE-Metal.
 
-Remaining editing follow-ons (deferred, named in code): edit one AREF placement
-vs. the master; drawing into an instanced master (draw is TOP-only); insert /
-delete vertex (count-preserving edits only); boolean edit ops (the kernel now
-exists: `crates/core/boolean.rs`).
+The editing follow-ons are done (Phase 5d). Known edges, documented in code: a
+shape drawn past a cell's original extent grows that cell's cull/pick bbox but
+not its ancestors' precomputed ones; picking a flattened placement's copy
+needs a fresh click after the flatten (the app re-picks at the same point).
 
 Then Phase 6: content-addressed store, tile CDN, streaming OASIS (the out-of-core
 story the production-SoC scale ceiling needs).

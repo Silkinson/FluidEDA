@@ -151,12 +151,15 @@ pub enum PickTarget {
     Added(crate::edit::AddId),
 }
 
-/// A composite hit: the target and the world transform of the placement it
-/// was hit at (identity for the TOP cell).
-#[derive(Debug, Clone, Copy)]
+/// A composite hit: the target, the world transform of the placement it was
+/// hit at (identity for the TOP cell), and the placement **path** from TOP down
+/// to the hit's cell — one [`crate::edit::PlacementKey`] per hierarchy hop
+/// (empty for a TOP-cell hit). "Edit this placement only" flattens along it.
+#[derive(Debug, Clone)]
 pub struct CompositeHit {
     pub target: PickTarget,
     pub world_tf: Transform,
+    pub path: Vec<crate::edit::PlacementKey>,
 }
 
 /// Pick what is *drawn* under a world point — Phase 5d: base shapes minus
@@ -182,10 +185,12 @@ pub fn pick_composite(db: &CellDb, overlay: &crate::edit::EditOverlay, world: Po
         grow(a.cell, &a.shape.points);
     }
     let mut best: Option<(CompositeHit, f64)> = None;
-    walk_composite(db, overlay, &grown, db.top, Transform::IDENTITY, world, &mut best);
+    let mut path = Vec::new();
+    walk_composite(db, overlay, &grown, db.top, Transform::IDENTITY, world, &mut path, &mut best);
     best.map(|(h, _)| h)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_composite(
     db: &CellDb,
     overlay: &crate::edit::EditOverlay,
@@ -193,6 +198,7 @@ fn walk_composite(
     id: CellId,
     world_tf: Transform,
     world: Point,
+    path: &mut Vec<crate::edit::PlacementKey>,
     best: &mut Option<(CompositeHit, f64)>,
 ) {
     let local_bb = grown.get(&id).copied().unwrap_or_else(|| db.local_bbox(id));
@@ -208,9 +214,9 @@ fn walk_composite(
     let scale = world_tf.det().abs();
     let mut offer = |target: PickTarget, pts: &[Point], overlay_wins_ties: bool| {
         let area = bbox_area(pts) as f64 * scale;
-        let better = best.as_ref().map_or(true, |&(_, a)| if overlay_wins_ties { area <= a } else { area < a });
+        let better = best.as_ref().map_or(true, |(_, a)| if overlay_wins_ties { area <= *a } else { area < *a });
         if better {
-            *best = Some((CompositeHit { target, world_tf }, area));
+            *best = Some((CompositeHit { target, world_tf, path: path.clone() }, area));
         }
     };
     if let Some(idx) = pick_in_cell_except(cell, local, overlay.suppressed_in(id)) {
@@ -228,10 +234,16 @@ fn walk_composite(
             }
         }
     }
-    for inst in &cell.instances {
+    for (ii, inst) in cell.instances.iter().enumerate() {
+        let ii = ii as u32;
         match inst.kind {
             crate::db::InstanceKind::Single => {
-                walk_composite(db, overlay, grown, inst.child, world_tf.then(&inst.transform), world, best);
+                if overlay.is_hidden((id, ii, 0, 0)) {
+                    continue;
+                }
+                path.push((id, ii, 0, 0));
+                walk_composite(db, overlay, grown, inst.child, world_tf.then(&inst.transform), world, path, best);
+                path.pop();
             }
             crate::db::InstanceKind::Array { cols, rows, col_step, row_step } => {
                 if cols <= 0 || rows <= 0 {
@@ -245,8 +257,13 @@ fn walk_composite(
                 );
                 for r in r0..=r1 {
                     for c in c0..=c1 {
+                        if overlay.is_hidden((id, ii, c, r)) {
+                            continue;
+                        }
                         let t = world_tf.then(&crate::cull::placement(&inst.transform, col_step, row_step, c, r));
-                        walk_composite(db, overlay, grown, inst.child, t, world, best);
+                        path.push((id, ii, c, r));
+                        walk_composite(db, overlay, grown, inst.child, t, world, path, best);
+                        path.pop();
                     }
                 }
             }

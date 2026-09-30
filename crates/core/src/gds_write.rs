@@ -97,35 +97,57 @@ pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
             }
         }
 
-        // Instances (unchanged by the skeleton's edits).
-        for inst in &cell.instances {
+        // Instances. Phase 5d: a placement hidden by "edit this placement
+        // only" is left out (its geometry was flattened into this cell's added
+        // shapes, written above); an AREF with hidden elements is split into
+        // sub-arrays covering exactly the visible ones.
+        for (ii, inst) in cell.instances.iter().enumerate() {
             let child = &db.cells[inst.child].name;
-            let (angle, reflect, mag) = invert_strans(&inst.transform);
+            let strans = invert_strans(&inst.transform);
             match inst.kind {
                 InstanceKind::Single => {
-                    w.record(SREF, &[]);
-                    w.record(SNAME, child.as_bytes());
-                    w.strans(angle, reflect, mag);
-                    w.record(XY, &i32_bytes(&[round(inst.transform.tx), round(inst.transform.ty)]));
-                    w.record(ENDEL, &[]);
+                    if overlay.is_hidden((id, ii as u32, 0, 0)) {
+                        continue;
+                    }
+                    w.sref(child, strans, inst.transform.tx, inst.transform.ty);
                 }
                 InstanceKind::Array { cols, rows, col_step, row_step } => {
-                    w.record(AREF, &[]);
-                    w.record(SNAME, child.as_bytes());
-                    w.strans(angle, reflect, mag);
-                    w.record(COLROW, &i16_bytes(&[cols as i16, rows as i16]));
-                    // Three-point xy: p0 = origin, p1 = p0 + cols·col_step,
-                    // p2 = p0 + rows·row_step (see the module note).
-                    let (p0x, p0y) = (inst.transform.tx, inst.transform.ty);
-                    let p1x = p0x + cols as f64 * col_step[0];
-                    let p1y = p0y + cols as f64 * col_step[1];
-                    let p2x = p0x + rows as f64 * row_step[0];
-                    let p2y = p0y + rows as f64 * row_step[1];
-                    w.record(
-                        XY,
-                        &i32_bytes(&[round(p0x), round(p0y), round(p1x), round(p1y), round(p2x), round(p2y)]),
-                    );
-                    w.record(ENDEL, &[]);
+                    let hidden = |c: i32, r: i32| overlay.is_hidden((id, ii as u32, c, r));
+                    let any_hidden = overlay.hides_in(id) && (0..rows).any(|r| (0..cols).any(|c| hidden(c, r)));
+                    if !any_hidden {
+                        w.aref(child, strans, (inst.transform.tx, inst.transform.ty), cols, rows, col_step, row_step);
+                        continue;
+                    }
+                    let origin = |c: i32, r: i32| {
+                        let t = inst.placement(c, r);
+                        (t.tx, t.ty)
+                    };
+                    // Full rows (no hidden element) merge into row blocks; a row
+                    // with hidden elements becomes one 1-row array per visible run.
+                    let mut r = 0;
+                    while r < rows {
+                        if (0..cols).any(|c| hidden(c, r)) {
+                            let mut c = 0;
+                            while c < cols {
+                                if hidden(c, r) {
+                                    c += 1;
+                                    continue;
+                                }
+                                let c0 = c;
+                                while c < cols && !hidden(c, r) {
+                                    c += 1;
+                                }
+                                w.aref(child, strans, origin(c0, r), c - c0, 1, col_step, row_step);
+                            }
+                            r += 1;
+                        } else {
+                            let r0 = r;
+                            while r < rows && !(0..cols).any(|c| hidden(c, r)) {
+                                r += 1;
+                            }
+                            w.aref(child, strans, origin(0, r0), cols, r - r0, col_step, row_step);
+                        }
+                    }
                 }
             }
         }
@@ -154,6 +176,45 @@ struct Writer(Vec<u8>);
 impl Writer {
     fn new() -> Self {
         Writer(Vec::new())
+    }
+
+    /// One SREF of `child` at `(x, y)` with `strans` = (angle°, reflected, mag).
+    fn sref(&mut self, child: &str, strans: (f64, bool, f64), x: f64, y: f64) {
+        self.record(SREF, &[]);
+        self.record(SNAME, child.as_bytes());
+        self.strans(strans.0, strans.1, strans.2);
+        self.record(XY, &i32_bytes(&[round(x), round(y)]));
+        self.record(ENDEL, &[]);
+    }
+
+    /// One AREF (a 1×1 array is written as an SREF). Three-point xy: p0 =
+    /// origin, p1 = p0 + cols·col_step, p2 = p0 + rows·row_step (see the module
+    /// note).
+    #[allow(clippy::too_many_arguments)]
+    fn aref(
+        &mut self,
+        child: &str,
+        strans: (f64, bool, f64),
+        (p0x, p0y): (f64, f64),
+        cols: i32,
+        rows: i32,
+        col_step: [f64; 2],
+        row_step: [f64; 2],
+    ) {
+        if cols == 1 && rows == 1 {
+            self.sref(child, strans, p0x, p0y);
+            return;
+        }
+        self.record(AREF, &[]);
+        self.record(SNAME, child.as_bytes());
+        self.strans(strans.0, strans.1, strans.2);
+        self.record(COLROW, &i16_bytes(&[cols as i16, rows as i16]));
+        let p1x = p0x + cols as f64 * col_step[0];
+        let p1y = p0y + cols as f64 * col_step[1];
+        let p2x = p0x + rows as f64 * row_step[0];
+        let p2y = p0y + rows as f64 * row_step[1];
+        self.record(XY, &i32_bytes(&[round(p0x), round(p0y), round(p1x), round(p1y), round(p2x), round(p2y)]));
+        self.record(ENDEL, &[]);
     }
 
     /// One GDS record: u16 length (incl. this 4-byte header, BE), u16 tag (BE),
@@ -368,6 +429,67 @@ mod tests {
     #[test]
     fn round_trip_fixture_via_gds21() {
         assert_round_trip(FIXTURE, crate::gds::load_gds_db_gds21, "fixture/gds21");
+    }
+
+    /// Phase 5d: hidden placements are left out of the export — an AREF with
+    /// hidden elements is split into sub-arrays around them — and the flattened
+    /// copies travel as the parent's shapes. Re-imported by BOTH readers, the
+    /// file flattens to exactly what was drawn.
+    #[test]
+    fn hidden_placements_export_as_split_arrays() {
+        use crate::db::{CellDbBuilder, Instance};
+        use crate::transform::Transform;
+        let rect = |x: i32, y: i32, w: i32, h: i32| {
+            vec![Point::new(x, y), Point::new(x + w, y), Point::new(x + w, y + h), Point::new(x, y + h), Point::new(x, y)]
+        };
+        let mut b = CellDbBuilder::new();
+        let top = b.intern("TOP");
+        let leaf = b.intern("LEAF");
+        b.cell_mut(leaf).shapes.push(Layer::new(1, 0), rect(0, 0, 100, 100));
+        b.cell_mut(top).shapes.push(Layer::new(2, 0), rect(-400, -400, 50, 50));
+        b.cell_mut(top).instances.push(Instance {
+            child: leaf,
+            transform: Transform::translate(0.0, 0.0),
+            kind: InstanceKind::Array { cols: 4, rows: 3, col_step: [500.0, 0.0], row_step: [0.0, 700.0] },
+        });
+        b.cell_mut(top).instances.push(Instance {
+            child: leaf,
+            transform: Transform::translate(-2000.0, 0.0),
+            kind: InstanceKind::Single,
+        });
+        let db = b.build().unwrap();
+        // Flatten two elements of the array (one mid-row, one corner) and the SREF.
+        let mut o = EditOverlay::new();
+        for key in [(top, 0, 1, 1), (top, 0, 3, 2), (top, 1, 0, 0)] {
+            for (k, s) in crate::flatten::flatten_placement(&db, &o.clone(), key, 1000).unwrap().into_iter().enumerate() {
+                o.add((key.1 as u64, (key.2 * 10 + key.3 + k as i32) as u32), top, s);
+            }
+            o.hide_placement(key);
+        }
+        let want = {
+            let mut v: Vec<(Layer, Vec<(i32, i32)>)> = crate::flatten::composite_flat(&db, &o)
+                .into_iter()
+                .map(|s| (s.layer, s.points.iter().map(|p| (p.x, p.y)).collect()))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(want.len(), 1 + 12 + 1, "nothing lost or doubled by the flatten");
+        let bytes = write_gds(&db, &o);
+        for (label, reader) in [
+            ("ours", crate::gds::load_gds_db as fn(&[u8]) -> anyhow::Result<CellDb>),
+            ("gds21", crate::gds::load_gds_db_gds21),
+        ] {
+            let re = reader(&bytes).unwrap();
+            let mut got: Vec<(Layer, Vec<(i32, i32)>)> = re
+                .flatten()
+                .polygons
+                .into_iter()
+                .map(|p| (p.layer, p.points.iter().map(|q| (q.x, q.y)).collect()))
+                .collect();
+            got.sort();
+            assert_eq!(got, want, "{label}: re-imported design differs from what was drawn");
+        }
     }
 
     #[test]

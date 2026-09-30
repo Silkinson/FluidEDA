@@ -215,6 +215,14 @@ pub struct FluidApp {
     /// Phase 5d: every selected shape with the placement it was clicked at
     /// (shift-click toggles members). Delete and the boolean ops act on it all.
     selection_set: Vec<(Selection, Transform)>,
+    /// The placement path (TOP → … → the cell) the primary was clicked through,
+    /// and the world point it was clicked at — for "edit this placement only".
+    selected_path: Vec<fluideda_core::PlacementKey>,
+    selected_world: Option<Vec2>,
+    /// The last pick's path (consumed when a pick becomes the selection).
+    last_pick_path: Vec<fluideda_core::PlacementKey>,
+    /// Per-design placement counts (lazy; which hop a flatten may hide).
+    placement_counts: Option<Vec<u64>>,
     /// World transform of the placement that was clicked, for the highlight and for
     /// mapping a world-space drag into the selected cell's local frame. Identity
     /// for a TOP-cell selection.
@@ -368,6 +376,10 @@ impl FluidApp {
             draw_ctx: None,
             selected: None,
             selection_set: Vec::new(),
+            selected_path: Vec::new(),
+            selected_world: None,
+            last_pick_path: Vec::new(),
+            placement_counts: None,
             selected_tf: Transform::IDENTITY,
             move_delta: (0, 0),
             drag_move_from: None,
@@ -430,6 +442,8 @@ impl FluidApp {
         self.overlay = EditOverlay::new();
         self.selected = None;
         self.selection_set.clear();
+        self.selected_path.clear();
+        self.placement_counts = None;
         self.selected_tf = Transform::IDENTITY;
         self.move_delta = (0, 0);
         self.drag_move_from = None;
@@ -489,6 +503,8 @@ impl FluidApp {
         let hit = self.pick(world);
         self.selection_set = hit.into_iter().collect();
         self.set_primary(hit);
+        self.selected_path = if hit.is_some() { std::mem::take(&mut self.last_pick_path) } else { Vec::new() };
+        self.selected_world = hit.map(|_| world);
     }
 
     /// Shift-click (Phase 5d): toggle the shape under `world` in the selection
@@ -504,11 +520,16 @@ impl FluidApp {
         } else {
             self.selection_set.push((sel, tf));
             self.set_primary(Some((sel, tf)));
+            self.selected_path = std::mem::take(&mut self.last_pick_path);
+            self.selected_world = Some(world);
         }
     }
 
-    /// Make `hit` the primary selection (or clear it).
+    /// Make `hit` the primary selection (or clear it). Clears the recorded
+    /// placement path — only a real pick knows it, and `pick_at` sets it after.
     fn set_primary(&mut self, hit: Option<(Selection, Transform)>) {
+        self.selected_path.clear();
+        self.selected_world = None;
         match hit {
             Some((sel, tf)) => {
                 self.selected = Some(sel);
@@ -536,15 +557,61 @@ impl FluidApp {
         }
         let p = Point::new(world.x.round() as i32, world.y.round() as i32);
         let t = web_time::Instant::now();
-        let hit = fluideda_core::pick_composite(&self.db, &self.overlay, p).map(|h| {
-            let sel = match h.target {
-                fluideda_core::PickTarget::Base(id) => Selection::Base(id),
-                fluideda_core::PickTarget::Added(id) => Selection::Added(id),
-            };
-            (sel, h.world_tf)
-        });
+        let hit = fluideda_core::pick_composite(&self.db, &self.overlay, p);
         self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
-        hit
+        let hit = hit?;
+        // Remember where it was hit — the path "edit this placement only" uses.
+        self.last_pick_path = hit.path.clone();
+        let sel = match hit.target {
+            fluideda_core::PickTarget::Base(id) => Selection::Base(id),
+            fluideda_core::PickTarget::Added(id) => Selection::Added(id),
+        };
+        Some((sel, hit.world_tf))
+    }
+
+    // --- Phase 5d SLICE 4: edit one placement only ---------------------------
+
+    /// "Edit this placement only": flatten the clicked placement of the primary
+    /// selection — at the deepest hop whose parent is placed exactly once, so
+    /// exactly this one placement changes — into its parent as ordinary shapes,
+    /// hiding the placement. One transaction (one undo step). Afterwards the
+    /// flattened copy under the same point is selected, ready to edit.
+    fn flatten_selection_placement(&mut self, world: Option<Vec2>) {
+        let path = self.selected_path.clone();
+        let counts = self
+            .placement_counts
+            .get_or_insert_with(|| fluideda_core::placement_counts(&self.db))
+            .clone();
+        let Some(hop) = fluideda_core::flatten_hop(&path, &counts) else {
+            self.status = "already a top-level shape — edit it directly".into();
+            return;
+        };
+        let key = path[hop];
+        let shapes = match fluideda_core::flatten_placement(&self.db, &self.overlay, key, fluideda_core::FLATTEN_LIMIT) {
+            Ok(s) => s,
+            Err(n) => {
+                self.status = format!("too big to flatten here (> {n} shapes) — pick something smaller");
+                return;
+            }
+        };
+        let parent = key.0;
+        let mut ops = vec![BatchOp::Hide(key)];
+        let n = shapes.len();
+        ops.extend(shapes.into_iter().map(|s| BatchOp::Add { cell: parent, layer: s.layer, points: s.points }));
+        self.session.apply_batch(ops);
+        self.reconcile_edits();
+        self.status = format!(
+            "placement flattened into {}: {n} shape(s), editable here only",
+            self.db.cell(parent).name
+        );
+        // Re-select what is now drawn under the click: the flattened copy.
+        match world {
+            Some(w) => self.pick_at(w),
+            None => {
+                self.selection_set.clear();
+                self.set_primary(None);
+            }
+        }
     }
 
     // --- Phase 5d SLICE 3: drawing into an instanced master -------------------
@@ -1607,7 +1674,11 @@ impl FluidApp {
             .collect();
         let new = self.overlay_from_crdt();
         let added_changed = new.added != self.overlay.added;
-        if !added_changed && new.deleted == self.overlay.deleted && new.edited == self.overlay.edited {
+        if !added_changed
+            && new.deleted == self.overlay.deleted
+            && new.edited == self.overlay.edited
+            && new.hidden == self.overlay.hidden
+        {
             return; // nothing edit-related changed (e.g. a marker-only update)
         }
         let changed: Vec<BaseShapeId> = changed_ids(&self.overlay, &new).into_iter().collect();
@@ -1682,6 +1753,14 @@ impl FluidApp {
                     let layer = self.db.cell(cell).shapes.layer(idx as usize);
                     o.move_shape(id, fluideda_core::Shape { layer, points });
                 }
+            }
+        }
+        // Hidden placements (Phase 5d "edit this placement only"). Out-of-range
+        // keys (a peer on a different file) are ignored.
+        for key in self.session.hidden() {
+            let (parent, ii, _, _) = key;
+            if parent < self.db.cells.len() && (ii as usize) < self.db.cell(parent).instances.len() {
+                o.hide_placement(key);
             }
         }
         // Added shapes (Phase 5 SLICE 1): geometry ships in the record; tombstoned
@@ -1843,7 +1922,7 @@ impl FluidApp {
         let moves = self.overlay.edited.len();
         let edited = self.overlay.deleted.len();
         let state = format!(
-            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{}}}",
+            "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{},\"hidden\":{}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -1864,6 +1943,7 @@ impl FluidApp {
                 .map_or(-1i64, |(_, pts)| fluideda_core::edit::vertex_count(&pts) as i64),
             self.selection_set.len(),
             self.overlay.added.iter().filter(|a| a.cell != top).count(),
+            self.overlay.hidden.len(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -1895,6 +1975,7 @@ impl FluidApp {
                 if cell < self.db.cells.len() && (idx as usize) < self.db.cell(cell).shapes.len() {
                     self.selected = Some(Selection::Base((cell, idx)));
                     self.selection_set = vec![(Selection::Base((cell, idx)), Transform::IDENTITY)];
+                    self.selected_path.clear();
                     self.selected_tf = Transform::IDENTITY;
                     self.move_delta = self.existing_delta((cell, idx));
                 }
@@ -1911,6 +1992,18 @@ impl FluidApp {
                             self.selection_set.push(hit);
                         }
                         self.set_primary(Some(hit));
+                    }
+                }
+            }
+            Some("flatten_at") => {
+                // `flatten_at <x> <y>` — pick at a world point and "edit this
+                // placement only" there (Phase 5d driver).
+                let x = parts.next().and_then(|s| s.parse::<f32>().ok());
+                let y = parts.next().and_then(|s| s.parse::<f32>().ok());
+                if let (Some(x), Some(y)) = (x, y) {
+                    self.pick_at(Vec2::new(x, y));
+                    if self.selected.is_some() {
+                        self.flatten_selection_placement(Some(Vec2::new(x, y)));
                     }
                 }
             }
@@ -1964,6 +2057,7 @@ impl FluidApp {
                     if let Some(a) = self.overlay.added.get(i) {
                         self.selected = Some(Selection::Added(a.id));
                         self.selection_set = vec![(Selection::Added(a.id), Transform::IDENTITY)];
+                    self.selected_path.clear();
                         self.selected_tf = Transform::IDENTITY;
                         self.move_delta = (0, 0);
                     }
@@ -2358,6 +2452,15 @@ impl FluidApp {
                 });
                 ui.small(format!("move Δ: ({}, {}) nm", self.move_delta.0, self.move_delta.1));
                 ui.small("double-click a vertex: delete it · an edge: add one");
+                if !self.selected_path.is_empty() {
+                    if ui
+                        .button("Edit this placement only")
+                        .on_hover_text("flatten the clicked placement into its parent; other placements keep the master")
+                        .clicked()
+                    {
+                        self.flatten_selection_placement(self.selected_world);
+                    }
+                }
                 // Phase 5d: booleans over the multi-selection (shift-click).
                 if self.selection_set.len() >= 2 {
                     use fluideda_core::boolean::BoolOp;

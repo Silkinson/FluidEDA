@@ -20,7 +20,7 @@
 
 use anyhow::Result;
 use ewebsock::{WsMessage, WsReceiver, WsSender};
-use fluideda_core::{AddId, BaseShapeId, CellId, Layer, Point};
+use fluideda_core::{AddId, BaseShapeId, CellId, Layer, PlacementKey, Point};
 use glam::Vec2;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -256,6 +256,12 @@ impl Session {
                     BatchOp::DeleteAdded(id) => {
                         self.edits.insert(&mut txn, add_key_of(id), "X".to_string());
                     }
+                    BatchOp::Hide(key) => {
+                        self.edits.insert(&mut txn, hide_key_of(key), "H".to_string());
+                    }
+                    BatchOp::Show(key) => {
+                        self.edits.insert(&mut txn, hide_key_of(key), "S".to_string());
+                    }
                     BatchOp::Add { cell, layer, points } => {
                         let id: AddId = (self.client_id, self.next_add_seq);
                         self.next_add_seq += 1;
@@ -280,6 +286,21 @@ impl Session {
                 out.push((id, kind));
             }
         }
+        out
+    }
+
+    /// Every placement currently hidden (Phase 5d), sorted.
+    pub fn hidden(&self) -> Vec<PlacementKey> {
+        let txn = self.doc.transact();
+        let mut out: Vec<PlacementKey> = self
+            .edits
+            .iter(&txn)
+            .filter_map(|(k, v)| match (parse_hide_key(k), v) {
+                (Some(key), Out::Any(Any::String(s))) if &*s == "H" => Some(key),
+                _ => None,
+            })
+            .collect();
+        out.sort();
         out
     }
 
@@ -442,6 +463,23 @@ pub enum BatchOp {
     DeleteAdded(AddId),
     /// A new shape (its id is minted by the batch).
     Add { cell: CellId, layer: Layer, points: Vec<Point> },
+    /// Hide one placement ("edit this placement only", Phase 5d). Its record
+    /// is LWW like every other: `H` hidden, `S` shown again.
+    Hide(PlacementKey),
+    /// Show a hidden placement again.
+    Show(PlacementKey),
+}
+
+/// `h<parent>:<inst>:<col>:<row>` — cannot collide with base keys (digit-first)
+/// or add keys (`a…`).
+fn hide_key_of(k: PlacementKey) -> String {
+    format!("h{}:{}:{}:{}", k.0, k.1, k.2, k.3)
+}
+
+fn parse_hide_key(k: &str) -> Option<PlacementKey> {
+    let mut it = k.strip_prefix('h')?.split(':');
+    let key = (it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    it.next().is_none().then_some(key)
 }
 
 /// The CRDT value of a base-shape edit.
@@ -704,6 +742,26 @@ mod tests {
         assert!(s.edits().is_empty());
         let live: Vec<AddId> = s.adds().into_iter().filter(|(_, g)| g.is_some()).map(|(id, _)| id).collect();
         assert_eq!(live, vec![a], "the original add is back, the batch's adds are gone");
+    }
+
+    #[test]
+    fn hidden_placements_round_trip_and_undo() {
+        let mut s = Session::new(Presence { cursor: Vec2::ZERO, name: "t".into(), color: [1.0; 4] });
+        assert_eq!(parse_hide_key(&hide_key_of((3, 7, -1, 2))), Some((3, 7, -1, 2)));
+        assert_eq!(parse_hide_key("3:7"), None, "a base key is not a hide key");
+        s.apply_batch(vec![
+            BatchOp::Hide((0, 1, 2, 0)),
+            BatchOp::Add { cell: 0, layer: Layer::new(1, 0), points: vec![Point::new(0, 0), Point::new(1, 0), Point::new(1, 1)] },
+        ]);
+        assert_eq!(s.hidden(), vec![(0, 1, 2, 0)]);
+        assert!(s.edits().is_empty(), "hide keys are not base edits");
+        s.apply_batch(vec![BatchOp::Show((0, 1, 2, 0))]);
+        assert!(s.hidden().is_empty());
+        assert!(s.undo(), "undo the show");
+        assert_eq!(s.hidden(), vec![(0, 1, 2, 0)]);
+        assert!(s.undo(), "undo the flatten");
+        assert!(s.hidden().is_empty());
+        assert!(s.adds().iter().all(|(_, g)| g.is_none()));
     }
 
     #[test]
