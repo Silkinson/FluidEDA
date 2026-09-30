@@ -15,8 +15,10 @@ use std::rc::Rc;
 /// parse synchronously on the next frame (fallback path).
 pub type LoadSlot = Rc<RefCell<Option<(String, Vec<u8>)>>>;
 
-/// The worker path drops a reconstructed `Design` (or an error string) here.
-pub type DesignSlot = Rc<RefCell<Option<Result<crate::design::Design, String>>>>;
+/// The worker path drops a pending [`Reconstruction`](crate::design::Reconstruction)
+/// (or an error string) here; the app advances it across frames and installs
+/// the finished design (Phase 5c).
+pub type DesignSlot = Rc<RefCell<Option<Result<crate::design::Reconstruction, String>>>>;
 
 /// Does this browser support Web Workers (the off-main-thread parse path)?
 #[cfg(target_arch = "wasm32")]
@@ -233,39 +235,23 @@ pub fn spawn_worker_bytes(_name: String, _bytes: Vec<u8>, _slot: DesignSlot) {}
 #[cfg(target_arch = "wasm32")]
 const WORKER_URL: &str = "assets/worker/parse_worker.js";
 
-/// Fetch `url` and hand its bytes to the parse worker; the reconstructed `Design`
-/// lands in `slot`. The file bytes are transferred (not copied) into the worker.
+/// Parse the file at `url` in the worker — which **fetches it itself** (Phase
+/// 5c), so the body never materialises on the main thread. The pending
+/// reconstruction lands in `slot`. `file_bytes` for the metrics comes from the
+/// worker's reply.
 #[cfg(target_arch = "wasm32")]
 pub fn spawn_worker_fetch(url: String, slot: DesignSlot) {
-    use wasm_bindgen::JsCast;
     let name = url.rsplit('/').next().unwrap_or("file.gds").to_string();
-    wasm_bindgen_futures::spawn_local(async move {
-        let Some(win) = web_sys::window() else { return };
-        let fut = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(&url));
-        let buf = match fut.await.and_then(|v| v.dyn_into::<web_sys::Response>()) {
-            Ok(r) => match r.array_buffer().map(wasm_bindgen_futures::JsFuture::from) {
-                Ok(p) => match p.await {
-                    Ok(b) => b.dyn_into::<js_sys::ArrayBuffer>().ok(),
-                    Err(e) => {
-                        fail(&slot, format!("fetch body failed: {e:?}"));
-                        return;
-                    }
-                },
-                Err(e) => {
-                    fail(&slot, format!("array_buffer() failed: {e:?}"));
-                    return;
-                }
-            },
-            Err(e) => {
-                fail(&slot, format!("fetch {url} failed: {e:?}"));
-                return;
-            }
-        };
-        match buf {
-            Some(b) => run_worker(name, b, slot),
-            None => fail(&slot, "fetch produced no ArrayBuffer".into()),
-        }
-    });
+    // Absolute URL: a worker resolves relative URLs against its own script.
+    let abs = web_sys::window()
+        .and_then(|w| w.location().href().ok())
+        .and_then(|base| web_sys::Url::new_with_base(&url, &base).ok())
+        .map(|u| u.href())
+        .unwrap_or(url);
+    let payload = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&payload, &"type".into(), &"fetch_parse".into());
+    let _ = js_sys::Reflect::set(&payload, &"url".into(), &abs.into());
+    run_worker(name, payload, js_sys::Array::new(), slot);
 }
 
 /// Hand already-in-wasm `bytes` (drag-drop / picker) to the parse worker. Copies
@@ -275,17 +261,22 @@ pub fn spawn_worker_fetch(url: String, slot: DesignSlot) {
 pub fn spawn_worker_bytes(name: String, bytes: Vec<u8>, slot: DesignSlot) {
     let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
     arr.copy_from(&bytes);
-    run_worker(name, arr.buffer(), slot);
+    let buf = arr.buffer();
+    // Post the bytes with a transfer list (move, not structured-clone copy).
+    let payload = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&payload, &"type".into(), &"parse".into());
+    let _ = js_sys::Reflect::set(&payload, &"bytes".into(), &buf);
+    run_worker(name, payload, js_sys::Array::of1(&buf), slot);
 }
 
-/// Spawn a one-shot worker to parse `buf`, reconstruct the `Design` on the main
-/// thread from its reply, then terminate the worker (reclaiming its parse memory).
+/// Spawn a one-shot parse worker, post it `payload` (with `transfer`), turn its
+/// reply into a pending reconstruction in `slot`, then terminate the worker
+/// (reclaiming its parse memory).
 #[cfg(target_arch = "wasm32")]
-fn run_worker(name: String, buf: js_sys::ArrayBuffer, slot: DesignSlot) {
+fn run_worker(name: String, payload: js_sys::Object, transfer: js_sys::Array, slot: DesignSlot) {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
 
-    let file_bytes = buf.byte_length() as usize;
     let worker = match web_sys::Worker::new(WORKER_URL) {
         Ok(w) => w,
         Err(e) => {
@@ -305,13 +296,20 @@ fn run_worker(name: String, buf: js_sys::ArrayBuffer, slot: DesignSlot) {
             worker_for_msg.terminate();
             return;
         }
-        // type == "done": rebuild the Design from the transferred columns.
+        // type == "done": rebuild the Design from the transferred columns. The
+        // three big columns stay in their transferred JS buffers; the rebuild
+        // copies each cell's slice from there exactly once (Phase 5c).
+        let columns = JsColumns {
+            coords: js_sys::Int32Array::new(&get_val(&data, "coords")),
+            starts: js_sys::Uint32Array::new(&get_val(&data, "starts")),
+            layers: js_sys::ArrayBuffer::from(get_val(&data, "layers")),
+        };
+        let coord_count = columns.coords.length() as usize;
         let msg = crate::design::WorkerMsg {
             name: name_for_msg.clone(),
-            file_bytes,
-            coords: get_i32_vec(&data, "coords"),
-            starts: get_u32_vec(&data, "starts"),
-            layers: get_u32_vec(&data, "layers"),
+            file_bytes: get_f64(&data, "file_bytes") as usize,
+            columns: Box::new(columns),
+            coord_count,
             meta: get_u8_vec(&data, "meta"),
             bbox: get_bbox(&data),
             total_shapes: get_f64(&data, "total_shapes") as u64,
@@ -321,10 +319,11 @@ fn run_worker(name: String, buf: js_sys::ArrayBuffer, slot: DesignSlot) {
             parse_ms: get_f64(&data, "parse_ms"),
             worker_heap_bytes: get_f64(&data, "worker_heap_bytes") as usize,
         };
-        // Combined-peak proof: sample the main heap while the worker is still
-        // alive (its parse memory not yet reclaimed), then reconstruct + terminate.
-        match crate::design::reconstruct(msg) {
-            Ok(design) => *slot_for_msg.borrow_mut() = Some(Ok(design)),
+        // Hand the pending rebuild to the app (it copies across frames) and
+        // terminate the worker now — its ~0.8 GB parse heap is reclaimed while
+        // the main thread copies, so the two never peak together.
+        match crate::design::Reconstruction::new(msg) {
+            Ok(r) => *slot_for_msg.borrow_mut() = Some(Ok(r)),
             Err(err) => *slot_for_msg.borrow_mut() = Some(Err(format!("reconstruct failed: {err}"))),
         }
         worker_for_msg.terminate();
@@ -332,16 +331,68 @@ fn run_worker(name: String, buf: js_sys::ArrayBuffer, slot: DesignSlot) {
     worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
     onmessage.forget(); // keep alive for the one message; the worker is then dropped
 
-    // Post the bytes with a transfer list (move, not structured-clone copy).
-    let payload = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&payload, &"type".into(), &"parse".into());
-    let _ = js_sys::Reflect::set(&payload, &"bytes".into(), &buf);
-    let transfer = js_sys::Array::of1(&buf);
     if let Err(e) = worker.post_message_with_transfer(&payload, &transfer) {
         fail(&slot, format!("worker postMessage failed: {e:?}"));
         worker.terminate();
     }
     let _ = JsValue::NULL; // silence unused import in some cfgs
+}
+
+/// The parse worker's three geometry columns, still in the `ArrayBuffer`s the
+/// worker transferred. [`fluideda_core::ColumnSource`] over them: each cell's
+/// slice is copied once, directly into that cell's `Vec` (`subarray().to_vec()`
+/// allocates uninitialised and memcpys — no zero-fill, no whole-column copy).
+#[cfg(target_arch = "wasm32")]
+struct JsColumns {
+    coords: js_sys::Int32Array,
+    starts: js_sys::Uint32Array,
+    /// Packed layers (u32 each = the `Layer` byte layout); read as u16 pairs.
+    layers: js_sys::ArrayBuffer,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn check_range(off: usize, len: usize, total: u32, what: &str) -> anyhow::Result<(u32, u32)> {
+    match off.checked_add(len).filter(|&e| e <= total as usize) {
+        Some(e) => Ok((off as u32, e as u32)),
+        None => anyhow::bail!("CellDb blob {what} column underrun"),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl fluideda_core::ColumnSource for JsColumns {
+    fn coords_into(&mut self, off: usize, len: usize, out: &mut Vec<i32>) -> anyhow::Result<()> {
+        let (a, b) = check_range(off, len, self.coords.length(), "coords")?;
+        out.reserve(len);
+        let at = out.len();
+        // SAFETY: `reserve` guarantees room for `len` more i32s past `at`; the
+        // subarray holds exactly `len` elements, all written by the copy.
+        unsafe {
+            self.coords.subarray(a, b).raw_copy_to_ptr(out.as_mut_ptr().add(at));
+            out.set_len(at + len);
+        }
+        Ok(())
+    }
+    fn starts(&mut self, off: usize, len: usize) -> anyhow::Result<Vec<u32>> {
+        let (a, b) = check_range(off, len, self.starts.length(), "starts")?;
+        Ok(self.starts.subarray(a, b).to_vec())
+    }
+    fn layers(&mut self, off: usize, len: usize) -> anyhow::Result<Vec<fluideda_core::Layer>> {
+        let total = self.layers.byte_length() / 4;
+        let (a, _) = check_range(off, len, total, "layers")?;
+        // `Layer` is `repr(C) { u16, u16 }` — exactly one packed u32's bytes on
+        // a little-endian target — so view the buffer as u16 pairs and copy
+        // straight into the Vec's storage.
+        let view = js_sys::Uint16Array::new_with_byte_offset_and_length(&self.layers, a * 4, (len * 2) as u32);
+        let mut v: Vec<fluideda_core::Layer> = Vec::with_capacity(len);
+        // SAFETY: `v` has capacity for `len` Layers = `2 * len` u16s, which is
+        // exactly `view`'s length; `raw_copy_to_ptr` writes all of them, and
+        // every bit pattern is a valid `Layer` (Pod).
+        unsafe {
+            view.raw_copy_to_ptr(v.as_mut_ptr() as *mut u16);
+            v.set_len(len);
+        }
+        Ok(v)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

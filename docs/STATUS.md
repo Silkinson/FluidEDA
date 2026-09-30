@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-09-30 · current branch: `phase5b-drc-hardening` (off `phase5-authoring-drc`)_
+_Last updated: 2026-09-30 · current branch: `phase5c-load-perf` (off `phase5b-drc-hardening`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -114,9 +114,9 @@ still byte-identical).
 |---|--:|---|
 | leaf-zoom tessellation | 22 ms | was 2235 ms (chunking) |
 | leaf GPU geometry | 1.1 MB | was 141 MB |
-| main-thread parse freeze | **~0** (pannable) | was 1.2 s; parse now runs in a Web Worker (STEP 2). Residual ~200 ms design-swap frame |
+| main-thread parse freeze | **~0** (pannable) | was 1.2 s; parse runs in a Web Worker (STEP 2), which now also *fetches* the file (Phase 5c). The design swap is rebuilt across ~7 frames at ≤ 6 ms each; longest load frame 42–58 ms vs 76–176 ms before (same session, headless) |
 | parse wall | 1.0–1.2 s | now off the main thread (in the worker) |
-| combined peak heap (worker+main) | **~1.46 GB** | << 4 GB; caravan-signoff ~1.39 GB. Worker memory reclaimed on terminate |
+| combined peak heap (worker+main) | **~1.28 GB** | was 1.46 GB: single-copy reconstruction drops the concatenated wasm-side columns (main heap 434 → 254 MB). Worker memory reclaimed on terminate |
 | fit fps | 47–78 | browser WebGL2 / native Metal; chunking cost ~6% at fit |
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |
 | fit-view TTFF | **2.1 s** | was ~3.0 s inline (first paint no longer waits for tessellation — proxies show immediately). caravan-signoff 3.3 s → 2.2 s |
@@ -242,12 +242,16 @@ still byte-identical).
   ships (`phase2b-worker`). Measured combined peak across worker+main during load:
   caravel ~1.46 GB, caravan-signoff ~1.39 GB, both << 4 GB; worker memory reclaimed
   on `terminate()`. (phase2b-findings, "STEP 2 — worker offload (SHIPPED)")
-- **Residual ~200 ms design-swap frame** on the worker load (reconstruct: two
-  ~150 MB coord copies + first render), down from the ~1.2 s parse freeze — now the
-  **largest single main-thread block on load** (it runs in the worker-reply handler,
-  not a render frame, so it is separate from the < 100 ms fit-view frames now that
-  the tessellation freeze is gone). A single-copy reconstruction (per-cell
-  `subarray`, no concatenated intermediate) would get it under 100 ms — not built.
+- ~~Residual ~200 ms design-swap frame~~ **RESOLVED** (`phase5c-load-perf`
+  SLICE 1): the worker fetches the file itself (the main thread materialising a
+  278 MB fetch body was a ~70 ms stall of its own), the reply only queues a
+  budgeted `Reconstruction` (core `Deserializer`: one copy per cell column,
+  straight from the transferred JS buffers — no concatenated intermediate — a
+  big cell's coords in 16 MB slices), and the finished design installs on a
+  frame of its own. Longest load frame 76–176 → 42–58 ms; what remains is the
+  first leaf view's inline tessellation (~22 ms, the Phase 4 policy) and one
+  ~20 ms slice that allocates caravel_core's 125 MB coord column. Cost: TTFF
+  +~150 ms (the copy spans ~7 frames).
 - ~~Fit-view tessellation (~2.5 s) is a main-thread freeze~~ **RESOLVED** (`phase4`
   STEP 2): the visible chunks tessellate in a stateless Web Worker; the main thread
   draws each chunk's bbox as a coarse proxy, then uploads the returned `Pod` buffers
@@ -323,8 +327,6 @@ worker pool. Its own measurements name what is next for DRC: **in-context
 only merges across the hierarchy.
 
 Queued from Phase 4, unchanged:
-- **Single-copy worker reconstruction** — the last big main-thread load block
-  (~200 ms → < 100 ms); per-cell `subarray`, no concatenated intermediate.
 - **wgpu upgrade** — unblocks real WebGPU measurement (all browser numbers are
   WebGL2/ANGLE today) and reclaims the ~6% fit-view chunking cost.
 - **Progressive render during parse** (proxy the whole design before the first

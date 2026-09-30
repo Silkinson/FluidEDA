@@ -80,8 +80,13 @@ async function main() {
   await sleep(1500);
 
   const maxGap = await page.evaluate(() => window.__maxFrameGap);
+  // The app's own view: longest update() since the design installed (the
+  // install frame itself included) — separates the reply handler (a task
+  // between frames) from the first frames of the new design.
+  const appPerf = await page.evaluate(() => { try { return JSON.parse(window.__fluideda_perf || '{}'); } catch { return {}; } });
   const frames = await page.evaluate(() => window.__frames);
   const spikes = await page.evaluate(() => window.__spikes);
+
   await browser.close();
   console.log('frame spikes (>60ms) during load:', JSON.stringify(spikes));
 
@@ -95,18 +100,20 @@ async function main() {
   console.log(`file:            ${metrics.name}  (${mb(metrics.file_bytes)} MB)`);
   console.log(`worker_used:     ${metrics.worker_used}`);
   console.log(`parse (worker):  ${metrics.parse_ms} ms`);
-  console.log(`reconstruct:     ${metrics.reconstruct_ms} ms  (main-thread)`);
+  console.log(`reconstruct:     ${metrics.reconstruct_ms.toFixed(1)} ms main-thread, over ${metrics.reconstruct_frames} frame(s) (budgeted)`);
   console.log(`TTFF:            ${metrics.ttff_ms} ms`);
   console.log(`worker heap:     ${mb(workerHeap)} MB  (parse peak, off main)`);
   console.log(`main heap:       ${mb(mainHeap)} MB`);
   console.log(`COMBINED peak:   ${mb(combined)} MB  (target << 4096)`);
   console.log(`longest frame:   ${maxGap.toFixed(0)} ms  (${frames} frames total)`);
+  console.log(`longest update() since install: ${(appPerf.max_frame_ms ?? -1).toFixed(1)} ms`);
 
   const checks = [];
   const check = (c, m) => { console.log(`${c ? 'PASS' : 'FAIL'}  ${m}`); if (!c) checks.push(m); };
   check(metrics.worker_used === true, 'parsed in the worker (worker_used)');
   check(combined < 4096 * 1048576, 'combined peak heap under 4 GB');
   check(maxGap < 300, `no main-thread frame > 300 ms during load (was ${maxGap.toFixed(0)} ms)`);
+  check(metrics.reconstruct_frames > 1, `reconstruction spread over frames (${metrics.reconstruct_frames})`);
   console.log(checks.length ? `\nWORKER-TEST: ${checks.length} FAILURE(S)` : '\nWORKER-TEST: all checks passed');
   process.exit(checks.length ? 1 : 0);
 }

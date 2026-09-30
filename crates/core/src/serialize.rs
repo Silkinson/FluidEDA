@@ -116,43 +116,173 @@ pub fn serialize(db: &CellDb) -> DbColumns {
     DbColumns { coords, starts, layers, meta: meta.into_vec() }
 }
 
+/// Where the deserializer gets each cell's slice of the three columns. The
+/// columns live wherever the transfer left them — in wasm memory (a `DbColumns`)
+/// or, on the main thread, still in the JS `ArrayBuffer`s the worker
+/// transferred (Phase 5c: single-copy reconstruction copies each cell's slice
+/// straight from there into its own `Vec`, with no concatenated intermediate).
+/// Offsets and lengths are in elements of the column.
+pub trait ColumnSource {
+    /// Append `len` coordinates (i32) starting at element `off` of the coord
+    /// column to `out` (which the caller has reserved).
+    fn coords_into(&mut self, off: usize, len: usize, out: &mut Vec<i32>) -> Result<()>;
+    /// `len` point offsets (u32) starting at element `off` of the starts column.
+    fn starts(&mut self, off: usize, len: usize) -> Result<Vec<u32>>;
+    /// `len` packed layers starting at element `off` of the layer column.
+    fn layers(&mut self, off: usize, len: usize) -> Result<Vec<Layer>>;
+}
+
+/// The in-memory source: slices of already-copied `Vec` columns.
+struct VecSource<'a> {
+    coords: &'a [i32],
+    starts: &'a [u32],
+    layers: &'a [u32],
+}
+
+impl ColumnSource for VecSource<'_> {
+    fn coords_into(&mut self, off: usize, len: usize, out: &mut Vec<i32>) -> Result<()> {
+        out.extend_from_slice(take(self.coords, off, len)?);
+        Ok(())
+    }
+    fn starts(&mut self, off: usize, len: usize) -> Result<Vec<u32>> {
+        Ok(take(self.starts, off, len)?.to_vec())
+    }
+    fn layers(&mut self, off: usize, len: usize) -> Result<Vec<Layer>> {
+        // A packed layer u32 has the exact little-endian byte layout of `Layer`
+        // (layer | datatype << 16 — see pack_layer), so on any LE target (wasm +
+        // all our natives) this cast is a memcpy, not per-shape unpack calls.
+        Ok(bytemuck::cast_slice::<u32, Layer>(take(self.layers, off, len)?).to_vec())
+    }
+}
+
+fn take<T>(buf: &[T], off: usize, len: usize) -> Result<&[T]> {
+    match off.checked_add(len).filter(|&e| e <= buf.len()) {
+        Some(e) => Ok(&buf[off..e]),
+        None => bail!("CellDb blob column underrun"),
+    }
+}
+
 /// Rebuild a `CellDb` from the worker's transferred columns. Does no geometry
 /// work — the columns and chunk tables are already final.
 pub fn deserialize(cols: DbColumns) -> Result<CellDb> {
     let DbColumns { coords, starts, layers, meta } = cols;
-    let mut r = Reader::new(&meta);
+    deserialize_from(meta, &mut VecSource { coords: &coords, starts: &starts, layers: &layers })
+}
 
-    if r.u32()? != MAGIC {
-        bail!("bad CellDb blob: magic mismatch");
+/// Rebuild a `CellDb` in one go from its metadata blob, pulling each cell's
+/// column slices from `src` (see [`ColumnSource`]).
+pub fn deserialize_from(meta: Vec<u8>, src: &mut dyn ColumnSource) -> Result<CellDb> {
+    let mut d = Deserializer::new(meta)?;
+    while !d.step(src, usize::MAX)? {}
+    d.finish()
+}
+
+/// Coordinates copied per coord-slice of one big cell (4 M × 4 B = 16 MB): the
+/// unit that lets a 100 MB cell (caravel_core) span several steps.
+const COORD_SLICE: usize = 4 << 20;
+
+/// A cell whose columns are part-way through copying.
+struct PartialCell {
+    n_coords: usize,
+    n_shapes: usize,
+    coords: Vec<i32>,
+}
+
+/// **Incremental** rebuild of a `CellDb` (Phase 5c): each [`step`](Self::step)
+/// copies at most about `max_bytes` of columns, splitting even a single huge
+/// cell's coordinate column into slices, so the main thread can spread the
+/// design swap over frames instead of blocking one. Owns the metadata blob and
+/// a cursor into it; the columns stay in the caller's [`ColumnSource`].
+pub struct Deserializer {
+    meta: Vec<u8>,
+    pos: usize,
+    top: CellId,
+    cell_count: usize,
+    cells: Vec<Cell>,
+    coord_off: usize,
+    start_off: usize,
+    layer_off: usize,
+    partial: Option<PartialCell>,
+    bytes_copied: usize,
+}
+
+impl Deserializer {
+    /// Validate the header. No column is touched yet.
+    pub fn new(meta: Vec<u8>) -> Result<Self> {
+        let mut r = Reader::new(&meta);
+        if r.u32()? != MAGIC {
+            bail!("bad CellDb blob: magic mismatch");
+        }
+        if r.u32()? != VERSION {
+            bail!("unsupported CellDb blob version");
+        }
+        let top = r.u32()? as CellId;
+        let cell_count = r.u32()? as usize;
+        let pos = r.pos;
+        Ok(Deserializer {
+            meta,
+            pos,
+            top,
+            cell_count,
+            cells: Vec::with_capacity(cell_count),
+            coord_off: 0,
+            start_off: 0,
+            layer_off: 0,
+            partial: None,
+            bytes_copied: 0,
+        })
     }
-    if r.u32()? != VERSION {
-        bail!("unsupported CellDb blob version");
+
+    /// Copy up to about `max_bytes` more; `Ok(true)` once every cell is built.
+    pub fn step(&mut self, src: &mut dyn ColumnSource, max_bytes: usize) -> Result<bool> {
+        let mut budget = max_bytes;
+        while self.cells.len() < self.cell_count {
+            // Start the next cell: read its column lengths.
+            let p = match self.partial.as_mut() {
+                Some(p) => p,
+                None => {
+                    let mut r = Reader { buf: &self.meta, pos: self.pos };
+                    let n_coords = r.u32()? as usize;
+                    let n_shapes = r.u32()? as usize;
+                    self.pos = r.pos;
+                    self.partial.insert(PartialCell { n_coords, n_shapes, coords: Vec::with_capacity(n_coords) })
+                }
+            };
+            // Coordinates, a slice at a time.
+            while p.coords.len() < p.n_coords {
+                if budget == 0 {
+                    return Ok(false);
+                }
+                let n = (p.n_coords - p.coords.len()).min(COORD_SLICE).min((budget / 4).max(1));
+                src.coords_into(self.coord_off + p.coords.len(), n, &mut p.coords)?;
+                budget = budget.saturating_sub(n * 4);
+                self.bytes_copied += n * 4;
+            }
+            // Starts + layers (8 B/shape) and the metadata finish the cell.
+            let p = self.partial.take().unwrap();
+            let s = src.starts(self.start_off, p.n_shapes + 1)?;
+            let l = src.layers(self.layer_off, p.n_shapes)?;
+            budget = budget.saturating_sub(p.n_shapes * 8);
+            self.bytes_copied += p.n_shapes * 8;
+            if s.last().copied().unwrap_or(0) as usize * 2 != p.coords.len() {
+                bail!("CellDb blob: cell starts/coords mismatch");
+            }
+            self.coord_off += p.n_coords;
+            self.start_off += p.n_shapes + 1;
+            self.layer_off += p.n_shapes;
+            let shapes = ShapeStore::from_columns(p.coords, s, l);
+            let cell = self.read_cell_meta(shapes)?;
+            self.cells.push(cell);
+            if budget == 0 && self.cells.len() < self.cell_count {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
-    let top = r.u32()? as CellId;
-    let cell_count = r.u32()? as usize;
 
-    let mut cells = Vec::with_capacity(cell_count);
-    let mut coord_off = 0usize;
-    let mut start_off = 0usize;
-    let mut layer_off = 0usize;
-
-    for _ in 0..cell_count {
-        let n_coords = r.u32()? as usize;
-        let n_shapes = r.u32()? as usize;
-
-        // Slice this cell's columns out of the concatenated buffers (memcpy each,
-        // not an element loop — the reconstruction runs on the main thread and
-        // must stay inside a frame).
-        let c = slice(&coords, &mut coord_off, n_coords)?.to_vec();
-        // `starts` holds n_shapes + 1 entries per cell.
-        let s = slice(&starts, &mut start_off, n_shapes + 1)?.to_vec();
-        // A packed layer u32 has the exact little-endian byte layout of `Layer`
-        // (layer | datatype << 16 — see pack_layer), so on any LE target (wasm +
-        // all our natives) this cast is a memcpy, not 3.9 M unpack calls.
-        let lu = slice(&layers, &mut layer_off, n_shapes)?;
-        let l = bytemuck::cast_slice::<u32, Layer>(lu).to_vec();
-        let shapes = ShapeStore::from_columns(c, s, l);
-
+    /// Name, instances and chunk table of the cell whose shapes just finished.
+    fn read_cell_meta(&mut self, shapes: ShapeStore) -> Result<Cell> {
+        let mut r = Reader { buf: &self.meta, pos: self.pos };
         let name_len = r.u32()? as usize;
         let name = String::from_utf8(r.bytes(name_len)?.to_vec())?;
 
@@ -182,28 +312,26 @@ pub fn deserialize(cols: DbColumns) -> Result<CellDb> {
             let bbox = r.bbox()?;
             chunks.push(Chunk { start, end, bbox });
         }
-
-        cells.push(Cell::from_parts(name, shapes, instances, chunks));
+        self.pos = r.pos;
+        Ok(Cell::from_parts(name, shapes, instances, chunks))
     }
 
-    let mut local_bboxes = Vec::with_capacity(cell_count);
-    for _ in 0..cell_count {
-        local_bboxes.push(r.bbox()?);
+    /// Fraction of the column bytes copied so far, given the total (readout).
+    pub fn bytes_copied(&self) -> usize {
+        self.bytes_copied
     }
 
-    Ok(CellDb::from_parts(cells, top, local_bboxes))
-}
-
-/// Advance `off` by `n` and return the slice, erroring if it runs past the end.
-fn slice<'a, T>(buf: &'a [T], off: &mut usize, n: usize) -> Result<&'a [T]> {
-    let end = off.checked_add(n).filter(|&e| e <= buf.len());
-    match end {
-        Some(e) => {
-            let s = &buf[*off..e];
-            *off = e;
-            Ok(s)
+    /// Assemble the `CellDb` (call once `step` returned `true`).
+    pub fn finish(self) -> Result<CellDb> {
+        if self.cells.len() != self.cell_count {
+            bail!("CellDb deserializer finished early");
         }
-        None => bail!("CellDb blob column underrun"),
+        let mut r = Reader { buf: &self.meta, pos: self.pos };
+        let mut local_bboxes = Vec::with_capacity(self.cell_count);
+        for _ in 0..self.cell_count {
+            local_bboxes.push(r.bbox()?);
+        }
+        Ok(CellDb::from_parts(self.cells, self.top, local_bboxes))
     }
 }
 
@@ -302,6 +430,29 @@ mod tests {
 
     const HIER: &[u8] = include_bytes!("../../../assets/hier.gds");
     const FIXTURE: &[u8] = include_bytes!("../../../assets/edit_fixture.gds");
+
+    /// Budgeted (sliced) reconstruction must build exactly the same CellDb as a
+    /// one-shot one — including a cell whose coords span several slices.
+    #[test]
+    fn incremental_deserialize_matches_one_shot() {
+        let db = crate::gds::load_gds_db(FIXTURE).unwrap();
+        let cols = serialize(&db);
+        let mut src = VecSource { coords: &cols.coords, starts: &cols.starts, layers: &cols.layers };
+        let mut d = Deserializer::new(cols.meta.clone()).unwrap();
+        let mut steps = 0;
+        while !d.step(&mut src, 64).unwrap() {
+            steps += 1;
+        }
+        assert!(steps > 3, "a 64-byte budget must take several steps ({steps})");
+        let inc = d.finish().unwrap();
+        let whole = deserialize(serialize(&db)).unwrap();
+        assert_eq!(inc.cells.len(), whole.cells.len());
+        for (a, b) in inc.cells.iter().zip(&whole.cells) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.shapes.columns(), b.shapes.columns());
+            assert_eq!(a.chunks.len(), b.chunks.len());
+        }
+    }
 
     /// A round-tripped CellDb must be identical in everything the renderer reads —
     /// the whole point of the worker transfer. Compares cells/shapes/instances/

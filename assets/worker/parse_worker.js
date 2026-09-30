@@ -16,11 +16,20 @@ const ready = wasm_bindgen('worker_bg.wasm');
 
 self.onmessage = async (e) => {
   const msg = e.data || {};
-  if (msg.type !== 'parse') return;
+  if (msg.type !== 'parse' && msg.type !== 'fetch_parse') return;
   try {
-    await ready;
-    // msg.bytes is a transferred ArrayBuffer (moved from the main thread).
-    const bytes = new Uint8Array(msg.bytes);
+    // 'fetch_parse' (Phase 5c): the worker fetches the file itself, so the main
+    // thread never materialises the body (a 278 MB ArrayBuffer was a ~70 ms
+    // main-thread stall). 'parse': the bytes were transferred in (drag-drop /
+    // picker — they already live on the main thread).
+    const body = msg.type === 'fetch_parse'
+      ? fetch(msg.url).then((r) => {
+          if (!r.ok) throw new Error(`fetch ${msg.url}: HTTP ${r.status}`);
+          return r.arrayBuffer();
+        })
+      : Promise.resolve(msg.bytes);
+    const [buf] = await Promise.all([body, ready]);
+    const bytes = new Uint8Array(buf);
     const result = wasm_bindgen.parse(bytes); // the heavy work, off the main thread
 
     const coords = result.coords;
@@ -41,6 +50,7 @@ self.onmessage = async (e) => {
         layer_set: layer_set.buffer,
         world_bbox: [world_bbox[0], world_bbox[1], world_bbox[2], world_bbox[3]],
         total_shapes: result.total_shapes,
+        file_bytes: bytes.length,
         distinct_polys: result.distinct_polys,
         cell_defs: result.cell_defs,
         worker_heap_bytes: result.worker_heap_bytes,

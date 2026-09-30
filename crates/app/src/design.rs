@@ -6,7 +6,7 @@
 //! memory metrics. On wasm the metrics are also pushed to `window` and the
 //! console so the Playwright bench can read them.
 
-use fluideda_core::{CellDb, DbColumns, Layer};
+use fluideda_core::{CellDb, ColumnSource, Layer};
 use web_time::Instant;
 
 /// Everything the app needs to render one design, plus how expensive it was.
@@ -47,18 +47,27 @@ pub struct Metrics {
     pub worker_used: bool,
     /// Main-thread wall time to rebuild the CellDb from the worker's buffers
     /// (worker path only) — the one load-time frame the main thread still spends.
+    /// Phase 5c: this now covers the column copies too (they happen inside the
+    /// rebuild — one copy per cell column, straight from the transferred JS
+    /// buffers), i.e. the whole design-swap handler's geometry work.
     pub reconstruct_ms: f64,
+    /// Frames the (budgeted) reconstruction spanned (Phase 5c).
+    pub reconstruct_frames: usize,
 }
 
-/// Everything the parse worker sends back: the four serialized columns plus the
+/// Everything the parse worker sends back: the serialized columns (left where
+/// the transfer put them, behind a [`ColumnSource`]) and metadata blob, plus the
 /// summary it computed (so the main thread doesn't rescan 3.9 M shapes). The
-/// worker path builds a [`Design`] from this via [`reconstruct`].
+/// worker path builds a [`Design`] from this via [`Reconstruction`].
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
 pub struct WorkerMsg {
     pub name: String,
     pub file_bytes: usize,
-    pub coords: Vec<i32>,
-    pub starts: Vec<u32>,
-    pub layers: Vec<u32>,
+    /// The three geometry columns. On the web: the transferred `ArrayBuffer`s,
+    /// read per cell (Phase 5c single-copy reconstruction).
+    pub columns: Box<dyn ColumnSource>,
+    /// Length of the coord column (i32 elements) — progress readout.
+    pub coord_count: usize,
     pub meta: Vec<u8>,
     pub bbox: [f64; 4],
     pub total_shapes: u64,
@@ -69,43 +78,98 @@ pub struct WorkerMsg {
     pub worker_heap_bytes: usize,
 }
 
-/// Rebuild a `Design` on the main thread from the worker's transferred buffers.
-/// Does the columnar deserialize (a memcpy per column) and adopts the worker's
-/// precomputed summary — no reparse, no shape rescan.
-pub fn reconstruct(m: WorkerMsg) -> anyhow::Result<Design> {
-    let t = Instant::now();
-    let cols = DbColumns { coords: m.coords, starts: m.starts, layers: m.layers, meta: m.meta };
-    let db = fluideda_core::deserialize(cols)?;
-    let reconstruct_ms = t.elapsed().as_secs_f64() * 1e3;
+/// Main-thread bytes copied per `Deserializer::step` call between clock checks.
+const RECON_STEP_BYTES: usize = 4 << 20;
 
-    let layers = m
-        .layers_packed
-        .iter()
-        .map(|&v| Layer::new((v & 0xffff) as u16, (v >> 16) as u16))
-        .collect();
+/// A design being rebuilt from the worker's transferred buffers, **across
+/// frames** (Phase 5c). The worker reply only creates this; the app then
+/// advances it each frame within a time budget ([`step`](Self::step)) — one
+/// copy per cell column, straight from the transferred JS buffers, a big cell's
+/// coordinates in slices — and installs the finished [`Design`]. The swap no
+/// longer lands as one ~30–50 ms task between two frames.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
+pub struct Reconstruction {
+    deser: fluideda_core::serialize::Deserializer,
+    columns: Box<dyn ColumnSource>,
+    summary: WorkerMsg,
+    total_bytes: usize,
+    spent_ms: f64,
+    frames: usize,
+}
 
-    let metrics = Metrics {
-        name: m.name,
-        file_bytes: m.file_bytes,
-        parse_ms: m.parse_ms,
-        cell_defs: m.cell_defs,
-        distinct_polys: m.distinct_polys,
-        flattened: m.total_shapes,
-        wasm_heap_bytes: wasm_heap_bytes(), // main-thread heap after reconstruction
-        parse_heap_bytes: m.worker_heap_bytes, // the parse peak now lives in the worker
-        worker_used: true,
-        reconstruct_ms,
-        ..Default::default()
-    };
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
+impl Reconstruction {
+    /// Validate the metadata header; copies nothing yet.
+    pub fn new(mut m: WorkerMsg) -> anyhow::Result<Self> {
+        let deser = fluideda_core::serialize::Deserializer::new(std::mem::take(&mut m.meta))?;
+        // Every column byte gets copied once: coords (4 B/coord) + starts +
+        // layers (8 B/shape, near enough) — for the progress readout only.
+        let total_bytes = m.coord_count * 4 + m.distinct_polys * 8;
+        let columns = std::mem::replace(&mut m.columns, Box::new(NoColumns));
+        Ok(Reconstruction { deser, columns, summary: m, total_bytes, spent_ms: 0.0, frames: 0 })
+    }
 
-    Ok(Design {
-        db,
-        layers,
-        bbox_min: glam::Vec2::new(m.bbox[0] as f32, m.bbox[1] as f32),
-        bbox_max: glam::Vec2::new(m.bbox[2] as f32, m.bbox[3] as f32),
-        total_shapes: m.total_shapes,
-        metrics,
-    })
+    /// Copy for up to `budget_ms`; `Ok(true)` when the CellDb is complete.
+    pub fn step(&mut self, budget_ms: f64) -> anyhow::Result<bool> {
+        let t = Instant::now();
+        self.frames += 1;
+        let mut done = false;
+        while !done && t.elapsed().as_secs_f64() * 1e3 < budget_ms {
+            done = self.deser.step(self.columns.as_mut(), RECON_STEP_BYTES)?;
+        }
+        self.spent_ms += t.elapsed().as_secs_f64() * 1e3;
+        Ok(done)
+    }
+
+    /// Fraction of the column bytes copied (panel readout).
+    pub fn progress(&self) -> f64 {
+        (self.deser.bytes_copied() as f64 / self.total_bytes.max(1) as f64).min(1.0)
+    }
+
+    /// The finished design (call once `step` returned `true`). Adopts the
+    /// worker's precomputed summary — no reparse, no shape rescan.
+    pub fn finish(self) -> anyhow::Result<Design> {
+        let db = self.deser.finish()?;
+        let m = self.summary;
+        let layers = m.layers_packed.iter().map(|&v| Layer::new((v & 0xffff) as u16, (v >> 16) as u16)).collect();
+        let metrics = Metrics {
+            name: m.name,
+            file_bytes: m.file_bytes,
+            parse_ms: m.parse_ms,
+            cell_defs: m.cell_defs,
+            distinct_polys: m.distinct_polys,
+            flattened: m.total_shapes,
+            wasm_heap_bytes: wasm_heap_bytes(), // main-thread heap after reconstruction
+            parse_heap_bytes: m.worker_heap_bytes, // the parse peak now lives in the worker
+            worker_used: true,
+            reconstruct_ms: self.spent_ms,
+            reconstruct_frames: self.frames,
+            ..Default::default()
+        };
+        Ok(Design {
+            db,
+            layers,
+            bbox_min: glam::Vec2::new(m.bbox[0] as f32, m.bbox[1] as f32),
+            bbox_max: glam::Vec2::new(m.bbox[2] as f32, m.bbox[3] as f32),
+            total_shapes: m.total_shapes,
+            metrics,
+        })
+    }
+}
+
+/// Placeholder left in a consumed `WorkerMsg` (its columns moved out).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the worker path is web-only
+struct NoColumns;
+impl ColumnSource for NoColumns {
+    fn coords_into(&mut self, _: usize, _: usize, _: &mut Vec<i32>) -> anyhow::Result<()> {
+        anyhow::bail!("columns already taken")
+    }
+    fn starts(&mut self, _: usize, _: usize) -> anyhow::Result<Vec<u32>> {
+        anyhow::bail!("columns already taken")
+    }
+    fn layers(&mut self, _: usize, _: usize) -> anyhow::Result<Vec<Layer>> {
+        anyhow::bail!("columns already taken")
+    }
 }
 
 /// Parse only. Tessellation is now **lazy** (Phase 2a STEP 3): the app
@@ -201,7 +265,8 @@ impl Metrics {
              \"index_ms\":{:.1},\"index_p99_ms\":{:.3},\"index_max_ms\":{:.1},\"ttff_ms\":{:.1},\
              \"cell_defs\":{},\"distinct_polys\":{},\"flattened\":{},\"triangles\":{},\
              \"vertex_bytes\":{},\"index_bytes\":{},\"wasm_heap_bytes\":{},\
-             \"parse_heap_bytes\":{},\"worker_used\":{},\"reconstruct_ms\":{:.1}}}",
+             \"parse_heap_bytes\":{},\"worker_used\":{},\"reconstruct_ms\":{:.1},\
+             \"reconstruct_frames\":{}}}",
             self.name.replace('"', "'"),
             self.file_bytes,
             self.parse_ms,
@@ -220,6 +285,7 @@ impl Metrics {
             self.parse_heap_bytes,
             self.worker_used,
             self.reconstruct_ms,
+            self.reconstruct_frames,
         )
     }
 

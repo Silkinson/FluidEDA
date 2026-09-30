@@ -107,6 +107,10 @@ const DRC_BUDGET_MS: f64 = 8.0;
 const DRC_POOL_MAX: usize = 8;
 const DRC_JOBS_PER_WORKER: usize = 8;
 
+/// Per-frame budget (ms) for rebuilding a worker-parsed design (Phase 5c): the
+/// columns are copied a few MB at a time until done, then the design installs.
+const RECON_BUDGET_MS: f64 = 6.0;
+
 /// Cap on violation markers drawn per frame (the panel shows the counts).
 const DRC_MARKER_CAP: usize = 300;
 
@@ -127,6 +131,11 @@ pub struct FluidApp {
     load_slot: LoadSlot,
     /// Worker-parsed designs land here (Phase 2b STEP 2); drained before load_slot.
     design_slot: webio::DesignSlot,
+    /// A worker-parsed design being rebuilt across frames (Phase 5c); installed
+    /// when complete. The old design keeps rendering meanwhile.
+    pending_design: Option<design::Reconstruction>,
+    /// A rebuilt design waiting for next frame's install.
+    ready_design: Option<Design>,
     load_instant: web_time::Instant,
     awaiting_first_frame: bool,
     status: String,
@@ -311,6 +320,8 @@ impl FluidApp {
             metrics: design.metrics,
             load_slot,
             design_slot,
+            pending_design: None,
+            ready_design: None,
             load_instant: web_time::Instant::now(),
             awaiting_first_frame: true, // measure TTFF for the default too
             status: String::new(),
@@ -1073,16 +1084,38 @@ impl FluidApp {
 
     /// Consume any pending drag-drop / fetched / picked file.
     fn drain_loads(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        // 0. Worker-parsed design ready (Phase 2b STEP 2). Drained first so a
-        //    freshly reconstructed design installs immediately.
+        // 0. Worker-parsed design (Phase 2b STEP 2): the reply queues a
+        //    reconstruction; advance it within the frame budget and install the
+        //    design once complete (Phase 5c — the swap spans a few frames
+        //    instead of blocking one).
         let worker_done = self.design_slot.borrow_mut().take();
         if let Some(res) = worker_done {
             match res {
-                Ok(design) => {
-                    self.install(design, frame);
-                    self.status.clear();
-                }
+                Ok(r) => self.pending_design = Some(r),
                 Err(e) => self.status = format!("load failed: {e}"),
+            }
+        }
+        // A design finished rebuilding last frame: install it now, on a frame
+        // of its own (install + first-view tessellation are ~20 ms by
+        // themselves; stacking them on the last copy slice made one long frame).
+        if let Some(design) = self.ready_design.take() {
+            self.install(design, frame);
+            self.status.clear();
+        }
+        if let Some(r) = self.pending_design.as_mut() {
+            match r.step(RECON_BUDGET_MS) {
+                Ok(true) => {
+                    let r = self.pending_design.take().unwrap();
+                    match r.finish() {
+                        Ok(design) => self.ready_design = Some(design),
+                        Err(e) => self.status = format!("reconstruct failed: {e}"),
+                    }
+                }
+                Ok(false) => self.status = format!("rebuilding design… {:.0}%", r.progress() * 100.0),
+                Err(e) => {
+                    self.pending_design = None;
+                    self.status = format!("reconstruct failed: {e}");
+                }
             }
         }
 
