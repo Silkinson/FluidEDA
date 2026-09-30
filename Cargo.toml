@@ -38,6 +38,9 @@ egui-wgpu = "0.29"
 gds21 = "0.2"
 lyon = "1"
 rstar = "0.12"        # used from Phase 1
+# Integer polygon booleans (Phase 5b — merge-first DRC). Pure Rust, no_std,
+# wasm-clean; the i32 engine takes coordinates within ±2^30 nm (±1.07 m).
+i_overlay = "9"
 
 # --- collaboration ---
 yrs = "0.19"

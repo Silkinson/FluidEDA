@@ -179,6 +179,25 @@ impl EditOverlay {
         }
     }
 
+    /// The overlay geometry that is LIVE in `cell`: every moved/vertex-edited
+    /// copy of a tombstoned base shape, then every added shape — the part of the
+    /// composite the base store doesn't hold. (Consumers pair it with the base
+    /// minus [`suppressed_in`](Self::suppressed_in) to get the whole cell.)
+    pub fn live_shapes_in(&self, cell: CellId) -> impl Iterator<Item = &Shape> + '_ {
+        let edited = self
+            .edits_cell(cell)
+            .then(|| {
+                self.edited
+                    .iter()
+                    .filter(move |(&(c, i), _)| c == cell && self.deleted.contains(&(c, i)))
+                    .map(|(_, s)| s)
+            })
+            .into_iter()
+            .flatten();
+        let added = self.added.iter().filter(move |a| a.cell == cell).map(|a| &a.shape);
+        edited.chain(added)
+    }
+
     /// The added shape with this id, if it exists.
     pub fn find_added(&self, id: AddId) -> Option<&AddedShape> {
         self.added.iter().find(|a| a.id == id)

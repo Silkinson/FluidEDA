@@ -17,7 +17,12 @@
 //! immutable base: cull composites base ∪ overlay, untouched cells stay on the
 //! Phase 2b path. Still no rendering or networking deps here — the overlay is
 //! plain data the app mirrors into the CRDT.
+//!
+//! Phase 5b adds a **boolean kernel** ([`boolean`], integer `i_overlay`) and
+//! rebuilds DRC on it: merge-first, edge-pair width/space, checked per spatial
+//! tile so the same pure function runs inline or in a worker pool.
 
+pub mod boolean;
 pub mod chunk;
 pub mod cull;
 pub mod db;
@@ -37,7 +42,10 @@ pub mod types;
 pub use chunk::{Chunk, ChunkId};
 pub use cull::{cull, cull_counted, cull_with_overlay, CellDraw, CullStats, VisibleSet};
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind};
-pub use drc::{check_cell, check_cell_range, DrcKind, DrcRules, LayerRule, Violation};
+pub use drc::{
+    build_grid, cell_tiles, check_cell, check_tile, check_tile_columns, gather_tile, DrcDriver, DrcGrid,
+    DrcGridBuilder, DrcKind, DrcRules, DrcStep, LayerRule, PassStats, TileInput, TileJob, TileKey, Violation,
+};
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, Shape};
 pub use gds_write::write_gds;
 pub use index::ShapeIndex;

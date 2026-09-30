@@ -13,6 +13,7 @@ thiserror.workspace = true
 gds21.workspace = true
 lyon.workspace = true
 rstar.workspace = true
+i_overlay.workspace = true
 
 [dev-dependencies]
 libc = "0.2"

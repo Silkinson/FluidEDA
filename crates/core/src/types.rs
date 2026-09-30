@@ -54,7 +54,7 @@ pub struct Polygon {
 
 /// Axis-aligned bounding box in nm. Used for framing the initial view and,
 /// later, for culling.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bbox {
     pub min: Point,
     pub max: Point,

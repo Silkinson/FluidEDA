@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-08-21 · current branch: `phase5-authoring-drc` (off `phase4`)_
+_Last updated: 2026-09-30 · current branch: `phase5b-drc-hardening` (off `phase5-authoring-drc`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -15,6 +15,26 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 `docs/AtomicStudio_Implementation_Plan.md`.
 
 ## Where we are
+
+**Phase 5b in progress: DRC hardening** on `phase5b-drc-hardening` — the three
+follow-ups Phase 5's own DRC measurements named.
+
+* **SLICE 1 — booleans + merge-first, tiled DRC.** New integer boolean kernel
+  (`crates/core/boolean.rs`, `i_overlay` 9, pure Rust / no_std / wasm-clean).
+  DRC is rebuilt on it (`crates/core/drc/`): per layer, the live shapes near a
+  tile are **unioned** (fracture slivers vanish into the real wire), then width
+  and space are measured as **edge pairs on the merged boundary** — exact for
+  any polygon (L arms, diagonal necks, acute tips) and space now includes
+  same-polygon **notches**. A cell is cut into a density-adaptive **tile grid**
+  (uniform buckets, dense ones split k×k) built in budgeted slices — no R-tree,
+  no atomic block — and each tile is a pure function of Pod columns, so an edit
+  re-checks only the tiles within reach of what changed. caravel_core (wasm):
+  **611,680 → 61 flags**, and all 61 sit where a child instance's same-layer
+  metal covers the spot (intra-cell scope, measured); full check **10.3 s →
+  2.9 s** single-threaded, slowest tile 5.1 ms; **re-check after an edit
+  9.6 s → 1.1 ms**; a background pass never pushes a frame past ~19 ms.
+  Scheduler = `DrcDriver` (core, pure state machine: grids, per-tile results,
+  generation-stamped jobs) — the seam SLICE 3's worker pool plugs into.
 
 **Phase 5 shipped: FluidEDA authors geometry and checks it.** Three slices on
 `phase5-authoring-drc`:
@@ -62,6 +82,7 @@ still byte-identical).
 | 3 — real editing | `phase3-real-editing` | ✅ done | SLICE 1: GDS export (round-trip + pixel-match). SLICE 2: non-TOP editing under the transform stack (landmine eliminated), master-edit semantics, finer chunking (edit 22→0.8 ms), two-browser non-TOP convergence |
 | 4 — integrate + fit-view offload | `phase4` | ✅ done | STEP 1: merged parse-worker + real-editing onto the trunk (build + 39 core + golden green). STEP 2: fit-view tessellation offloaded to a worker (bbox proxy → stream). Longest fit frame ~1.1–1.35 s → **62–64 ms** (caravel / caravan-signoff), leaf unchanged, edit < 2 ms |
 | 5 — authoring + DRC | `phase5-authoring-drc` | ✅ done | SLICE 1: rect/poly draw tools, geometry-carrying CRDT adds with stable `(client, seq)` ids — concurrent adds converge; export covers adds (0 px round-trip). SLICE 2: vertex editing via `SetPoints` (LWW on same shape), non-TOP masters. SLICE 3: intra-cell DRC (exact spacing, per-shape width), overlay-composited, 8 ms/frame budget; caravel_core 10.3 s cold / 9.6 s warm (wasm) |
+| 5b — DRC hardening | `phase5b-drc-hardening` | ◑ SLICE 1 done | SLICE 1: integer booleans (`i_overlay`); merge-first edge-pair DRC (width/space/notch) on a density-adaptive tile grid. caravel_core: 611,680 → 61 flags (all 61 = child-instance context); full 10.3 s → 2.9 s wasm; edit re-check 9.6 s → 1.1 ms; slowest tile 5.1 ms |
 | 6 — backend/OASIS | — | ⏳ planned | Content-addressed store, tile CDN, streaming OASIS (moved from the old "Phase 5" label — see the ledger-reshape note) |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
@@ -77,9 +98,11 @@ still byte-identical).
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |
 | fit-view TTFF | **2.1 s** | was ~3.0 s inline (first paint no longer waits for tessellation — proxies show immediately). caravan-signoff 3.3 s → 2.2 s |
 | edit re-tess frame | < 2 ms | dirty chunks stay inline (finer-chunking, SLICE 2 path unchanged); offload never touches the edit path. caravel 1.8 ms, caravan-signoff 0.4 ms |
-| DRC: biggest cell full check | **10.3 s cold / 9.6 s warm** (wasm) | caravel_core, 2.5 M shapes; native 7.5 / 7.0 s. Cold includes the one-time R-tree build. Warm = the re-check-after-one-edit cost (base never mutates ⇒ index stays valid). Runs through the 8 ms/frame budget queue — never blocks a frame; the wall-clock latency is why DRC-in-worker is the follow-up |
-| DRC: typical cell check | ~5 ms | chip_io (5.7 k shapes, native) — an edit to a normal cell re-verifies within a frame |
-| DRC: drawn-sliver feedback | ~immediate | a 40 nm-wide drawn rect flags via the budgeted queue on the next frames (in-browser verified) |
+| DRC: biggest cell full check | **2.9 s** (wasm, single-threaded) | caravel_core, 2.5 M shapes, merge-first (Phase 5b); was 10.3 s cold / 9.6 s warm per-shape. Native 2.3 s. Includes the 95 ms tile-grid build (budgeted, replaces the atomic R-tree). 2923 tiles, slowest 5.1 ms |
+| DRC: re-check after one edit | **1.1 ms** (wasm) | tiles within reach of the edit (1 tile for a typical shape); was a 9.6 s whole-cell re-check |
+| DRC: background pass | 8.0 s wall, longest frame **19.1 ms** | "check visible" over caravel_core at leaf, 8 ms/frame budget, inline (no worker yet) |
+| DRC: flags on caravel_core | **61** (blanket 100/100) | was 611,680. All 61 lie on same-layer metal of a child instance (70 nm staircase bends a via cell fills in context) — the intra-cell scope, not false geometry |
+| DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 
 ## Decisions locked (do not relitigate without a measurement)
@@ -130,6 +153,20 @@ still byte-identical).
   (`geom_edited`). Pure translates of pristine base shapes still ship the tiny
   "M dx dy" op — the amendments are scoped to where geometry is unavoidable.
   (phase5 SLICE 2)
+- **DRC is merge-first, edge-pair, tiled (Phase 5b).** Per layer, shapes near a
+  tile are unioned (integer `i_overlay`, clipped to core ⊕ reach) and width /
+  space are edge pairs on the merged boundary (Euclidean, KLayout-style angle
+  filter: facing edges must run opposite; adjacent edges flag only acute
+  vertices). Markers are the exact too-close edge portions, clipped to the
+  tile's half-open core — tiles partition the plane, so tiling never changes
+  what is found (tested). Manhattan pairs use 1-D strip sweeps (H with H, V
+  with V — perpendicular edges never face); only diagonals use an R-tree. The
+  edge check went 6.6 s → 0.5 s on caravel_core with that split.
+- **The DRC grid index replaces the R-tree for DRC.** Uniform buckets (bbox ⊕
+  reach), two budgeted linear passes, deck-dependent (rebuilt on deck change),
+  edit-independent (base never mutates). Dense buckets split k×k by shape
+  count: caravel_core's 110 µm tiles ranged 0–35 k shapes (135 ms); split, the
+  slowest is 5.1 ms (wasm).
 - **DRC is intra-cell, composite-aware, budgeted.** Checks run per cell in
   cell-local space over base∖tombstones ∪ moved/vertex copies ∪ adds, using the
   existing per-cell R-tree for spacing candidates (base never mutates ⇒ the index
@@ -196,6 +233,11 @@ still byte-identical).
   same as Phase 0 markers). Related operational note: the relay accumulates dead
   sockets across runs — a room reused after peers vanish can drop rebroadcasts
   (bit us in testing; restart the relay). Worth a cleanup pass with the y-sync work.
+- **DRC deferrals, updated by Phase 5b SLICE 1:** merge-first width is DONE
+  (the 593 k fracture flags are gone); the atomic index build is DONE (grid,
+  budgeted); non-rect width is exact now (edge pairs). Still open below:
+  cross-instance context (now *measured* as the only remaining source of flags
+  on caravel_core), the rule table, and DRC-in-worker.
 - **DRC deferrals (phase5 SLICE 3 — scoped honestly, in the code too):**
   - **Cross-instance / hierarchical spacing is NOT checked.** Checks are
     intra-cell; a shape in cell A near an instance of cell B is invisible to
