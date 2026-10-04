@@ -87,6 +87,10 @@ pub struct Cell {
     /// gets exactly one chunk covering everything, so the draw path never needs
     /// to distinguish "chunked" from "not chunked".
     pub chunks: Vec<Chunk>,
+    /// Spatial partition of `instances` (Phase 7.3): contiguous runs, each
+    /// with the footprint (cell frame) of the placements it holds. Empty iff
+    /// there are no instances; a cell with few placements has one chunk.
+    pub inst_chunks: Vec<Chunk>,
     index: OnceCell<ShapeIndex>,
 }
 
@@ -97,6 +101,7 @@ impl Cell {
             shapes: ShapeStore::new(),
             instances: Vec::new(),
             chunks: Vec::new(),
+            inst_chunks: Vec::new(),
             index: OnceCell::new(),
         }
     }
@@ -201,11 +206,17 @@ pub struct CellDb {
 
 impl Cell {
     /// Reconstruct a cell from already-computed parts (Phase 2b worker transfer):
-    /// name, chunked shape store, instances, and chunk table. The R-tree index is
-    /// **not** transferred — it stays a lazy `OnceCell`, rebuilt on the main
-    /// thread on first query exactly as for a locally-parsed cell.
-    pub fn from_parts(name: String, shapes: ShapeStore, instances: Vec<Instance>, chunks: Vec<Chunk>) -> Self {
-        Self { name, shapes, instances, chunks, index: OnceCell::new() }
+    /// name, chunked shape store, instances, and both chunk tables. The R-tree
+    /// index is **not** transferred — it stays a lazy `OnceCell`, rebuilt on the
+    /// main thread on first query exactly as for a locally-parsed cell.
+    pub fn from_parts(
+        name: String,
+        shapes: ShapeStore,
+        instances: Vec<Instance>,
+        chunks: Vec<Chunk>,
+        inst_chunks: Vec<Chunk>,
+    ) -> Self {
+        Self { name, shapes, instances, chunks, inst_chunks, index: OnceCell::new() }
     }
 }
 
@@ -404,6 +415,21 @@ impl CellDbBuilder {
 
         let local_bboxes = compute_local_bboxes(&cells);
 
+        // Partition each cell's placements spatially (Phase 7.3). This reorders
+        // the instances of cells with many placements — placement indices
+        // (`PlacementKey`) are numbered after it, hence `SHAPE_ID_SCHEME` 3.
+        // Bboxes do not depend on instance order, so they are computed first.
+        for cell in &mut cells {
+            let boxes: Vec<Bbox> =
+                cell.instances.iter().map(|inst| placement_bbox(inst, &local_bboxes[inst.child])).collect();
+            let (order, inst_chunks) = chunk::chunk_instances(&boxes);
+            if let Some(order) = order {
+                let old = std::mem::take(&mut cell.instances);
+                cell.instances = order.iter().map(|&i| old[i as usize]).collect();
+            }
+            cell.inst_chunks = inst_chunks;
+        }
+
         Ok(CellDb {
             cells,
             top,
@@ -438,21 +464,10 @@ fn compute_local_bboxes(cells: &[Cell]) -> Vec<Bbox> {
                 // All children resolved: fold them in.
                 let mut b = cells[id].own_bbox();
                 for inst in &cells[id].instances {
-                    let child_b = bboxes[inst.child];
-                    if child_b.min.x > child_b.max.x {
-                        continue; // empty child
-                    }
-                    match inst.kind {
-                        InstanceKind::Single => expand_by_transform(&mut b, &child_b, inst.transform),
-                        InstanceKind::Array { cols, rows, .. } => {
-                            // Corners of the array = base and the far element only
-                            // matter for bounds; fold the four extreme placements.
-                            for &(c, r) in &[(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1)] {
-                                let c = c.max(0);
-                                let r = r.max(0);
-                                expand_by_transform(&mut b, &child_b, inst.placement(c, r));
-                            }
-                        }
+                    let p = placement_bbox(inst, &bboxes[inst.child]);
+                    if p.min.x <= p.max.x {
+                        b.expand(p.min);
+                        b.expand(p.max);
                     }
                 }
                 bboxes[id] = b;
@@ -473,6 +488,25 @@ fn compute_local_bboxes(cells: &[Cell]) -> Vec<Bbox> {
         }
     }
     bboxes
+}
+
+/// Instance `inst`'s footprint in its parent's frame, given its child's local
+/// bbox: one placement, or an AREF's whole array (its four extreme elements
+/// bound it). Empty for an empty child.
+pub fn placement_bbox(inst: &Instance, child_b: &Bbox) -> Bbox {
+    let mut b = Bbox::empty();
+    if child_b.min.x > child_b.max.x {
+        return b;
+    }
+    match inst.kind {
+        InstanceKind::Single => expand_by_transform(&mut b, child_b, inst.transform),
+        InstanceKind::Array { cols, rows, .. } => {
+            for &(c, r) in &[(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1)] {
+                expand_by_transform(&mut b, child_b, inst.placement(c.max(0), r.max(0)));
+            }
+        }
+    }
+    b
 }
 
 /// Expand integer bbox `b` by the transformed corners of child bbox `child_b`.

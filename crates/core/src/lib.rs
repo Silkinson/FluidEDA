@@ -62,12 +62,13 @@ pub use serialize::{
 };
 pub use store::ShapeStore;
 
-/// Version of the rule that numbers each cell's shapes (the index in a
-/// [`BaseShapeId`]). Collaborative edits are keyed by these ids, so a room
-/// records the scheme its design was parsed with and refuses peers on another
-/// (Phase 6). 1: Phases 3–5 (GDS PATHs skipped). 2: Phase 6 (PATHs become
-/// polygons; OASIS read).
-pub const SHAPE_ID_SCHEME: u32 = 2;
+/// Version of the rule that numbers each cell's shapes and placements (the
+/// index in a [`BaseShapeId`] or a [`PlacementKey`]). Collaborative edits are
+/// keyed by these ids, so a room records the scheme its design was parsed with
+/// and refuses peers on another (Phase 6). 1: Phases 3–5 (GDS PATHs skipped).
+/// 2: Phase 6 (PATHs become polygons; OASIS read). 3: Phase 7.3 (the
+/// placements of cells with many are sorted spatially into placement chunks).
+pub const SHAPE_ID_SCHEME: u32 = 3;
 pub use tess::{
     tessellate, tessellate_chunk, tessellate_chunk_filtered, tessellate_columns, tessellate_shapes,
     LayerMesh,

@@ -28,8 +28,9 @@ use bytemuck::cast_slice;
 use std::io::{self, Write};
 
 /// Bumped whenever the pack layout (or anything baked into it — chunking,
-/// shape numbering) changes; servers key cached packs by it.
-pub const PACK_VERSION: u32 = 1;
+/// shape numbering) changes; servers key cached packs by it. 2: the skeleton
+/// carries placement chunk tables (Phase 7.3).
+pub const PACK_VERSION: u32 = 2;
 
 /// The first global chunk number of each cell, cells in order, followed by
 /// the total: cell `c`'s chunk `i` is chunk `base[c] + i` of the pack.

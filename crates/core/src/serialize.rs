@@ -37,7 +37,8 @@ use crate::types::{Bbox, Layer, Point};
 use anyhow::{bail, Result};
 
 const MAGIC: u32 = u32::from_le_bytes(*b"FEDB");
-const VERSION: u32 = 1;
+/// 2: each cell also carries its placement chunk table (Phase 7.3).
+const VERSION: u32 = 2;
 
 /// A serialized `CellDb`: three Pod columns (transferred as typed arrays) plus a
 /// metadata blob. Field order mirrors what the worker hands to `postMessage`.
@@ -116,12 +117,14 @@ fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell)) -> Vec<u8> {
             }
         }
 
-        // Chunk table.
-        meta.u32(cell.chunks.len() as u32);
-        for ch in &cell.chunks {
-            meta.u32(ch.start);
-            meta.u32(ch.end);
-            meta.bbox(&ch.bbox);
+        // Chunk tables: shapes, then placements (Phase 7.3).
+        for table in [&cell.chunks, &cell.inst_chunks] {
+            meta.u32(table.len() as u32);
+            for ch in table {
+                meta.u32(ch.start);
+                meta.u32(ch.end);
+                meta.bbox(&ch.bbox);
+            }
         }
     }
 
@@ -300,15 +303,9 @@ impl SkeletonParse {
                 }
                 instances.push(Instance { child, transform, kind });
             }
-            let n_chunks = r.u32()? as usize;
-            let mut chunks = Vec::with_capacity(n_chunks);
-            for _ in 0..n_chunks {
-                let start = r.u32()?;
-                let end = r.u32()?;
-                let bbox = r.bbox()?;
-                chunks.push(Chunk { start, end, bbox });
-            }
-            self.cells.push(Cell::from_parts(name, ShapeStore::new(), instances, chunks));
+            let chunks = read_chunks(&mut r, n_shapes)?;
+            let inst_chunks = read_chunks(&mut r, n_inst)?;
+            self.cells.push(Cell::from_parts(name, ShapeStore::new(), instances, chunks, inst_chunks));
         }
         self.pos = r.pos;
         Ok(true)
@@ -450,6 +447,21 @@ impl ProgressiveLoad {
         }
         Ok(self.remaining == 0)
     }
+}
+
+/// A chunk table: contiguous, in-range runs (checked — a malformed blob must
+/// not make the cull index past the end of a cell's shapes or instances).
+fn read_chunks(r: &mut Reader, total: usize) -> Result<Vec<Chunk>> {
+    let n = r.u32()? as usize;
+    let mut chunks = Vec::with_capacity(n.min(total + 1));
+    for _ in 0..n {
+        let (start, end, bbox) = (r.u32()?, r.u32()?, r.bbox()?);
+        if start > end || end as usize > total {
+            bail!("CellDb blob: chunk {start}..{end} outside 0..{total}");
+        }
+        chunks.push(Chunk { start, end, bbox });
+    }
+    Ok(chunks)
 }
 
 // --- little-endian byte cursor ----------------------------------------------
@@ -619,6 +631,7 @@ mod tests {
                     _ => panic!("{label}: '{}' inst {j} kind mismatch", a.name),
                 }
             }
+            assert_eq!(a.inst_chunks, b.inst_chunks, "{label}: '{}' placement chunks", a.name);
             assert_eq!(a.chunks.len(), b.chunks.len(), "{label}: '{}' chunk count", a.name);
             for (j, (x, y)) in a.chunks.iter().zip(&b.chunks).enumerate() {
                 assert_eq!((x.start, x.end), (y.start, y.end), "{label}: '{}' chunk {j} range", a.name);

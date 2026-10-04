@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-09-30 · current branch: `phase6-backend-oasis` (off `phase5d-editing`)_
+_Last updated: 2026-10-03 · current branch: `phase7` (off `phase6-backend-oasis`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -15,6 +15,18 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 `docs/AtomicStudio_Implementation_Plan.md`.
 
 ## Where we are
+
+**Phase 7 in progress** on `phase7` (plan: `docs/phase7-plan.md`; findings:
+`docs/phase7-findings.md`). The owner moved 7.3, stream the hierarchy, to the
+front.
+
+* **7.3 SLICE A — placement chunks.** Cells with many placements get a
+  spatial placement grid, like shape chunks: contiguous runs with footprints,
+  so the cull skips off-screen runs whole. In-core output is identical (cull
+  equivalence test, KLayout oracle, goldens, 0-pixel stream test). caravel's
+  per-frame cull in the browser drops **10.0 → 0.73 ms at mid** and
+  **9.7 → 0.37 ms at leaf**; fit is unchanged. Placement numbering changed
+  (`SHAPE_ID_SCHEME` 3, `PACK_VERSION` 2).
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -204,6 +216,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
+| 7 — scale + collaboration | `phase7` | ◑ 7.3 SLICE A done | 7.3 first (owner's order). SLICE A: placement chunks — caravel's in-browser cull at mid 10.0 → 0.73 ms/frame, leaf 9.7 → 0.37 ms/frame, output identical. Next: stream the hierarchy (pack v3), coloured proxies |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -218,6 +231,7 @@ still byte-identical).
 | fit fps, **real WebGPU** (Metal) | sky130 **60** / caravel 44 | Phase 5c (wgpu 30): first real WebGPU numbers — WebGL2-on-Metal for the same views is 22 / 51 (3 runs each, headless, 120 Hz cap). sky130's fit (5,144 draws/frame, CPU-bound) is 2.7× faster: WebGPU's per-draw cost is lower than ANGLE's. caravel's fit (1,822 draws over millions of triangles, GPU-bound) is 14% slower on Dawn-Metal than ANGLE-Metal. mid/leaf identical (93–94 fps) |
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |
 | fit-view TTFF | **1.7 s** (first frame of the new design) | Phase 5c: the skeleton (hierarchy + chunk boxes) installs before any geometry, so first paint no longer waits for the column copy either; all geometry in ~150 ms later (`geometry_ms`). Same session before/after: caravel 2.7 → 1.7 s, caravan-signoff 3.0 → 2.0 s; longest fit frame 112 → 84 ms / 119 → 82 ms (machine under load; absolute numbers above this table's older 62 ms were measured on a quiet machine) |
+| cull per frame (browser, caravel) | fit 17.7 ms · mid **0.73 ms** · leaf **0.37 ms** | Phase 7.3 SLICE A placement chunks: mid/leaf were 10.0 / 9.7 ms (same-build A/B, `?instwalk`); fit is the 553 k per-placement proxies — next for the density rule |
 | edit re-tess frame | < 2 ms | dirty chunks stay inline (finer-chunking, SLICE 2 path unchanged); offload never touches the edit path. caravel 1.8 ms, caravan-signoff 0.4 ms |
 | DRC: biggest cell full check | **2.9 s** (wasm, single-threaded) | caravel_core, 2.5 M shapes, merge-first (Phase 5b); was 10.3 s cold / 9.6 s warm per-shape. Native 2.3 s. Includes the 95 ms tile-grid build (budgeted, replaces the atomic R-tree). 2923 tiles, slowest 5.1 ms |
 | DRC: re-check after one edit | **1.1 ms** (wasm) | tiles within reach of the edit (1 tile for a typical shape); was a 9.6 s whole-cell re-check |

@@ -20,7 +20,7 @@ fn cell_of(shapes: Vec<(Layer, Vec<Point>)>) -> Cell {
         store.push(l, pts);
     }
     let chunks = crate::chunk::chunk_store(&mut store);
-    Cell::from_parts("T".into(), store, Vec::new(), chunks)
+    Cell::from_parts("T".into(), store, Vec::new(), chunks, Vec::new())
 }
 
 fn rules(w: i32, s: i32) -> DrcRules {

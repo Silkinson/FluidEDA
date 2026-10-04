@@ -221,6 +221,9 @@ pub struct FluidApp {
     pending_hash: Option<design::HashSlot>,
     /// The installed design is streamed (Phase 6 SLICE 3): its residency.
     stream: Option<Stream>,
+    /// Cull wall time per frame: smoothed, and the worst since `perf_reset`.
+    cull_ms: f64,
+    cull_max_ms: f64,
     /// A worker-parsed design arriving progressively (Phase 5c): first its
     /// skeleton is parsed (the old design keeps rendering), then installed
     /// (it renders as proxies), then its geometry fills in, visible cells
@@ -478,6 +481,8 @@ impl FluidApp {
             load_in_flight: file.is_some() || stream_hash.is_some(),
             pending_hash: None,
             stream: None,
+            cull_ms: 0.0,
+            cull_max_ms: 0.0,
             loading: None,
             load_instant: web_time::Instant::now(),
             awaiting_first_frame: true, // measure TTFF for the default too
@@ -620,6 +625,17 @@ impl FluidApp {
         self.design_source = design.source.clone();
         self.pending_hash = design.pending_hash;
         self.stream = design.stream.map(|info| Stream::new(info, &self.db));
+        // `?instwalk`: collapse placement chunks (the pre-7.3 walk) — the
+        // same-build A/B knob for the cull.
+        if webio::query_flag("instwalk") {
+            for id in 0..self.db.cells.len() {
+                let n = self.db.cells[id].instances.len() as u32;
+                if n > 0 {
+                    let bbox = self.db.local_bbox(id);
+                    self.db.cells[id].inst_chunks = vec![fluideda_core::chunk::Chunk { start: 0, end: n, bbox }];
+                }
+            }
+        }
         if self.stream.is_some() {
             // View-only: nothing geometry-backed (picking, edits, DRC, export)
             // can work on cells that hold no shapes.
@@ -1848,7 +1864,7 @@ impl FluidApp {
              \"gpu_bytes\":{},\"streaming\":{},\"stream_fetched\":{},\"stream_fetched_bytes\":{},\
              \"stream_fetch_ms\":{:.1},\"stream_evicted\":{},\"stream_failures\":{},\"stream_dense\":{},\
              \"stream_skeleton_bytes\":{},\"stream_geometry_bytes\":{},\"stream_pack_ms\":{:.1},\"wasm_heap\":{},\
-             \"stream_stale\":{},\"instances\":{}}}",
+             \"stream_stale\":{},\"instances\":{},\"cull_ms\":{:.3},\"cull_max_ms\":{:.2},\"nodes_visited\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -1890,6 +1906,9 @@ impl FluidApp {
             design::wasm_heap_bytes(),
             self.stream.as_ref().map_or(0, |s| s.stale),
             self.cull_stats.instances_emitted,
+            self.cull_ms,
+            self.cull_max_ms,
+            self.cull_stats.nodes_visited,
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -1914,6 +1933,7 @@ impl FluidApp {
     }
 
     fn recull(&mut self) {
+        let cull_t = web_time::Instant::now();
         self.camera.world_origin = self.camera.center;
         let half_w = (self.camera.viewport.x as f64 * 0.5) / self.camera.scale as f64;
         let half_h = (self.camera.viewport.y as f64 * 0.5) / self.camera.scale as f64;
@@ -1933,6 +1953,9 @@ impl FluidApp {
         };
         self.cull_stats = vs.stats;
         self.visible = Arc::new(vs);
+        let ms = cull_t.elapsed().as_secs_f64() * 1e3;
+        self.cull_ms = if self.cull_ms == 0.0 { ms } else { 0.9 * self.cull_ms + 0.1 * ms };
+        self.cull_max_ms = self.cull_max_ms.max(ms);
     }
 
     /// The collaboration section of the side panel (Phase 6: room, connection
@@ -2665,6 +2688,7 @@ impl FluidApp {
                 // the harness measure a window (e.g. a background DRC pass).
                 self.max_frame_ms = 0.0;
                 self.perf_frames = 0;
+                self.cull_max_ms = 0.0;
             }
             Some("drc_check") => self.drc_enqueue_visible(),
             Some("drc_bench") => {

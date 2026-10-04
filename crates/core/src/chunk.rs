@@ -99,8 +99,9 @@ pub const CHUNK_TARGET_SHAPES: usize = 16_000;
 /// the draw-call count at fit view, where every chunk of a big cell is visible.
 pub const CHUNK_MAX_DIM: u32 = 32;
 
-/// A contiguous run of shapes in a cell's store, plus the bbox they cover.
-#[derive(Debug, Clone, Copy)]
+/// A contiguous run of shapes in a cell's store (or, for a placement chunk,
+/// of its instances — Phase 7.3), plus the bbox they cover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chunk {
     /// First shape index (inclusive).
     pub start: u32,
@@ -159,20 +160,33 @@ pub fn chunk_store(store: &mut ShapeStore) -> Vec<Chunk> {
         return vec![Chunk { start: 0, end: n as u32, bbox: total }];
     }
 
-    // Grid over the cell's own-shape bbox. `size()` floors at 1, so a degenerate
-    // (zero-width) cell still yields a positive step rather than dividing by 0.
+    let (order, chunks) = grid_runs(&boxes, &total, dim);
+    drop(boxes);
+    *store = store.reordered(&order);
+    chunks
+}
+
+/// The single-owner grid sort shared by shape chunks and placement chunks:
+/// key each box by the grid square (`dim` × `dim` over `total`) holding its
+/// centre, stable-sort by key, and return the permutation (`order[new] = old`)
+/// plus one [`Chunk`] per non-empty square, each with the loose union bbox of
+/// what it owns. Empty boxes (`min > max`) are sorted but add nothing to bboxes.
+fn grid_runs(boxes: &[Bbox], total: &Bbox, dim: u32) -> (Vec<u32>, Vec<Chunk>) {
+    let n = boxes.len();
+    // Grid over the total bbox. `size()` floors at 1, so a degenerate
+    // (zero-width) extent still yields a positive step rather than dividing by 0.
     let (w, h) = total.size();
     let step_x = (w / dim as f64).max(1.0);
     let step_y = (h / dim as f64).max(1.0);
     let ox = total.min.x as f64;
     let oy = total.min.y as f64;
 
-    // Key each shape by the grid square holding its bbox centre (single owner).
+    // Key each box by the grid square holding its centre (single owner).
     let ncells = (dim * dim) as usize;
     let mut keys: Vec<u32> = Vec::with_capacity(n);
     let mut counts: Vec<u32> = vec![0; ncells];
-    for b in &boxes {
-        let (cx, cy) = b.center();
+    for b in boxes {
+        let (cx, cy) = if b.min.x <= b.max.x { b.center() } else { (ox, oy) };
         let col = (((cx - ox) / step_x).floor() as i64).clamp(0, dim as i64 - 1) as u32;
         let row = (((cy - oy) / step_y).floor() as i64).clamp(0, dim as i64 - 1) as u32;
         let k = row * dim + col;
@@ -199,7 +213,7 @@ pub fn chunk_store(store: &mut ShapeStore) -> Vec<Chunk> {
 
     // Chunk table over the runs the sort just created, each with its loose union
     // bbox. Built from `order` (new index -> old index) so it reads the cached
-    // boxes rather than re-scanning the reordered store.
+    // boxes rather than re-scanning the reordered data.
     let mut chunks = Vec::new();
     for k in 0..ncells {
         let (start, end) = (offsets[k], offsets[k + 1]);
@@ -210,17 +224,60 @@ pub fn chunk_store(store: &mut ShapeStore) -> Vec<Chunk> {
         for j in start..end {
             let b = boxes[order[j as usize] as usize];
             if b.min.x > b.max.x {
-                continue; // degenerate/pointless shape
+                continue; // degenerate/pointless box
             }
             bbox.expand(b.min);
             bbox.expand(b.max);
         }
         chunks.push(Chunk { start, end, bbox });
     }
-    drop(boxes);
+    (order, chunks)
+}
 
-    *store = store.reordered(&order);
-    chunks
+// --- placement chunks (Phase 7.3) --------------------------------------------
+//
+// The same treatment for a cell's *placements*. caravel_core places 460 k
+// standard cells directly; the cull visited every one of them each frame
+// (most only to find them off-screen), and an out-of-core client had to hold
+// all of them before its first frame. A placement chunk is a contiguous run
+// of a cell's instances plus the parent-frame bbox they cover, so the cull
+// skips a whole off-screen run with one test — and a streamed design can
+// fetch the runs on screen only.
+
+/// Cells with more placements than this get a placement grid; others keep one
+/// chunk spanning every instance (as shape chunks do below CHUNK_MIN_SHAPES).
+pub const INST_CHUNK_MIN: usize = 4096;
+/// Grid resolution aims for about this many placements per chunk — also the
+/// unit a streamed design fetches (≈ 2 k × 60 B ≈ 120 KB).
+pub const INST_CHUNK_TARGET: usize = 2048;
+/// Upper bound on the placement grid's resolution per axis (16 k chunks, so a
+/// cell with 50 M placements still gets ~3 k-placement chunks).
+pub const INST_CHUNK_MAX_DIM: u32 = 128;
+
+/// Partition a cell's placements spatially. `boxes[i]` is instance `i`'s
+/// footprint in the cell's frame (an AREF's whole array; empty for an empty
+/// child). Returns the permutation to apply (`order[new] = old`; identity —
+/// and `None` — when the cell stays one chunk) and the chunk table (empty iff
+/// there are no instances).
+pub fn chunk_instances(boxes: &[Bbox]) -> (Option<Vec<u32>>, Vec<Chunk>) {
+    let n = boxes.len();
+    if n == 0 {
+        return (None, Vec::new());
+    }
+    let mut total = Bbox::empty();
+    for b in boxes {
+        if b.min.x <= b.max.x {
+            total.expand(b.min);
+            total.expand(b.max);
+        }
+    }
+    let want = n.div_ceil(INST_CHUNK_TARGET);
+    let dim = ((want as f64).sqrt().ceil() as u32).clamp(1, INST_CHUNK_MAX_DIM);
+    if n <= INST_CHUNK_MIN || dim <= 1 {
+        return (None, vec![Chunk { start: 0, end: n as u32, bbox: total }]);
+    }
+    let (order, chunks) = grid_runs(boxes, &total, dim);
+    (Some(order), chunks)
 }
 
 /// How much the loose bboxes overlap their ideal grid squares, for the findings.
@@ -311,6 +368,56 @@ mod tests {
             cursor = c.end;
         }
         assert_eq!(cursor as usize, n, "chunks must cover every shape");
+    }
+
+    fn sq(x: i32, y: i32, s: i32) -> Bbox {
+        Bbox { min: Point::new(x, y), max: Point::new(x + s, y + s) }
+    }
+
+    #[test]
+    fn placement_chunks_tile_every_instance_and_contain_it() {
+        // A lattice of placements big enough to chunk, plus an empty child and
+        // a die-spanning macro.
+        let n = INST_CHUNK_MIN + 3_000;
+        let mut boxes: Vec<Bbox> = (0..n as i32).map(|i| sq((i % 128) * 5_000, (i / 128) * 3_000, 2_000)).collect();
+        boxes.push(Bbox::empty());
+        boxes.push(sq(0, 0, 640_000));
+        let (order, chunks) = chunk_instances(&boxes);
+        let order = order.expect("a cell over INST_CHUNK_MIN must reorder");
+        assert!(chunks.len() > 1);
+        let mut seen = vec![false; boxes.len()];
+        let mut cursor = 0;
+        for c in &chunks {
+            assert_eq!(c.start, cursor, "contiguous");
+            cursor = c.end;
+            for j in c.start..c.end {
+                let i = order[j as usize] as usize;
+                assert!(!seen[i], "placement {i} in two chunks");
+                seen[i] = true;
+                let b = boxes[i];
+                if b.min.x <= b.max.x {
+                    assert!(b.min.x >= c.bbox.min.x && b.max.x <= c.bbox.max.x && b.min.y >= c.bbox.min.y && b.max.y <= c.bbox.max.y);
+                }
+            }
+        }
+        assert_eq!(cursor as usize, boxes.len());
+        assert!(seen.iter().all(|&s| s), "every placement owned");
+        // Sorting an already-sorted list changes nothing (a written-then-reread
+        // file keeps its order).
+        let sorted: Vec<Bbox> = order.iter().map(|&i| boxes[i as usize]).collect();
+        let (again, chunks2) = chunk_instances(&sorted);
+        assert!(again.unwrap().iter().enumerate().all(|(k, &v)| k as u32 == v), "idempotent");
+        assert_eq!(chunks, chunks2);
+    }
+
+    #[test]
+    fn few_placements_stay_one_chunk_unsorted() {
+        let boxes: Vec<Bbox> = (0..100).map(|i| sq(i * 10, 0, 5)).collect();
+        let (order, chunks) = chunk_instances(&boxes);
+        assert!(order.is_none());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!((chunks[0].start, chunks[0].end), (0, 100));
+        assert!(chunk_instances(&[]).1.is_empty());
     }
 
     /// Single-owner assignment + loose bbox must never lose a shape: every shape

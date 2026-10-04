@@ -69,6 +69,9 @@ pub struct CullStats {
     /// Chunk selections emitted from *chunked* (large) cells only — the measure
     /// of how much of a die-spanning cell a viewport actually pulled in.
     pub chunks_emitted: u64,
+    /// Placement chunks skipped whole because their footprint missed the view
+    /// (Phase 7.3).
+    pub inst_chunks_skipped: u64,
 }
 
 /// Cull the design against a world-space viewport.
@@ -324,27 +327,43 @@ impl CullCtx<'_> {
             }
         }
 
-        // Descend into child instances.
+        // Descend into child instances, a placement chunk at a time (Phase
+        // 7.3): a chunk whose footprint misses the view is skipped with one
+        // test instead of one per placement — caravel_core's 460 k standard
+        // cells were each visited every frame just to be found off-screen.
+        // While an edit has grown a cell past its stored bbox, the chunks'
+        // precomputed footprints may be too small, so every chunk is walked
+        // (exactly the pre-7.3 behavior).
         // Phase 5d: placements hidden by "edit this placement only" are skipped
         // (their geometry is drawn as the parent's added shapes instead).
         let hides = self.overlay.is_some_and(|o| o.hides_in(id));
-        for (ii, inst) in cell.instances.iter().enumerate() {
-            match inst.kind {
-                InstanceKind::Single => {
-                    if hides && self.overlay.is_some_and(|o| o.is_hidden((id, ii as u32, 0, 0))) {
-                        continue;
-                    }
-                    self.walk(inst.child, world_tf.then(&inst.transform));
+        let chunk_view =
+            (cell.inst_chunks.len() > 1 && self.grown.is_empty()).then(|| world_tf.inverse().apply_bboxf(&self.view));
+        for ch in &cell.inst_chunks {
+            if chunk_view.as_ref().is_some_and(|v| !bbox_intersects(&ch.bbox, v)) {
+                self.set.stats.inst_chunks_skipped += 1;
+                continue;
+            }
+            for ii in ch.start as usize..ch.end as usize {
+                self.descend(id, ii, world_tf, hides);
+            }
+        }
+    }
+
+    /// Walk placement `ii` of cell `id` (`world_tf` = the cell's own world
+    /// transform).
+    fn descend(&mut self, id: CellId, ii: usize, world_tf: Transform, hides: bool) {
+        let inst = self.db.cell(id).instances[ii];
+        match inst.kind {
+            InstanceKind::Single => {
+                if hides && self.overlay.is_some_and(|o| o.is_hidden((id, ii as u32, 0, 0))) {
+                    return;
                 }
-                InstanceKind::Array {
-                    cols,
-                    rows,
-                    col_step,
-                    row_step,
-                } => {
-                    let hidden_in = hides.then_some((id, ii as u32));
-                    self.walk_array(inst.child, world_tf, inst.transform, cols, rows, col_step, row_step, hidden_in);
-                }
+                self.walk(inst.child, world_tf.then(&inst.transform));
+            }
+            InstanceKind::Array { cols, rows, col_step, row_step } => {
+                let hidden_in = hides.then_some((id, ii as u32));
+                self.walk_array(inst.child, world_tf, inst.transform, cols, rows, col_step, row_step, hidden_in);
             }
         }
     }
@@ -550,4 +569,82 @@ mod tests {
         xs.sort();
         assert_eq!(xs, vec![1_000, 6_000]);
     }
+
+    /// Phase 7.3: culling a placement chunk at a time must select exactly what
+    /// walking every placement does — same draws (cell, chunk, transforms) and
+    /// same proxies — at every view, including views that cut chunks in half.
+    #[test]
+    fn placement_chunks_cull_exactly_like_walking_every_placement() {
+        use crate::chunk::Chunk;
+        fn lattice() -> CellDb {
+            let mut b = CellDbBuilder::new();
+            let top = b.intern("TOP");
+            let leaf = b.intern("LEAF");
+            let tall = b.intern("TALL");
+            b.cell_mut(leaf).shapes.push(Layer::new(1, 0), sq(0, 0, 800));
+            b.cell_mut(tall).shapes.push(Layer::new(2, 0), sq(0, 0, 300));
+            // 6,000 scattered single placements (enough to chunk) …
+            for i in 0..6_000i32 {
+                let (x, y) = ((i * 7_919) % 100_000, (i * 104_729) % 80_000);
+                b.cell_mut(top).instances.push(Instance {
+                    child: leaf,
+                    transform: Transform::translate(x as f64, y as f64),
+                    kind: InstanceKind::Single,
+                });
+            }
+            // … and an array, which is one placement record covering many.
+            b.cell_mut(top).instances.push(Instance {
+                child: tall,
+                transform: Transform::translate(-5_000.0, 0.0),
+                kind: InstanceKind::Array { cols: 3, rows: 40, col_step: [1_000.0, 0.0], row_step: [0.0, 2_000.0] },
+            });
+            b.build().unwrap()
+        }
+        fn sq(x: i32, y: i32, s: i32) -> Vec<Point> {
+            vec![Point::new(x, y), Point::new(x + s, y), Point::new(x + s, y + s), Point::new(x, y + s)]
+        }
+        type Canon = (Vec<(CellId, ChunkId, Vec<[i64; 6]>)>, Vec<[i64; 4]>);
+        fn canon(vs: &VisibleSet) -> Canon {
+            let q = |v: f64| (v * 1e3).round() as i64;
+            let mut draws: Vec<_> = vs
+                .draws
+                .iter()
+                .map(|d| {
+                    let mut t: Vec<[i64; 6]> =
+                        d.transforms.iter().map(|t| [q(t.a), q(t.b), q(t.c), q(t.d), q(t.tx), q(t.ty)]).collect();
+                    t.sort();
+                    (d.cell, d.chunk, t)
+                })
+                .collect();
+            draws.sort();
+            let mut proxies: Vec<[i64; 4]> = vs.proxies.iter().map(|p| [q(p.min_x), q(p.min_y), q(p.max_x), q(p.max_y)]).collect();
+            proxies.sort();
+            (draws, proxies)
+        }
+        let chunked = lattice();
+        let top = chunked.top;
+        assert!(chunked.cell(top).inst_chunks.len() > 1, "the lattice must chunk");
+        // The reference: same database with every placement in one chunk.
+        let mut walked = lattice();
+        let n = walked.cells[top].instances.len() as u32;
+        walked.cells[top].inst_chunks = vec![Chunk { start: 0, end: n, bbox: walked.local_bbox(top) }];
+        let views = [
+            Bboxf { min_x: -6_000.0, min_y: -1_000.0, max_x: 101_000.0, max_y: 81_000.0 }, // all
+            Bboxf { min_x: 10_000.0, min_y: 10_000.0, max_x: 14_000.0, max_y: 13_000.0 },  // leaf-ish
+            Bboxf { min_x: 49_000.0, min_y: -500.0, max_x: 52_000.0, max_y: 80_500.0 },    // a stripe across chunks
+            Bboxf { min_x: -5_500.0, min_y: 30_000.0, max_x: -3_000.0, max_y: 50_000.0 },   // the array only
+        ];
+        for v in views {
+            for scale in [0.002, 0.05, 1.0] {
+                let a = cull(&chunked, &v, scale, 4.0);
+                let b = cull(&walked, &v, scale, 4.0);
+                assert_eq!(canon(&a), canon(&b), "view {v:?} at {scale} px/nm");
+                assert!(a.stats.nodes_visited <= b.stats.nodes_visited);
+            }
+        }
+        // A small view really skips most of the lattice.
+        let small = cull(&chunked, &views[1], 1.0, 4.0);
+        assert!(small.stats.inst_chunks_skipped > 0);
+    }
+
 }
