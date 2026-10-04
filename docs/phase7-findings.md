@@ -3,8 +3,8 @@
 **Status: in progress on `phase7`.** The owner moved 7.3 (stream the
 hierarchy) to the front. **7.3 is done** in three slices: **A** placement
 chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
-proxies (pack v4). **7.4** (edit streamed designs) is under way: **A**
-picking and editing, **B** rooms and "edit this placement only".
+proxies (pack v4). **7.4 is done** (edit streamed designs): **A** picking and editing, **B**
+rooms and "edit this placement only", **C** server-side export.
 
 ## 7.3 SLICE A — placement chunks
 
@@ -294,3 +294,95 @@ like any other.
   cell inside caravel_core, whose placements are remote. Streamed copies the
   same **53 shapes** into caravel_core as in-core, in **31 ms** including
   the fetches, and the views are identical.
+
+## 7.4 SLICE C — server-side export
+
+**Problem.** A streamed design is never wholly in the browser, so "Save
+GDS" and "Export OASIS" could not write it.
+
+**Design.**
+- `POST /export/<sha256>?format=gds|oas&ids=<scheme>`, with the client's
+  document state (a yrs v1 update) as the body. The server:
+  - parses the stored design in full;
+  - builds the overlay with `Session::overlay`, which moved from the app
+    into the sync crate, so client and server share one builder;
+  - writes the file with the same writers as an in-core save;
+  - puts the output in the blob store.
+- The client then downloads `/blobs/<hash>` directly, so a big export never
+  passes through the page's memory.
+- `POST /rooms/<name>/export` does the same with a room's bound design and
+  state. The plan named only this route. The client-state route also covers
+  a streamed design edited offline, with no room.
+- Refusals:
+  - 404: unknown design, or a room that is unknown or not bound.
+  - 400: an unknown format, or a state that does not decode.
+  - 409: another shape-id scheme. Its edits would land on other shapes.
+- One export runs at a time, because each parses a whole design.
+
+**Found: the same edits did not always write the same file.** Moved copies
+were written in hash-map order, which differs from one map to the next
+(Rust's per-instance random hashing). Two clients with identical edits
+could save files with the same geometry in a different record order. The
+first server test passed by luck and failed on the next run. Both writers
+now emit moved copies in base-id order (`EditOverlay::live_shapes_in`), so
+the same edits give the same bytes. A core test builds overlays in opposite
+orders and gets identical GDS and OASIS.
+
+**Correctness.**
+- Server tests: an export with every kind of edit is byte-for-byte the
+  in-core write (GDS and OASIS), and re-reads as exactly the composite. The
+  edits are moves in TOP and in a master, a delete, a vertex edit, shapes
+  drawn into TOP and into a master, and a hidden placement. A room's export
+  is the same file. All the refusals are covered.
+- `edit_sync_test` gained **20c**: after the whole scenario, both peers
+  "Save GDS", and the downloads must be the same file. With `STREAMED=1`,
+  B's file is written by the server: same SHA-256 (128 ms round trip). The
+  STREAMED run passes all 34 checks; the in-core run passes all 33.
+- **On caravel** (`stream_edit_test`): after the three edits, the in-core
+  page saves the file itself and the streamed page saves through the
+  server. Both downloads are the **same 276.3 MB file**.
+  - **KLayout as the oracle**: KLayout's reading of the server's export
+    matches ours on all 1,014 cells, 3,925,012 polygons (the original
+    3,925,013 minus the delete) and 462,523 placements.
+- **A second nondeterminism, found on caravel**: the first comparison
+  failed in **582 ANGLE records**, all −90° ± 1 ulp. The writers recovered
+  angles with `atan2`, and wasm's math library and the native one disagree
+  in the last bit. `Transform::strans_parts` now gives both writers one
+  canonical form: the angle in [0°, 360°), exact for multiples of 90°,
+  other angles and magnifications rounded. The bytes now match. A unit test
+  feeds it ulp noise of both signs around each quadrant. (The reader's
+  sin/cos keeps its ulp noise in the matrices; drawing and picking are
+  unaffected, as the pixel and pick checks show.)
+
+**Measured** (caravel, WebGPU, headless):
+
+| save the edited design | in-core page | streamed page (server writes) |
+|---|--:|--:|
+| wall time to the download | 1.15 s | 3.7 s (parse 291 MB GDS + write on the server) |
+| page heap afterwards | **860 MB** (from ~380: the 276 MB file is built in wasm) | **128 MB** (the file never enters the page) |
+
+## 7.4 — acceptance
+
+- **Two-peer scenario, one peer streamed, pixel-identical: met.**
+  `edit_sync_test` STREAMED=1 passes all 34 checks: the original 22 steps
+  plus 20b (0 of 619,200 pixels differ) and 20c (same file). B and the late
+  joiner C stream; A is in-core.
+- **Server export ≡ in-core export: met, byte for byte.** This is stronger
+  than the plan's normalized digest. It holds on the fixture and on edited
+  caravel (276 MB), and the KLayout oracle agrees.
+- **Memory bounded while editing: met.** Main memory holds the shape chunks
+  picks and edits fetched, up to a budget (128 MB by default). Edited and
+  selected chunks are pinned.
+  - caravel after 128 picks and the edits: 128 MB heap with 74 MB of shapes
+    held (in-core: 360–380 MB, 860 MB after a save).
+  - Under a 1 MB budget: 2,126 chunks evicted, 4 pinned (5.2 MB), heap
+    78 MB.
+- Not in 7.4, as the plan said:
+  - DRC on streamed designs moves to the server with 7.5.
+  - Rooms, streamed or not, stay open to anyone until 7.2.
+- Follow-ups it measured:
+  - A pick fetches whole chunks under the point: 74 MB for 128 caravel
+    picks. A server-side pick would send only the answer.
+  - An edited chunk of a streamed cell cannot be split finer. A shape in a
+    100 k-shape single-chunk cell re-tessellates that whole chunk once per
+    suppression change (in-core splits it to 3 k).

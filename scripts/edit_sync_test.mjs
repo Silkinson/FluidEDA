@@ -12,7 +12,8 @@
 //       store and the whole room state, and matches A exactly;
 //   22. a peer with ANOTHER design is refused (and the room is untouched),
 //       then loads the room's design from the store and converges.
-// Phase 7.4 adds 20b: converged peers draw the same pixels. With STREAMED=1,
+// Phase 7.4 adds 20b: converged peers draw the same pixels, and 20c: they
+// save the same file (a streamed peer's is written by the server). With STREAMED=1,
 // peer B and the late joiner C open the fixture OUT OF CORE (streamed from
 // the server's pack; every pick and edit fetches the chunks it needs) while A
 // stays in-core: the same scenario must converge, pixel-identical.
@@ -24,6 +25,7 @@
 // Each run uses a fresh room (rooms persist on the server now).
 // Run: node scripts/edit_sync_test.mjs   (STREAMED=1 for a streamed B and C)
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { launch } from './launch.mjs';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8080';
@@ -82,6 +84,14 @@ async function diff(page, a, b) {
     }
     return { px, total: x.length / 4 };
   }, [a.toString('base64'), b.toString('base64')]);
+}
+
+// "Save GDS" and the file the browser downloads: name, size, SHA-256, ms.
+async function saved(page) {
+  const t = Date.now();
+  const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 300000 }), cmdWait(page, 'save gds')]);
+  const bytes = readFileSync(await dl.path());
+  return { name: dl.suggestedFilename(), bytes: bytes.length, sha: createHash('sha256').update(bytes).digest('hex'), ms: Date.now() - t };
 }
 
 // Poll until predicate(state) is true, or throw.
@@ -332,6 +342,13 @@ async function main() {
     check(d20.px === 0,
       `A and B draw the same pixels (${d20.px} of ${d20.total} differ)` +
       (STREAMED ? `; B streamed: ${qb.stream_fetched} chunks drawn, ${qb.s_fetched} fetched for picks and edits` : ''));
+
+    // 20c. ...and save the same file. A streamed B cannot write the design
+    //      itself: the server writes it with B's edits (Phase 7.4 SLICE C).
+    const fa = await saved(A), fb = await saved(B);
+    check(fa.sha === fb.sha && fa.bytes > 0,
+      `both peers save the same file: ${fa.name}, ${fa.bytes} B, sha ${fa.sha.slice(0, 12)} ${fa.sha === fb.sha ? '=' : '≠'} ` +
+      `${fb.sha.slice(0, 12)}${STREAMED ? ` (B's written by the server, ${fb.ms} ms)` : ''}`);
 
     // --- Phase 6: the server keeps the room ------------------------------------
 

@@ -85,16 +85,10 @@ pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
             }
             w.boundary(cell.shapes.layer(i), cell.shapes.points(i));
         }
-        for (&(c, i), shape) in &overlay.edited {
-            if c == id && overlay.deleted.contains(&(c, i)) {
-                // A move tombstones the base and records the moved copy here.
-                w.boundary(shape.layer, &shape.points);
-            }
-        }
-        for a in &overlay.added {
-            if a.cell == id {
-                w.boundary(a.shape.layer, &a.shape.points);
-            }
+        // A move tombstones the base and records the moved copy; added shapes
+        // follow. In a fixed order: the same edits write the same file.
+        for shape in overlay.live_shapes_in(id) {
+            w.boundary(shape.layer, &shape.points);
         }
 
         // Instances. Phase 5d: a placement hidden by "edit this placement
@@ -159,13 +153,10 @@ pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
     w.into_vec()
 }
 
-/// Recover `(angle_deg, reflected, mag)` from a `from_strans`-built transform.
+/// Recover `(angle_deg, reflected, mag)` from a `from_strans`-built
+/// transform, in canonical form (the same bytes on every platform).
 fn invert_strans(t: &Transform) -> (f64, bool, f64) {
-    let mag = (t.a * t.a + t.b * t.b).sqrt();
-    let det = t.a * t.d - t.b * t.c;
-    let reflected = det < 0.0;
-    let angle = t.b.atan2(t.a).to_degrees();
-    (angle, reflected, mag)
+    t.strans_parts()
 }
 
 fn round(v: f64) -> i32 {
@@ -490,6 +481,28 @@ mod tests {
             got.sort();
             assert_eq!(got, want, "{label}: re-imported design differs from what was drawn");
         }
+    }
+
+    /// Phase 7.4: the same edits write the same file, whatever order they
+    /// were made in — the moved copies' map iterates differently in every
+    /// overlay, so a server-side export must not follow it.
+    #[test]
+    fn the_same_edits_write_the_same_file() {
+        let db = crate::load_layout_db(FIXTURE).unwrap();
+        let top = db.top;
+        let moves: Vec<(u32, i32)> = (0..5).map(|i| (i, 100 * (i as i32 + 1))).collect();
+        let build = |order: &mut dyn Iterator<Item = &(u32, i32)>| {
+            let mut o = EditOverlay::new();
+            for &(i, d) in order {
+                let c = db.cell(top);
+                o.move_shape((top, i), crate::edit::translate(c.shapes.layer(i as usize), c.shapes.points(i as usize), d, -d));
+            }
+            o
+        };
+        let a = build(&mut moves.iter());
+        let b = build(&mut moves.iter().rev());
+        assert_eq!(write_gds(&db, &a), write_gds(&db, &b));
+        assert_eq!(crate::write_oasis(&db, &a), crate::write_oasis(&db, &b));
     }
 
     #[test]

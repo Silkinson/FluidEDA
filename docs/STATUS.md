@@ -18,7 +18,7 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 
 **Phase 7 in progress** on `phase7` (plan: `docs/phase7-plan.md`; findings:
 `docs/phase7-findings.md`). The owner moved 7.3, stream the hierarchy, to the
-front.
+front, then 7.4, edit streamed designs. **Both are done.**
 
 * **7.3 SLICE A — placement chunks.** Cells with many placements get a
   spatial placement grid, like shape chunks: contiguous runs with footprints,
@@ -58,7 +58,21 @@ front.
   first. The two-peer test with B (and the late joiner) streamed passes all
   33 checks, and A and B end pixel-identical (0 of 619,200). On caravel, a
   streamed flatten inside caravel_core copies the same 53 shapes as in-core
-  (31 ms with fetches). Next: server-side export (SLICE C).
+  (31 ms with fetches).
+* **7.4 SLICE C — server-side export.** `POST /export/<sha256>` (the
+  client's edits in the body) and `POST /rooms/<r>/export` write the design
+  with its edits into the blob store, and the browser downloads it
+  directly. Client and server build the overlay with one function
+  (`Session::overlay`). Edited caravel saved through the server is **the
+  same 276 MB file, byte for byte**, as the in-core page's save, and KLayout
+  reads it like we do. The streamed page stays at 128 MB; the in-core page
+  grows to 860 MB. Two nondeterminisms found and fixed:
+  - moved copies were written in hash-map order;
+  - wasm and native `atan2` differ in the last bit (582 ANGLE records on
+    caravel). Angles and magnifications are now written in a canonical form.
+
+  **7.4 is done**: the two-peer scenario with one streamed peer passes all
+  34 checks, pixel-identical and saving the same file.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).

@@ -28,7 +28,7 @@
 
 use anyhow::Result;
 use ewebsock::{WsMessage, WsReceiver, WsSender};
-use fluideda_core::{AddId, BaseShapeId, CellId, Layer, PlacementKey, Point};
+use fluideda_core::{AddId, BaseShapeId, CellDb, CellId, EditOverlay, Layer, PlacementKey, Point};
 use glam::Vec2;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -201,6 +201,73 @@ impl Session {
             client_id,
             next_add_seq: 0,
         }
+    }
+
+    /// An offline session holding a document state — a v1 update, as a room
+    /// or [`state`](Self::state) encodes it. The server reads a room's or a
+    /// client's edits through one to export them (Phase 7.4).
+    pub fn from_state(update: &[u8]) -> Result<Self> {
+        let mut s = Self::new(Presence { cursor: Vec2::ZERO, name: String::new(), color: [0.0; 4] });
+        let update = yrs::Update::decode_v1(update).map_err(|e| anyhow::anyhow!("document state: {e}"))?;
+        s.doc.transact_mut().apply_update(update);
+        s.last_sv = s.doc.transact().state_vector();
+        Ok(s)
+    }
+
+    /// The whole document state, as one v1 update.
+    pub fn state(&self) -> Vec<u8> {
+        self.doc.transact().encode_state_as_update_v1(&StateVector::default())
+    }
+
+    /// The edit overlay these records make over `db` — the one builder the
+    /// app and the server's export share (Phase 7.4). Moves are translated
+    /// against `db`'s own base geometry; ids out of range (a peer on another
+    /// file) are ignored. A move or vertex edit needs its base shape in
+    /// memory: on a streamed design those that are not are left out, and the
+    /// shape chunks they wait for are returned (in-core: never any).
+    pub fn overlay(&self, db: &CellDb) -> (EditOverlay, Vec<(CellId, u32)>) {
+        let mut o = EditOverlay::new();
+        let mut waiting = Vec::new();
+        for (id, kind) in self.edits() {
+            let (cell, idx) = id;
+            if cell >= db.cells.len() || idx as usize >= db.cell(cell).shape_count() {
+                continue;
+            }
+            let c = db.cell(cell);
+            let base = c.shape_layer(idx as usize).zip(c.shape_points(idx as usize));
+            match (kind, base) {
+                (EditKind::Delete, _) => o.delete(id),
+                (EditKind::Move { dx, dy }, Some((layer, pts))) => {
+                    o.move_shape(id, fluideda_core::edit::translate(layer, pts, dx, dy));
+                }
+                // A vertex edit ships the full ring (SLICE 2 amendment); the
+                // layer comes from the receiver's own base — it never changes.
+                (EditKind::SetPoints(points), Some((layer, _))) => {
+                    o.move_shape(id, fluideda_core::Shape { layer, points });
+                }
+                (_, None) => waiting.extend(c.chunk_of(idx).map(|ci| (cell, ci))),
+            }
+        }
+        // Hidden placements (Phase 5d "edit this placement only").
+        for key in self.hidden() {
+            let (parent, ii, _, _) = key;
+            if parent < db.cells.len() && (ii as usize) < db.cell(parent).placement_count() {
+                o.hide_placement(key);
+            }
+        }
+        // Added shapes: geometry ships in the record; tombstoned adds are
+        // skipped. `adds()` is sorted by id, so every peer rebuilds the same
+        // draw order.
+        for (id, geom) in self.adds() {
+            let Some(g) = geom else { continue };
+            if g.cell >= db.cells.len() {
+                continue;
+            }
+            o.add(id, g.cell, fluideda_core::Shape { layer: g.layer, points: g.points });
+        }
+        waiting.sort_unstable();
+        waiting.dedup();
+        (o, waiting)
     }
 
     /// Create a session and immediately connect to the relay.

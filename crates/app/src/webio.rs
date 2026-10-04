@@ -923,6 +923,77 @@ pub struct RoomInfo {
 
 pub type RoomSlot = Rc<RefCell<Option<Result<RoomInfo, String>>>>;
 
+/// A server-side export (Phase 7.4 SLICE C), as the app follows it.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the export is web-only
+pub enum ExportState {
+    Idle,
+    Running,
+    /// Written into the blob store as `hash` and handed to the browser's
+    /// download as `name`.
+    Done { hash: String, bytes: u64, ms: f64, name: String },
+    Failed(String),
+}
+
+pub type ExportSlot = Rc<RefCell<ExportState>>;
+
+/// Export design `design` with the edits in document state `state` on the
+/// server (`POST /export/<design>`), then download the result straight from
+/// the blob store as `name` — the bytes never pass through this page.
+#[cfg(target_arch = "wasm32")]
+pub fn export_on_server(design: String, oasis: bool, state: Vec<u8>, name: String, slot: ExportSlot) {
+    *slot.borrow_mut() = ExportState::Running;
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            let format = if oasis { "oas" } else { "gds" };
+            let url = format!("/export/{design}?format={format}&ids={}", fluideda_core::SHAPE_ID_SCHEME);
+            let body: wasm_bindgen::JsValue = js_sys::Uint8Array::from(state.as_slice()).into();
+            let resp = http(&url, "POST", Some(&body)).await?;
+            if !resp.ok() {
+                let text = wasm_bindgen_futures::JsFuture::from(resp.text().map_err(|e| format!("{e:?}"))?)
+                    .await
+                    .ok()
+                    .and_then(|t| t.as_string())
+                    .unwrap_or_default();
+                return Err(format!("POST {url}: HTTP {} {text}", resp.status()));
+            }
+            let m = wasm_bindgen_futures::JsFuture::from(resp.json().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("POST {url}: {e:?}"))?;
+            let hash = get_str(&m, "hash").ok_or("export: no hash")?;
+            download_url(&format!("/blobs/{hash}"), &name)?;
+            Ok::<_, String>(ExportState::Done { hash, bytes: get_f64(&m, "bytes") as u64, ms: get_f64(&m, "ms"), name })
+        }
+        .await;
+        *slot.borrow_mut() = result.unwrap_or_else(ExportState::Failed);
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_on_server(_design: String, _oasis: bool, _state: Vec<u8>, _name: String, slot: ExportSlot) {
+    *slot.borrow_mut() = ExportState::Failed("server export is web-only".into());
+}
+
+/// Hand `url` (same origin) to the browser's download as `name`.
+#[cfg(target_arch = "wasm32")]
+fn download_url(url: &str, name: &str) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
+    let a = doc
+        .create_element("a")
+        .map_err(|e| format!("a: {e:?}"))?
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| "anchor cast".to_string())?;
+    a.set_href(url);
+    a.set_download(name);
+    let _ = a.style().set_property("display", "none");
+    let body = doc.body().ok_or("no body")?;
+    let _ = body.append_child(&a);
+    a.click();
+    let _ = body.remove_child(&a);
+    Ok(())
+}
+
 /// Where the design stands in the server's blob store.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the upload is web-only

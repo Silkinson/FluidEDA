@@ -10,7 +10,9 @@
 //      streamed page redraws the edited chunks from the copies it fetched; the
 //      screenshots must match pixel for pixel. Undoing all three restores the
 //      original pixels. "Edit this placement only" there (a standard cell in
-//      caravel_core, whose placements are remote) copies the same shapes.
+//      caravel_core, whose placements are remote) copies the same shapes. And
+//      "Save GDS" gives the same file: written by the in-core page, and by
+//      the server for the streamed one (SLICE C).
 //   3. MEMORY — with a 1 MB shape budget the streamed page evicts what its
 //      picks fetched but keeps what its edits and selection need: after picks
 //      all over the die, the edited view still matches in-core exactly. (Both
@@ -18,6 +20,8 @@
 //
 // Prereqs: server (:9000) holding caravel's blob, trunk serve (:8080).
 // Run: GPU=webgpu node scripts/stream_edit_test.mjs
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { launch } from './launch.mjs';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8080';
@@ -132,6 +136,14 @@ function points(view) {
   return out;
 }
 
+// "Save GDS" and the file the browser downloads: size, SHA-256, ms.
+async function saved(page) {
+  const t = Date.now();
+  const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 600000 }), cmd(page, 'save gds')]);
+  const bytes = readFileSync(await dl.path());
+  return { bytes: bytes.length, sha: createHash('sha256').update(bytes).digest('hex'), ms: Date.now() - t };
+}
+
 // The three edits, by pick point: delete, move vertex 0, nudge.
 async function edit(page, targets) {
   await pick(page, targets[0]);
@@ -204,6 +216,17 @@ async function main() {
     check(dChanged.px > 0 && d1.px === 0,
       `edited view: streamed = in-core (${d1.px} of ${d1.total} pixels differ; the edits changed ${dChanged.px}); ` +
       `streamed re-tessellated ${qe.last_edit_chunks} chunk(s) in ${qe.last_edit_ms.toFixed(1)} ms for the last edit`);
+
+    // Saved: in-core, the page writes the file; streamed, the server writes
+    // it with the page's edits (SLICE C). The same file either way.
+    const fl0 = await saved(local);
+    const hl = await perf(local);
+    const fs0 = await saved(streamed);
+    const hs = await perf(streamed);
+    check(fl0.sha === fs0.sha && fl0.bytes > 1e6,
+      `save the edited caravel: the server's export of the streamed edits = the in-core save ` +
+      `(${(fl0.bytes / 1e6).toFixed(1)} MB, sha ${fl0.sha.slice(0, 12)}); in-core page ${fl0.ms} ms (heap ` +
+      `${(hl.wasm_heap / 1e6).toFixed(0)} MB), streamed via the server ${fs0.ms} ms (heap ${(hs.wasm_heap / 1e6).toFixed(0)} MB)`);
 
     for (let i = 0; i < 3; i++) {
       await cmd(local, 'undo');

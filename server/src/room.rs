@@ -200,6 +200,14 @@ impl Room {
         let _ = self.tx.send((peer, msg));
     }
 
+    /// The room's design binding and its whole document state (Phase 7.4:
+    /// what a server-side export writes).
+    pub fn design_and_state(&self) -> (Option<DesignKey>, Vec<u8>) {
+        let st = self.state.lock().unwrap();
+        let state = st.doc.transact().encode_state_as_update_v1(&StateVector::default());
+        (st.design(), state)
+    }
+
     /// The framed whole-room state (a lagging peer's resync).
     pub fn state_frame(&self) -> Vec<u8> {
         let st = self.state.lock().unwrap();

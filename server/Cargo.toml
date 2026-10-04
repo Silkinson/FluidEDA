@@ -25,9 +25,10 @@ yrs.workspace = true
 sha2 = "0.10"
 # Phase 6 SLICE 3: the server parses stored designs into streamable packs.
 fluideda-core = { path = "../crates/core" }
+# Phase 7.4 SLICE C: exports read edits through the client's own overlay builder.
+fluideda-sync = { path = "../crates/sync" }
 
 [dev-dependencies]
-fluideda-sync = { path = "../crates/sync" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 glam.workspace = true

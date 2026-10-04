@@ -81,6 +81,31 @@ impl Transform {
         }
     }
 
+    /// `(angle°, reflected, mag)` of a [`from_strans`](Self::from_strans)
+    /// transform, in the one form both writers emit (Phase 7.4). The angle
+    /// is in [0°, 360°). It is exactly a multiple of 90° when it is one to
+    /// within 1e-9°, and other angles are rounded to 1e-9°. Magnification is
+    /// rounded to 12 decimals.
+    ///
+    /// The reader's sin/cos and this atan2 leave noise in the last bits, and
+    /// the noise differs between platforms (wasm's math library vs the
+    /// native one). Measured: caravel exported in the browser and on the
+    /// server differed in 582 ANGLE records, all −90° ± 1 ulp. Canonical
+    /// values make an export the same bytes wherever it is written.
+    pub fn strans_parts(&self) -> (f64, bool, f64) {
+        let mag = (self.a * self.a + self.b * self.b).sqrt();
+        let reflected = self.a * self.d - self.b * self.c < 0.0;
+        let mut angle = self.b.atan2(self.a).to_degrees().rem_euclid(360.0);
+        let quarter = (angle / 90.0).round();
+        angle = if (angle - quarter * 90.0).abs() < 1e-9 {
+            (quarter as i64).rem_euclid(4) as f64 * 90.0
+        } else {
+            (angle * 1e9).round() / 1e9
+        };
+        let mag = (mag * 1e12).round() / 1e12;
+        (angle, reflected, mag)
+    }
+
     /// `self ∘ rhs`: apply `rhs` first (inner/child), then `self` (outer/parent).
     /// Used to push a child's placement onto the parent's accumulated transform.
     pub fn then(&self, rhs: &Transform) -> Transform {
@@ -230,6 +255,29 @@ impl Bboxf {
 
 #[cfg(test)]
 mod tests {
+
+    /// Phase 7.4: ulp noise of either sign around a 90° multiple (what the
+    /// reader's sin/cos leaves, differently per platform) gives one exact
+    /// angle; other angles and magnifications are rounded, not noisy.
+    #[test]
+    fn strans_parts_are_canonical() {
+        let t = |a: f64, b: f64, c: f64, d: f64| Transform { a, b, c, d, tx: 0.0, ty: 0.0 };
+        let e = 6.123233995736766e-17;
+        for (m, want) in [
+            (t(e, -1.0, 1.0, e), (270.0, false, 1.0)),
+            (t(-e, -1.0, 1.0, -e), (270.0, false, 1.0)),
+            (t(-1.0, 1.2e-16, -1.2e-16, -1.0), (180.0, false, 1.0)),
+            (t(-1.0, -1.2e-16, 1.2e-16, -1.0), (180.0, false, 1.0)),
+            (t(1.0, -1e-17, 1e-17, 1.0), (0.0, false, 1.0)),
+            (t(e, 1.0, 1.0, -e), (90.0, true, 1.0)),
+        ] {
+            assert_eq!(m.strans_parts(), want);
+        }
+        for (deg, refl, mag) in [(45.0, false, 1.0), (30.0, true, 2.5), (271.5, false, 0.25)] {
+            let (a, r, g) = Transform::from_strans(0.0, 0.0, deg, refl, mag).strans_parts();
+            assert_eq!((a, r, g), (deg, refl, mag), "{deg}° {refl} ×{mag}");
+        }
+    }
     use super::*;
 
     fn approx(a: f64, b: f64) {

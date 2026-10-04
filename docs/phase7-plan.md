@@ -30,11 +30,12 @@ claim a same-session A/B; nothing pushed without the owner.
 | 7.5 | In-context (hierarchical) DRC | intra-cell DRC misses cross-instance errors; caravel's pad cells leave 3,305 context-only flags | L | — |
 | 7.6 | Fit-view GPU gap | caravel fit is 14% slower on WebGPU (Dawn) than WebGL (ANGLE) | S–M | (7.3's LOD) |
 
-**Order (revised 2026-10-03): the owner moved 7.3 to the front.** It has no
-dependencies. **7.3 is done** in three slices — placement chunks, streaming
-the hierarchy (pack v3), coloured proxies (pack v4); see
-`phase7-findings.md`. The rest follow in the original order: 7.1, 7.2, 7.4
-(which needs 7.3), then 7.5 and 7.6.
+**Order (revised 2026-10-03): the owner moved 7.3 to the front, then 7.4.**
+**7.3 is done** in three slices: placement chunks, streaming the hierarchy
+(pack v3), coloured proxies (pack v4). **7.4 is done** in three slices:
+picking and editing, rooms and "edit this placement only" (pack v5), and
+server-side export. See `phase7-findings.md`. The rest follow in the
+original order: 7.1, 7.2, 7.5, 7.6.
 
 The original reasoning for the rest still holds: 7.1 is small and makes
 everything after it cheaper to test; 7.2 gates using the server beyond one

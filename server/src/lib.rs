@@ -12,8 +12,13 @@
 //! * `GET /rooms/<name>` — the room's design binding and version history.
 //! * `GET /packs/<sha256>` — a stored design's streaming pack manifest, built
 //!   on first request ([`packs`]); its blobs are served from `/blobs/`.
+//! * `POST /export/<sha256>?format=gds|oas&ids=<n>` — the design with the
+//!   edits of the document state in the body, written into the blob store
+//!   ([`export`], Phase 7.4); `POST /rooms/<name>/export?format=` does the
+//!   same with the room's design and state.
 //! * `GET /health`.
 
+pub mod export;
 pub mod packs;
 pub mod room;
 pub mod store;
@@ -26,7 +31,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
@@ -49,7 +54,9 @@ pub fn app(hub: Arc<Hub>) -> Router {
         .route("/ws", get(ws_handler))
         .route("/blobs/:hash", get(get_blob).put(put_blob))
         .route("/rooms/:room", get(room_info))
+        .route("/rooms/:room/export", post(export_room))
         .route("/packs/:design", get(pack_manifest))
+        .route("/export/:design", post(export_design))
         .route("/health", get(|| async { "ok" }))
         .with_state(hub)
 }
@@ -390,6 +397,108 @@ async fn pack_manifest(State(hub): State<Arc<Hub>>, Path(design): Path<String>) 
         Ok(Some(m)) => ([(header::CACHE_CONTROL, "no-cache")], Json(m)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such design blob").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// --- export (Phase 7.4 SLICE C) ---------------------------------------------
+
+/// Largest document state `POST /export` accepts.
+const MAX_STATE: usize = 256 << 20;
+
+/// One export at a time (an export parses a whole design).
+static EXPORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    /// `gds` (the default) or `oas`.
+    format: Option<String>,
+    /// The client's shape-id scheme: its edits number shapes by it.
+    ids: Option<u32>,
+}
+
+impl ExportQuery {
+    fn oasis(&self) -> Result<bool, String> {
+        match self.format.as_deref() {
+            None | Some("gds") => Ok(false),
+            Some("oas") => Ok(true),
+            Some(f) => Err(format!("format {f:?}: gds or oas")),
+        }
+    }
+}
+
+/// `POST /export/<design>`: the design with the edits of the document state
+/// in the body (a client's own — it need not be in a room).
+async fn export_design(
+    State(hub): State<Arc<Hub>>,
+    Path(design): Path<String>,
+    Query(q): Query<ExportQuery>,
+    body: Body,
+) -> Response {
+    if !store::is_hash(&design) {
+        return bad_request("not a sha256 hex digest");
+    }
+    let oasis = match q.oasis() {
+        Ok(o) => o,
+        Err(e) => return bad_request(e),
+    };
+    if let Some(ids) = q.ids.filter(|&i| i != fluideda_core::SHAPE_ID_SCHEME) {
+        return id_scheme_conflict(ids);
+    }
+    let Ok(state) = axum::body::to_bytes(body, MAX_STATE).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, format!("document states are at most {MAX_STATE} bytes")).into_response();
+    };
+    run_export(&hub, design, state.to_vec(), oasis).await
+}
+
+/// `POST /rooms/<room>/export`: the room's design with the room's edits.
+async fn export_room(State(hub): State<Arc<Hub>>, Path(name): Path<String>, Query(q): Query<ExportQuery>) -> Response {
+    if !store::is_room_name(&name) {
+        return bad_request("room names are 1-64 characters of [A-Za-z0-9_-]");
+    }
+    let oasis = match q.oasis() {
+        Ok(o) => o,
+        Err(e) => return bad_request(e),
+    };
+    let h = hub.clone();
+    let found = tokio::task::spawn_blocking(move || h.existing_room(&name).map(|r| r.map(|r| r.design_and_state())))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)));
+    match found {
+        Ok(Some((Some(design), state))) => {
+            if design.ids != fluideda_core::SHAPE_ID_SCHEME {
+                return id_scheme_conflict(design.ids);
+            }
+            run_export(&hub, design.hash, state, oasis).await
+        }
+        Ok(Some((None, _))) => (StatusCode::NOT_FOUND, "the room is not bound to a design").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such room").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Edits numbered under another shape-id scheme would land on other shapes.
+fn id_scheme_conflict(ids: u32) -> Response {
+    (
+        StatusCode::CONFLICT,
+        format!("edits numbered under shape-id scheme {ids}; this server parses with {}", fluideda_core::SHAPE_ID_SCHEME),
+    )
+        .into_response()
+}
+
+async fn run_export(hub: &Arc<Hub>, design: String, state: Vec<u8>, oasis: bool) -> Response {
+    let store = hub.store.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let _one = EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
+        export::export(&store, &design, &state, oasis)
+    })
+    .await
+    .unwrap_or_else(|e| Err(export::ExportError::Io(io::Error::other(e))));
+    match done {
+        Ok(e) => ([(header::CACHE_CONTROL, "no-cache")], Json(e)).into_response(),
+        Err(export::ExportError::NoDesign) => (StatusCode::NOT_FOUND, "no such design blob").into_response(),
+        Err(export::ExportError::BadState(m)) => bad_request(m),
+        Err(export::ExportError::BadDesign(m)) => (StatusCode::UNPROCESSABLE_ENTITY, m).into_response(),
+        Err(export::ExportError::Io(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

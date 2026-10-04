@@ -562,6 +562,10 @@ pub struct FluidApp {
     reconnects: u32,
     /// The design's state in the server's blob store.
     upload: webio::UploadSlot,
+    /// A streamed design's last server-side export (Phase 7.4).
+    export: webio::ExportSlot,
+    /// The export last reported in the status line.
+    export_seen: Option<webio::ExportState>,
     /// The blob check ran for the current connection.
     upload_checked: bool,
     name: String,
@@ -714,6 +718,8 @@ impl FluidApp {
             rejoin_failures: 0,
             reconnects: 0,
             upload: Rc::new(RefCell::new(webio::UploadState::Idle)),
+            export: Rc::new(RefCell::new(webio::ExportState::Idle)),
+            export_seen: None,
             upload_checked: false,
             last_frame: 0.0,
             fps: 0.0,
@@ -1557,6 +1563,17 @@ impl FluidApp {
             self.status = "still loading — save when the geometry is in".into();
             return;
         }
+        if self.stream.is_some() {
+            // A streamed design is never all in memory (Phase 7.4): the
+            // server writes it with this session's edits, and the browser
+            // downloads the file straight from the blob store.
+            let gds = out_name(&self.metrics.name);
+            let name = if oasis { gds.replace(".gds", ".oas") } else { gds };
+            let state = self.session.state();
+            webio::export_on_server(self.metrics.hash.clone(), oasis, state, name.clone(), self.export.clone());
+            self.status = format!("exporting {name} on the server…");
+            return;
+        }
         let (bytes, name) = if oasis {
             (fluideda_core::write_oasis(&self.db, &self.overlay), out_name(&self.metrics.name).replace(".gds", ".oas"))
         } else {
@@ -1566,6 +1583,22 @@ impl FluidApp {
             Ok(()) => self.status = format!("saved {name} ({} KB)", bytes.len() / 1024),
             Err(e) => self.status = format!("save failed: {e}"),
         }
+    }
+
+    /// Report a server-side export's outcome in the status line, once.
+    fn drive_export(&mut self) {
+        let now = self.export.borrow().clone();
+        if self.export_seen.as_ref() == Some(&now) {
+            return;
+        }
+        match &now {
+            webio::ExportState::Done { name, bytes, ms, .. } => {
+                self.status = format!("saved {name} ({} KB, written by the server in {ms:.0} ms)", bytes / 1024);
+            }
+            webio::ExportState::Failed(e) => self.status = format!("export failed: {e}"),
+            webio::ExportState::Idle | webio::ExportState::Running => {}
+        }
+        self.export_seen = Some(now);
     }
 
     /// Undo the last local edit (per-user; a peer's edits are never on our undo
@@ -2811,7 +2844,7 @@ impl FluidApp {
             .into_iter()
             .filter_map(|(id, k)| matches!(k, fluideda_sync::EditKind::SetPoints(_)).then_some(id))
             .collect();
-        let (new, waiting) = self.overlay_from_crdt();
+        let (new, waiting) = self.session.overlay(&self.db);
         // A streamed design materializes an edit once its base shape's chunk
         // is in memory (Phase 7.4): fetch the missing ones; their arrival
         // reconciles again.
@@ -2873,59 +2906,6 @@ impl FluidApp {
             Selection::Added(id) => overlay.find_added(id).is_some(),
             Selection::Base(id) => !overlay.deleted.contains(&id) || overlay.edited.contains_key(&id),
         });
-    }
-
-    /// Build an `EditOverlay` from the CRDT's edit records, translating each move
-    /// against this client's base geometry. Out-of-range ids (a peer on a
-    /// different file) are ignored rather than panicking.
-    ///
-    /// A streamed design's move or vertex edit needs its base shape's chunk in
-    /// memory (Phase 7.4); until then it is left out, and the chunks it waits
-    /// for are returned.
-    fn overlay_from_crdt(&self) -> (EditOverlay, Vec<(CellId, u32)>) {
-        let mut o = EditOverlay::new();
-        let mut waiting = Vec::new();
-        for (id, kind) in self.session.edits() {
-            let (cell, idx) = id;
-            if cell >= self.db.cells.len() || idx as usize >= self.db.cell(cell).shape_count() {
-                continue;
-            }
-            let c = self.db.cell(cell);
-            let base = c.shape_layer(idx as usize).zip(c.shape_points(idx as usize));
-            match (kind, base) {
-                (fluideda_sync::EditKind::Delete, _) => o.delete(id),
-                (fluideda_sync::EditKind::Move { dx, dy }, Some((layer, pts))) => {
-                    o.move_shape(id, fluideda_core::edit::translate(layer, pts, dx, dy));
-                }
-                // A vertex edit ships the full ring (SLICE 2 amendment); the layer
-                // comes from the receiver's own base — it never changes.
-                (fluideda_sync::EditKind::SetPoints(points), Some((layer, _))) => {
-                    o.move_shape(id, fluideda_core::Shape { layer, points });
-                }
-                (_, None) => waiting.extend(c.chunk_of(idx).map(|ci| (cell, ci))),
-            }
-        }
-        // Hidden placements (Phase 5d "edit this placement only"). Out-of-range
-        // keys (a peer on a different file) are ignored.
-        for key in self.session.hidden() {
-            let (parent, ii, _, _) = key;
-            if parent < self.db.cells.len() && (ii as usize) < self.db.cell(parent).placement_count() {
-                o.hide_placement(key);
-            }
-        }
-        // Added shapes (Phase 5 SLICE 1): geometry ships in the record; tombstoned
-        // adds return None and are skipped. `session.adds()` is sorted by id, so
-        // every peer rebuilds the same deterministic draw order.
-        for (id, geom) in self.session.adds() {
-            let Some(g) = geom else { continue };
-            if g.cell >= self.db.cells.len() {
-                continue;
-            }
-            o.add(id, g.cell, fluideda_core::Shape { layer: g.layer, points: g.points });
-        }
-        waiting.sort_unstable();
-        waiting.dedup();
-        (o, waiting)
     }
 }
 
@@ -3044,6 +3024,7 @@ impl eframe::App for FluidApp {
             ctx.request_repaint();
         }
         self.drive_room(now);
+        self.drive_export();
 
         self.drive_test_hook();
 
@@ -3106,7 +3087,7 @@ impl FluidApp {
             "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{},\"hidden\":{},\
              \"room\":\"{}\",\"connecting\":{},\"synced\":{},\"design_hash\":\"{}\",\"room_design\":\"{}\",\
              \"room_design_name\":\"{}\",\"refused\":{},\"join_error\":\"{}\",\"upload\":\"{}\",\"reconnects\":{},\
-             \"loading\":{}}}",
+             \"loading\":{},\"export\":\"{}\"}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -3139,6 +3120,12 @@ impl FluidApp {
             json_str(&self.upload.borrow().label()),
             self.reconnects,
             self.load_in_flight || self.loading.is_some(),
+            json_str(&match &*self.export.borrow() {
+                webio::ExportState::Idle => String::new(),
+                webio::ExportState::Running => "running".into(),
+                webio::ExportState::Done { hash, .. } => hash.clone(),
+                webio::ExportState::Failed(e) => format!("failed: {e}"),
+            }),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -3496,6 +3483,9 @@ impl FluidApp {
             }
             Some("undo") => self.do_undo(),
             Some("redo") => self.do_redo(),
+            // `save gds|oas` — "Save GDS" / "Export OASIS" (Phase 7.4 driver: a
+            // streamed design exports on the server).
+            Some("save") => self.save_layout(parts.next() == Some("oas")),
             _ => {}
         }
     }
@@ -3747,15 +3737,13 @@ impl FluidApp {
                     self.do_redo();
                 }
             });
-            ui.add_enabled_ui(self.stream.is_none(), |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("💾 Save GDS").clicked() {
-                        self.save_gds();
-                    }
-                    if ui.button("Export OASIS").on_hover_text("same content, typically 10–30× smaller").clicked() {
-                        self.save_layout(true);
-                    }
-                });
+            ui.horizontal(|ui| {
+                if ui.button("💾 Save GDS").clicked() {
+                    self.save_gds();
+                }
+                if ui.button("Export OASIS").on_hover_text("same content, typically 10–30× smaller").clicked() {
+                    self.save_layout(true);
+                }
             });
 
             ui.separator();

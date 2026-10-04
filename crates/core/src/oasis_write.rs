@@ -178,12 +178,8 @@ fn as_rect(r: &[Point]) -> Option<(i32, i32, i32, i32)> {
 
 /// One placement (and, with `array`, its lattice as a repetition).
 fn placement(child: usize, t: &Transform, array: Option<(i32, i32, [f64; 2], [f64; 2])>, out: &mut Vec<u8>) {
-    let mag = (t.a * t.a + t.b * t.b).sqrt();
-    let mirror = t.a * t.d - t.b * t.c < 0.0;
-    let mut angle = t.b.atan2(t.a).to_degrees();
-    if angle < 0.0 {
-        angle += 360.0;
-    }
+    // Canonical parts: the same bytes on every platform (Phase 7.4).
+    let (angle, mirror, mag) = t.strans_parts();
     let quarter = (angle / 90.0).round();
     let compact = (mag - 1.0).abs() < 1e-9 && (angle - quarter * 90.0).abs() < 1e-9;
     let rep = array.filter(|&(c, r, _, _)| c * r > 1);

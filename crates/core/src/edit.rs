@@ -211,19 +211,19 @@ impl EditOverlay {
     /// copy of a tombstoned base shape, then every added shape — the part of the
     /// composite the base store doesn't hold. (Consumers pair it with the base
     /// minus [`suppressed_in`](Self::suppressed_in) to get the whole cell.)
+    ///
+    /// Moved copies come in base-id order, not the map's (which differs from
+    /// one map to the next): the same edits always export the same file
+    /// (Phase 7.4 — the server's export must equal an in-core save).
     pub fn live_shapes_in(&self, cell: CellId) -> impl Iterator<Item = &Shape> + '_ {
-        let edited = self
-            .edits_cell(cell)
-            .then(|| {
-                self.edited
-                    .iter()
-                    .filter(move |(&(c, i), _)| c == cell && self.deleted.contains(&(c, i)))
-                    .map(|(_, s)| s)
-            })
-            .into_iter()
-            .flatten();
+        let mut edited: Vec<(BaseShapeId, &Shape)> = if self.edits_cell(cell) {
+            self.edited.iter().filter(|(&(c, i), _)| c == cell && self.deleted.contains(&(c, i))).map(|(&id, s)| (id, s)).collect()
+        } else {
+            Vec::new()
+        };
+        edited.sort_unstable_by_key(|&(id, _)| id);
         let added = self.added.iter().filter(move |a| a.cell == cell).map(|a| &a.shape);
-        edited.chain(added)
+        edited.into_iter().map(|(_, s)| s).chain(added)
     }
 
     /// The added shape with this id, if it exists.
