@@ -27,6 +27,38 @@ pub fn layer_color(layer: fluideda_core::Layer) -> [f32; 4] {
     palette::color_for(layer)
 }
 
+/// The colour a chunk's layers make from far away (Phase 7.3 SLICE C), packed
+/// straight RGBA8 — what a streamed chunk too dense to fetch is drawn as. Each
+/// visible layer goes over the previous in draw order (ascending layer) with
+/// its palette alpha scaled by its area coverage; a stack of src-over draws is
+/// itself one src-over, so the proxy drawn with this colour shows what the
+/// full geometry averages to. Channels are quantized to 5 bits so a view's
+/// proxies fall into few colour groups (draw calls). 0 = nothing visible.
+pub fn composite_rgba(look: &[(Layer, u8)], hidden: impl Fn(Layer) -> bool) -> u32 {
+    let mut layers: Vec<(Layer, u8)> = look.iter().copied().filter(|&(l, _)| !hidden(l)).collect();
+    layers.sort_by_key(|&(l, _)| l);
+    // Premultiplied accumulation over transparent black.
+    let (mut r, mut g, mut b, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    for (l, c) in layers {
+        let [lr, lg, lb, la] = palette::color_for(l);
+        let e = (la * c as f32 / 255.0).clamp(0.0, 1.0);
+        r = lr * e + r * (1.0 - e);
+        g = lg * e + g * (1.0 - e);
+        b = lb * e + b * (1.0 - e);
+        a = e + a * (1.0 - e);
+    }
+    if a <= 1.0 / 255.0 {
+        return 0;
+    }
+    let q = |v: f32| ((v.clamp(0.0, 1.0) * 255.0).round() as u32) & 0xF8;
+    let alpha = q(a).max(8);
+    (q(r / a) << 24) | (q(g / a) << 16) | (q(b / a) << 8) | alpha
+}
+
+fn unpack_rgba(v: u32) -> [f32; 4] {
+    [(v >> 24) as f32 / 255.0, ((v >> 16) & 0xff) as f32 / 255.0, ((v >> 8) & 0xff) as f32 / 255.0, (v & 0xff) as f32 / 255.0]
+}
+
 use bytemuck::{Pod, Zeroable};
 use fluideda_core::{Bboxf, CellId, ChunkId, LayerMesh, Layer, VisibleSet};
 use std::collections::{HashMap, HashSet};
@@ -126,8 +158,11 @@ pub struct HierRenderer {
     cell_plan: Vec<CellPlan>,
     /// Meshes to draw, in `(cell, layer, chunk)` order. See [`DrawItem`].
     draw_seq: Vec<DrawItem>,
-    proxy_first: u32,
-    proxy_count: u32,
+    /// This frame's proxy draws: `(packed colour, first instance, count)` —
+    /// colour 0 is the neutral proxy (Phase 7.3 SLICE C).
+    proxy_groups: Vec<(u32, u32, u32)>,
+    /// Bind groups for coloured proxies, made on first use.
+    proxy_binds: HashMap<u32, wgpu::BindGroup>,
     /// Instance-buffer slot of the overlay's identity transform (set in `prepare`).
     overlay_first: u32,
 }
@@ -241,8 +276,8 @@ impl HierRenderer {
             hidden: HashSet::new(),
             cell_plan: Vec::new(),
             draw_seq: Vec::new(),
-            proxy_first: 0,
-            proxy_count: 0,
+            proxy_groups: Vec::new(),
+            proxy_binds: HashMap::new(),
             overlay_first: 0,
         }
     }
@@ -269,7 +304,7 @@ impl HierRenderer {
     /// mesh, plus the proxy and overlay draws) — the per-frame command count
     /// that dominates WebGPU's CPU cost at fit view (Phase 5c measurement).
     pub fn draw_calls(&self) -> usize {
-        self.draw_seq.len() + (self.proxy_count > 0) as usize + (!self.overlay.is_empty()) as usize
+        self.draw_seq.len() + self.proxy_groups.len() + (!self.overlay.is_empty()) as usize
     }
 
     /// Total vertex+index bytes uploaded so far (grows with lazy tessellation).
@@ -367,14 +402,16 @@ impl HierRenderer {
         // at each placement until the real mesh arrives — progressive refinement.
         // On native / no-worker this is always empty: the app tessellates every
         // visible chunk inline before paint, so the loop below always finds it.
-        let mut pending_proxies: Vec<Bboxf> = Vec::new();
+        // Phase 7.3 SLICE C: a chunk that knows its look (a streamed design's)
+        // proxies in the colour its layers make.
+        let mut pending_proxies: Vec<(u32, Bboxf)> = Vec::new();
         for d in &visible.draws {
             let key = (d.cell, d.chunk);
             if !self.cells.contains_key(&key) {
                 // Not tessellated yet: proxy the chunk's world footprint at each
                 // placement (a loose AABB of the local bbox under the transform).
                 for t in &d.transforms {
-                    pending_proxies.push(t.apply_bbox(&d.bbox));
+                    pending_proxies.push((d.rgba, t.apply_bbox(&d.bbox)));
                 }
                 continue;
             }
@@ -393,16 +430,43 @@ impl HierRenderer {
         }
 
         // Proxies: the culler's LOD boxes (sub-pixel cells) plus this frame's
-        // not-yet-tessellated chunk boxes. Both draw as the same dim proxy quad.
-        self.proxy_first = raw.len() as u32;
-        self.proxy_count = (visible.proxies.len() + pending_proxies.len()) as u32;
-        for b in visible.proxies.iter().chain(pending_proxies.iter()) {
+        // not-yet-tessellated chunk boxes, grouped by colour: neutral first,
+        // then each layer colour in layer order (a fixed order, so blending is
+        // reproducible).
+        pending_proxies.sort_by_key(|(l, _)| *l);
+        self.proxy_groups.clear();
+        let push_box = |raw: &mut Vec<InstanceRaw>, b: &Bboxf| {
             let w = (b.max_x - b.min_x).max(0.0) as f32;
             let h = (b.max_y - b.min_y).max(0.0) as f32;
             raw.push(InstanceRaw {
                 row0: [w, 0.0, (b.min_x - ox) as f32, 0.0],
                 row1: [0.0, h, (b.min_y - oy) as f32, 0.0],
             });
+        };
+        let first = raw.len() as u32;
+        for b in &visible.proxies {
+            push_box(&mut raw, b);
+        }
+        let mut i = 0;
+        while i < pending_proxies.len() && pending_proxies[i].0 == 0 {
+            push_box(&mut raw, &pending_proxies[i].1);
+            i += 1;
+        }
+        if raw.len() as u32 > first {
+            self.proxy_groups.push((0, first, raw.len() as u32 - first));
+        }
+        while i < pending_proxies.len() {
+            let rgba = pending_proxies[i].0;
+            let first = raw.len() as u32;
+            while i < pending_proxies.len() && pending_proxies[i].0 == rgba {
+                push_box(&mut raw, &pending_proxies[i].1);
+                i += 1;
+            }
+            if !self.proxy_binds.contains_key(&rgba) {
+                let bind = color_bind(device, &self.layer_bgl, unpack_rgba(rgba), "proxy-look");
+                self.proxy_binds.insert(rgba, bind);
+            }
+            self.proxy_groups.push((rgba, first, raw.len() as u32 - first));
         }
 
         // Phase 3: one identity, origin-rebased instance for the overlay. Its
@@ -455,14 +519,14 @@ impl HierRenderer {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.globals_bind, &[]);
 
-        // LOD proxies first (behind real geometry).
-        if self.proxy_count > 0 {
-            let off = self.proxy_first as u64 * INST_SIZE;
-            pass.set_vertex_buffer(1, self.instbuf.slice(off..));
-            pass.set_bind_group(1, &self.proxy.color_bind, &[]);
+        // LOD proxies first (behind real geometry), one draw per colour.
+        for &(rgba, first, count) in &self.proxy_groups {
+            let bind = self.proxy_binds.get(&rgba).unwrap_or(&self.proxy.color_bind);
+            pass.set_vertex_buffer(1, self.instbuf.slice(first as u64 * INST_SIZE..));
+            pass.set_bind_group(1, bind, &[]);
             pass.set_vertex_buffer(0, self.proxy.vbuf.slice(..));
             pass.set_index_buffer(self.proxy.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.proxy.index_count, 0, 0..self.proxy_count);
+            pass.draw_indexed(0..self.proxy.index_count, 0, 0..count);
         }
 
         // Instanced cell geometry, in (cell, layer, chunk) order. Slicing the
@@ -503,6 +567,23 @@ impl HierRenderer {
     }
 }
 
+/// A colour uniform + its bind group (per mesh, or per proxy layer).
+fn color_bind(device: &wgpu::Device, layer_bgl: &wgpu::BindGroupLayout, color: [f32; 4], label: &str) -> wgpu::BindGroup {
+    let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::bytes_of(&LayerUniform { color }),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: layer_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: ubuf.as_entire_binding(),
+        }],
+    })
+}
+
 fn build_mesh(
     device: &wgpu::Device,
     layer_bgl: &wgpu::BindGroupLayout,
@@ -510,20 +591,7 @@ fn build_mesh(
     vertices: &[fluideda_core::Vertex],
     indices: &[u32],
 ) -> GpuMesh {
-    let color = palette::color_for(layer);
-    let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("layer-color"),
-        contents: bytemuck::bytes_of(&LayerUniform { color }),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let color_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("layer-bind"),
-        layout: layer_bgl,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: ubuf.as_entire_binding(),
-        }],
-    });
+    let color_bind = color_bind(device, layer_bgl, palette::color_for(layer), "layer-bind");
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("verts"),
         contents: bytemuck::cast_slice(vertices),
@@ -595,5 +663,26 @@ fn uniform_entry(binding: u32, vis: wgpu::ShaderStages) -> wgpu::BindGroupLayout
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_single_layer_is_that_layer_and_nothing_is_zero() {
+        let l = Layer::new(68, 20);
+        let [r, g, b, a] = palette::color_for(l);
+        let v = unpack_rgba(composite_rgba(&[(l, 255)], |_| false));
+        for (got, want) in v.iter().zip([r, g, b, a]) {
+            assert!((got - want).abs() < 10.0 / 255.0, "{v:?} vs {:?}", [r, g, b, a]);
+        }
+        assert_eq!(composite_rgba(&[], |_| false), 0);
+        assert_eq!(composite_rgba(&[(l, 255)], |x| x == l), 0, "a hidden layer adds nothing");
+        // Sparse coverage is translucent: alpha well below the layer's own.
+        let sparse = unpack_rgba(composite_rgba(&[(l, 13)], |_| false));
+        assert!(sparse[3] < a / 4.0);
     }
 }

@@ -672,6 +672,7 @@ impl FluidApp {
         self.design_source = design.source.clone();
         self.pending_hash = design.pending_hash;
         self.stream = design.stream.map(|info| Stream::new(info, &self.db));
+        self.refresh_proxy_colours();
         // `?instwalk`: collapse placement chunks (the pre-7.3 walk) — the
         // same-build A/B knob for the cull.
         if webio::query_flag("instwalk") {
@@ -1661,6 +1662,22 @@ impl FluidApp {
         }
         self.gpu_bytes = renderer.uploaded_bytes();
         self.draw_calls = renderer.draw_calls();
+    }
+
+    /// Colour every shape chunk's proxy by its look (Phase 7.3 SLICE C): what
+    /// its visible layers make from far away. Only a streamed design's chunks
+    /// carry looks; `?greyproxies` keeps them neutral (the same-build A/B).
+    fn refresh_proxy_colours(&mut self) {
+        let grey = webio::query_flag("greyproxies");
+        let hidden: HashSet<fluideda_core::Layer> =
+            self.layers.iter().zip(&self.layer_visible).filter(|(_, &v)| !v).map(|(&l, _)| l).collect();
+        for cell in &mut self.db.cells {
+            cell.chunk_rgba = if grey {
+                Vec::new()
+            } else {
+                cell.chunk_looks.iter().map(|look| fluideda_render::composite_rgba(look, |l| hidden.contains(&l))).collect()
+            };
+        }
     }
 
     /// Placement residency, once per frame, before the shape chunks (Phase
@@ -3011,6 +3028,7 @@ impl FluidApp {
 
             ui.separator();
             ui.label(format!("Layers ({})", self.layers.len()));
+            let mut recolour = false;
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                 for i in 0..self.layers.len() {
                     let layer = self.layers[i];
@@ -3029,10 +3047,16 @@ impl FluidApp {
                                     r.set_layer_visible(layer, self.layer_visible[i]);
                                 }
                             }
+                            // A hidden layer drops out of streamed proxies' colours too.
+                            recolour = true;
                         }
                     });
                 }
             });
+
+            if recolour {
+                self.refresh_proxy_colours();
+            }
 
             ui.separator();
             ui.label("Editing");

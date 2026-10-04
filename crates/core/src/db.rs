@@ -95,6 +95,15 @@ pub struct Cell {
     /// (Phase 7.3 SLICE B): `instances` stays empty and the chunks that have
     /// arrived live here. `None` for every in-core cell.
     pub remote: Option<RemotePlacements>,
+    /// What each shape chunk looks like from far away (Phase 7.3 SLICE C):
+    /// its layers' area coverage (/255), densest first. A streamed chunk too
+    /// dense to fetch is drawn as the colour they make. Empty unless a design
+    /// pack computed it (`pack::annotate_chunk_looks`).
+    pub chunk_looks: Vec<Vec<(Layer, u8)>>,
+    /// That colour per shape chunk, packed straight RGBA8 (0 = draw the
+    /// neutral proxy). Set by the renderer's owner from `chunk_looks`, the
+    /// palette and the visible layers; the cull hands it to the renderer.
+    pub chunk_rgba: Vec<u32>,
     index: OnceCell<ShapeIndex>,
 }
 
@@ -114,6 +123,8 @@ impl Cell {
             chunks: Vec::new(),
             inst_chunks: Vec::new(),
             remote: None,
+            chunk_looks: Vec::new(),
+            chunk_rgba: Vec::new(),
             index: OnceCell::new(),
         }
     }
@@ -234,7 +245,7 @@ impl Cell {
         chunks: Vec<Chunk>,
         inst_chunks: Vec<Chunk>,
     ) -> Self {
-        Self { name, shapes, instances, chunks, inst_chunks, remote: None, index: OnceCell::new() }
+        Self { name, shapes, instances, chunks, inst_chunks, remote: None, chunk_looks: Vec::new(), chunk_rgba: Vec::new(), index: OnceCell::new() }
     }
 }
 

@@ -1,9 +1,9 @@
 # Phase 7: findings
 
 **Status: in progress on `phase7`.** The owner moved 7.3 (stream the
-hierarchy) to the front. It runs as three slices: **A** placement chunks in
-the core (done), **B** streaming the hierarchy, pack v3 (done), **C**
-coloured proxies.
+hierarchy) to the front. **7.3 is done** in three slices: **A** placement
+chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
+proxies (pack v4).
 
 ## 7.3 SLICE A — placement chunks
 
@@ -129,3 +129,53 @@ stream at all.
   successful in-core load when the worker died with a bare wasm trap
   (`unreachable`). It now treats traps as failures and requires the big
   file's metrics.
+
+## 7.3 SLICE C — coloured proxies (pack v4)
+
+**Problem.** A streamed chunk too dense to fetch draws as a neutral slate
+box. Where the real geometry is sparse that box is far darker than what a
+full load shows. flat_11M at fit: 71% of pixels visibly different from
+in-core.
+
+**What did not work.** The plan said "the dominant layer's colour". Measured,
+it made flat_11M *worse*: mean absolute difference 22.6 → 30.2. A full load of
+five interleaved layers averages to a blend, and any single layer's full
+colour is further from that blend than grey is.
+
+**Design.**
+- The pack records each shape chunk's *look*: its layers' polygon area over
+  the chunk's bbox area (≤ 8 layers, /255). The cell table carries it
+  (format v4, `PACK_VERSION` 4).
+- The app turns a look into one colour with the renderer's palette
+  (`composite_rgba`): each visible layer goes over the previous in draw
+  order, its palette alpha scaled by its coverage. A stack of src-over draws
+  is itself one src-over, so the proxy shows what the geometry averages to.
+  Channels are quantized to 5 bits, so a view's proxies fall into few colour
+  groups (draw calls). Colours are recomputed when a layer is shown or
+  hidden.
+- The renderer draws pending proxies grouped by colour (neutral first, then
+  in colour order, so blending is reproducible), with a bind group per
+  colour made on first use.
+- `?greyproxies` is the same-build A/B switch.
+
+**Measured** (`proxy_fidelity.mjs`; pixels "visibly off" = any channel more
+than 24/255 from in-core; WebGPU, headless):
+
+| view | grey proxies | coloured proxies |
+|---|--:|--:|
+| flat_11M at fit (729 dense chunks) | 70.8% off · mean diff 22.6 | **17.9% off · mean diff 13.0** |
+| caravel at fit (192 dense shape chunks) | 0.0% · 1.0 | 0.0% · **0.5** |
+| both at mid | 0.0% · 0.0 | 0.0% · 0.0 |
+
+The plan's target was to halve the visibly-off share at fit. flat_11M
+drops to a quarter; caravel was already indistinguishable, and its mean
+difference halves. A full load of flat_11M at fit is per-pixel noise
+(sub-pixel squares either hit a pixel or miss), so no uniform box can reach
+0 there. Mean difference is the better fidelity measure for such views.
+
+Correctness: coloured or grey, proxies exist only where chunks are not
+drawn, so the eight pixel-identity views are unchanged (0 pixels), and the
+golden images too. Core tests cover coverage (a lattice reads ≈5% per
+layer) and the look's round trip through the cell table; render tests cover
+the composite (a full single layer is that layer, a hidden layer adds
+nothing, sparse coverage is translucent).

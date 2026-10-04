@@ -35,6 +35,11 @@ front.
   still 0 pixels off in-core at eight views. A generated **50 M-placement**
   design (1.3 GB GDS) opens streamed in 92 ms with a 9 MB heap; in-core it
   fails.
+* **7.3 SLICE C — coloured proxies (pack v4).** A streamed chunk too dense to
+  fetch draws in the colour its layers average to (coverage-weighted
+  composite through the palette), not neutral slate. flat_11M at fit: pixels
+  visibly off a full load 71% → 18%, mean difference 22.6 → 13.0. The plan's
+  "dominant layer" was measured worse (30.2) and dropped. **7.3 is done.**
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -224,7 +229,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
-| 7 — scale + collaboration | `phase7` | ◑ 7.3 SLICES A–B done | 7.3 first (owner's order). SLICE A: placement chunks — caravel's in-browser cull at mid 10.0 → 0.73 ms/frame, leaf 9.7 → 0.37 ms/frame, output identical. SLICE B: pack v3 streams the hierarchy — streamed caravel heap 180 → 16 MB; a 50 M-placement design that fails in-core opens streamed (9 MB). Next: coloured proxies |
+| 7 — scale + collaboration | `phase7` | ◑ 7.3 done (SLICES A–C) | 7.3 first (owner's order). SLICE A: placement chunks — caravel's in-browser cull at mid 10.0 → 0.73 ms/frame, leaf 9.7 → 0.37 ms/frame, output identical. SLICE B: pack v3 streams the hierarchy — streamed caravel heap 180 → 16 MB; a 50 M-placement design that fails in-core opens streamed (9 MB). SLICE C: coloured proxies — flat_11M fit 71% → 18% of pixels off in-core. Next: 7.1, 7.2, 7.4, 7.5, 7.6 |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -439,8 +444,8 @@ still byte-identical).
     and a 50 M-placement design opens in 9 MB;
   - streamed designs are **view-only** (no pick/edit/DRC/export/rooms);
     editing out of core needs chunk-level residency in the `ShapeStore`;
-  - dense chunks draw as neutral proxies (a per-chunk layer summary could
-    color them).
+  - ~~dense chunks draw as neutral proxies~~ **RESOLVED** (Phase 7.3
+    SLICE C): they draw in the colour their layers average to.
 - ~~Phase 3: editing is TOP-cell-only~~ **RESOLVED** (`phase3-real-editing` SLICE 2):
   hit-test walks the instance tree under the transform stack (chunk-scan, no R-tree
   build — landmine *eliminated*, caravel first-click ~2.7 ms). Editing a shape edits

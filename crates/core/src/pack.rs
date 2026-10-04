@@ -44,8 +44,44 @@ use std::io::{self, Write};
 /// Bumped whenever the pack layout (or anything baked into it — chunking,
 /// shape numbering) changes; servers key cached packs by it. 2: the skeleton
 /// carries placement chunk tables (Phase 7.3). 3: big placement lists are
-/// remote — a cell table plus placement records (Phase 7.3 SLICE B).
-pub const PACK_VERSION: u32 = 3;
+/// remote — a cell table plus placement records (Phase 7.3 SLICE B). 4: the
+/// cell table carries each shape chunk's look — its layers' coverage
+/// (SLICE C).
+pub const PACK_VERSION: u32 = 4;
+
+/// At most this many layers describe a chunk's look (the densest ones).
+pub const LOOK_LAYERS: usize = 8;
+
+/// What shapes `chunk.start..chunk.end` look like from far away: each layer's
+/// polygon area (shoelace) over the chunk's bbox area, clamped to 1 and
+/// quantized to /255, densest first, at most [`LOOK_LAYERS`]. Overlaps count
+/// twice — it is an appearance estimate, not a measurement.
+pub fn chunk_look(store: &crate::store::ShapeStore, chunk: &crate::chunk::Chunk) -> Vec<(crate::types::Layer, u8)> {
+    let (w, h) = chunk.bbox.size();
+    let bbox_area = (w * h).max(1.0);
+    let mut area: Vec<(crate::types::Layer, f64)> = Vec::new();
+    for i in chunk.start as usize..chunk.end as usize {
+        let a = crate::boolean::signed_area2(store.points(i)).unsigned_abs() as f64 / 2.0;
+        let l = store.layer(i);
+        match area.iter_mut().find(|(k, _)| *k == l) {
+            Some((_, v)) => *v += a,
+            None => area.push((l, a)),
+        }
+    }
+    area.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    area.into_iter()
+        .take(LOOK_LAYERS)
+        .map(|(l, a)| (l, ((a / bbox_area).min(1.0) * 255.0).round() as u8))
+        .filter(|&(_, c)| c > 0)
+        .collect()
+}
+
+/// Fill every cell's `chunk_looks` (what a pack's cell table carries).
+pub fn annotate_chunk_looks(db: &mut CellDb) {
+    for cell in &mut db.cells {
+        cell.chunk_looks = cell.chunks.iter().map(|ch| chunk_look(&cell.shapes, ch)).collect();
+    }
+}
 
 /// A cell with at most this many placements keeps them in the cell table;
 /// above it, they are fetched by placement chunk. Most cells have a handful
@@ -275,6 +311,38 @@ mod tests {
         let far = crate::cull(&streamed, &fit, 0.0005, 4.0);
         assert!(far.stats.dense_inst_chunks > 0 && far.placements_wanted.is_empty());
         assert!(far.stats.nodes_visited < crate::cull(&db, &fit, 0.0005, 4.0).stats.nodes_visited / 10);
+    }
+
+    #[test]
+    fn chunk_looks_measure_coverage_and_travel_in_the_cell_table() {
+        // flat_N-style lattice: 100 nm squares at a 200 nm pitch, layers 0..4
+        // in turn — each layer covers ~5% of the chunk, the five 25%.
+        use crate::db::CellDbBuilder;
+        use crate::types::{Layer, Point};
+        let mut b = CellDbBuilder::new();
+        let top = b.intern("TOP");
+        for i in 0..10_000i32 {
+            let (x, y) = ((i % 100) * 200, (i / 100) * 200);
+            b.cell_mut(top).shapes.push(
+                Layer::new((i % 5) as u16, 0),
+                [Point::new(x, y), Point::new(x + 100, y), Point::new(x + 100, y + 100), Point::new(x, y + 100)],
+            );
+        }
+        let mut db = b.build().unwrap();
+        annotate_chunk_looks(&mut db);
+        let look = &db.cell(top).chunk_looks[0];
+        assert_eq!(look.len(), 5);
+        for &(_, c) in look {
+            assert!((12..=14).contains(&c), "≈5% of 255, got {c}");
+        }
+        let (back, _) = crate::ProgressiveLoad::new(&crate::serialize::cell_table_meta(&db, INLINE_PLACEMENTS)).unwrap();
+        for (a, b) in db.cells.iter().zip(&back.cells) {
+            assert_eq!(a.chunk_looks, b.chunk_looks);
+        }
+        // An unannotated design carries none.
+        let plain = crate::load_layout_db(include_bytes!("../../../assets/hier.gds")).unwrap();
+        let (back, _) = crate::ProgressiveLoad::new(&crate::skeleton_meta(&plain)).unwrap();
+        assert!(back.cells.iter().all(|c| c.chunk_looks.is_empty()));
     }
 
     #[test]

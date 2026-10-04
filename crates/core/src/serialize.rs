@@ -40,7 +40,9 @@ const MAGIC: u32 = u32::from_le_bytes(*b"FEDB");
 /// 2: each cell also carries its placement chunk table (Phase 7.3).
 /// 3: a cell's instances are inline, or *remote* — only counted here, and
 /// fetched by placement chunk (a streamed design, Phase 7.3 SLICE B).
-const VERSION: u32 = 3;
+/// 4: each cell's shape chunks' looks — layer coverage — when computed
+/// (SLICE C).
+const VERSION: u32 = 4;
 
 /// A serialized `CellDb`: three Pod columns (transferred as typed arrays) plus a
 /// metadata blob. Field order mirrors what the worker hands to `postMessage`.
@@ -194,6 +196,16 @@ fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell), inline: impl Fn(&Cell
                 meta.u32(ch.start);
                 meta.u32(ch.end);
                 meta.bbox(&ch.bbox);
+            }
+        }
+        // Shape chunks' looks (Phase 7.3 SLICE C): none, or one per chunk —
+        // a count, then (packed layer, coverage /255) pairs.
+        meta.u32(cell.chunk_looks.len() as u32);
+        for look in &cell.chunk_looks {
+            meta.u8(look.len() as u8);
+            for &(l, c) in look {
+                meta.u32(pack_layer(l));
+                meta.u8(c);
             }
         }
     }
@@ -367,7 +379,22 @@ impl SkeletonParse {
             }
             let chunks = read_chunks(&mut r, n_shapes)?;
             let inst_chunks = read_chunks(&mut r, n_inst)?;
+            let n_looks = r.u32()? as usize;
+            if n_looks != 0 && n_looks != chunks.len() {
+                bail!("CellDb blob: {n_looks} chunk looks for {} chunks", chunks.len());
+            }
+            let mut chunk_looks = Vec::with_capacity(n_looks);
+            for _ in 0..n_looks {
+                let k = r.u8()? as usize;
+                let mut look = Vec::with_capacity(k);
+                for _ in 0..k {
+                    let v = r.u32()?;
+                    look.push((Layer::new((v & 0xffff) as u16, (v >> 16) as u16), r.u8()?));
+                }
+                chunk_looks.push(look);
+            }
             let mut cell = Cell::from_parts(name, ShapeStore::new(), instances, chunks, inst_chunks);
+            cell.chunk_looks = chunk_looks;
             if remote {
                 cell.make_remote();
             }

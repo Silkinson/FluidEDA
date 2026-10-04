@@ -88,9 +88,12 @@ pub fn ensure(store: &Store, design: &str) -> io::Result<Option<Manifest>> {
 fn build(store: &Store, design: &str) -> io::Result<Manifest> {
     let t0 = Instant::now();
     let bytes = store.read_blob(design)?;
-    let db = fluideda_core::load_layout_db(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut db = fluideda_core::load_layout_db(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     drop(bytes);
     let parse_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // Each shape chunk's look (its layers' coverage): what a chunk too dense
+    // to fetch is drawn as (v4).
+    pack::annotate_chunk_looks(&mut db);
 
     let skeleton = fluideda_core::serialize::cell_table_meta(&db, pack::INLINE_PLACEMENTS);
     let skeleton = BlobRef { bytes: skeleton.len() as u64, hash: store.put_blob(&skeleton)? };

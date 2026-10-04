@@ -31,10 +31,10 @@ claim a same-session A/B; nothing pushed without the owner.
 | 7.6 | Fit-view GPU gap | caravel fit is 14% slower on WebGPU (Dawn) than WebGL (ANGLE) | S–M | (7.3's LOD) |
 
 **Order (revised 2026-10-03): the owner moved 7.3 to the front.** It has no
-dependencies. It runs as three slices: **A** placement chunks in the core
-(done — see `phase7-findings.md`), **B** streaming the hierarchy (pack v3),
-**C** coloured proxies. The rest follow in the original order: 7.1, 7.2,
-7.4 (which needs 7.3), then 7.5 and 7.6.
+dependencies. **7.3 is done** in three slices — placement chunks, streaming
+the hierarchy (pack v3), coloured proxies (pack v4); see
+`phase7-findings.md`. The rest follow in the original order: 7.1, 7.2, 7.4
+(which needs 7.3), then 7.5 and 7.6.
 
 The original reasoning for the rest still holds: 7.1 is small and makes
 everything after it cheaper to test; 7.2 gates using the server beyond one
@@ -165,9 +165,11 @@ the same wall in-core geometry hit, one level up.
 - Instance chunks join the same LRU residency budget.
 - One code path: in-core designs are "fully resident" (every instance chunk
   loaded), so cull, pick and export are unchanged for them.
-- **Colored proxies**: each shape chunk's dominant layer (by area) goes in
-  the pack; a dense chunk's proxy draws in that layer's color instead of
+- **Colored proxies**: each shape chunk's layer coverage goes in the pack; a
+  dense chunk's proxy draws in the colour its layers average to instead of
   neutral grey — the original plan's "density raster" LOD, cheaply.
+  (Done. The first idea, the dominant layer's colour, measured worse than
+  grey and was dropped.)
 - `PACK_VERSION` 2; servers rebuild packs on the bump.
 
 **Acceptance.**

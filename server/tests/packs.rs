@@ -36,7 +36,8 @@ async fn a_stored_design_becomes_a_streamable_pack() {
     let (s, body) = get(&hub, &format!("/packs/{design}"), None).await;
     assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let m: Manifest = serde_json::from_slice(&body).unwrap();
-    let db = fluideda_core::load_layout_db(FIXTURE).unwrap();
+    let mut db = fluideda_core::load_layout_db(FIXTURE).unwrap();
+    fluideda_core::pack::annotate_chunk_looks(&mut db);
     assert_eq!((m.design.as_str(), m.cells, m.ids), (design.as_str(), db.cells.len(), fluideda_core::SHAPE_ID_SCHEME));
     assert_eq!(m.chunks as u32, *fluideda_core::pack::chunk_base(&db).last().unwrap());
 

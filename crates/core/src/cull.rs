@@ -39,6 +39,10 @@ pub struct CellDraw {
     /// (a worker job is in flight), the renderer draws this box — transformed to
     /// world at each placement — as a coarse proxy until the real mesh arrives.
     pub bbox: crate::types::Bbox,
+    /// The colour this chunk's proxy draws in, packed straight RGBA8 — what
+    /// its layers make from far away (a streamed design, Phase 7.3 SLICE C);
+    /// 0 = the neutral proxy.
+    pub rgba: u32,
 }
 
 /// Result of a viewport query.
@@ -172,8 +176,10 @@ fn cull_inner(
     for ((cell, chunk), transforms) in grouped {
         ctx.set.stats.instances_emitted += transforms.len() as u64;
         let dirty = dirty_cells.contains(&cell);
-        let bbox = db.cell(cell).chunks[chunk as usize].bbox;
-        ctx.set.draws.push(CellDraw { cell, chunk, transforms, dirty, bbox });
+        let c = db.cell(cell);
+        let bbox = c.chunks[chunk as usize].bbox;
+        let rgba = c.chunk_rgba.get(chunk as usize).copied().unwrap_or(0);
+        ctx.set.draws.push(CellDraw { cell, chunk, transforms, dirty, bbox, rgba });
     }
     ctx.set.stats.proxy_count = ctx.set.proxies.len();
 
