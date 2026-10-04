@@ -50,6 +50,12 @@ pub struct Manifest {
     pub world_bbox: [f64; 4],
     /// Every layer, packed `layer | datatype << 16`.
     pub layers: Vec<u32>,
+    /// Per cell: how many times it is placed in the whole design, and how
+    /// many shapes its subtree flattens to (v5). A streamed client decides
+    /// "edit this placement only" with them: it cannot count placements it
+    /// has not fetched.
+    pub placement_counts: Vec<u64>,
+    pub subtree_shapes: Vec<u64>,
     pub build_ms: f64,
 }
 
@@ -123,6 +129,8 @@ fn build(store: &Store, design: &str) -> io::Result<Manifest> {
         flat_shapes: db.flat_shape_count(),
         world_bbox: [wb.min_x, wb.min_y, wb.max_x, wb.max_y],
         layers: db.all_layers().iter().map(|l| l.layer as u32 | (l.datatype as u32) << 16).collect(),
+        placement_counts: fluideda_core::placement_counts(&db),
+        subtree_shapes: fluideda_core::subtree_shapes(&db),
         build_ms: t0.elapsed().as_secs_f64() * 1e3,
     };
     log::info!(

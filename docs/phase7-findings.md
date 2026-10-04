@@ -4,7 +4,7 @@
 hierarchy) to the front. **7.3 is done** in three slices: **A** placement
 chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
 proxies (pack v4). **7.4** (edit streamed designs) is under way: **A**
-picking and editing.
+picking and editing, **B** rooms and "edit this placement only".
 
 ## 7.3 SLICE A — placement chunks
 
@@ -257,3 +257,40 @@ geometry, so streamed designs were view-only.
 The heap is a high-water mark: wasm memory never shrinks, and a pick
 waiting for chunks holds everything fetched for it.
 
+## 7.4 SLICE B — rooms and "edit this placement only"
+
+**Rooms.** A streamed design now joins rooms like an in-core one. A peer's
+edit fetches the chunks it touches (SLICE A), so a streamed peer converges
+like any other.
+- `?stream=<sha256>&room=R` joins with the streamed design.
+- `?room=R&streamed` opens the room's own design out of core.
+
+**Edit this placement only** needed two things a streamed client lacks:
+- **Which hop to flatten.** It is the deepest hop whose parent is placed
+  exactly once in the whole design, and counting placements needs all of
+  them. Pack v5: the server's manifest carries every cell's placement count
+  and its flattened subtree size (`subtree_shapes`, which equals the
+  loader's flat count).
+- **The subtree's geometry.** `flatten_needs` lists the placement's own
+  chunk first (its child is unknown until then), then the subtree's shape
+  and placement chunks. The flatten runs once they are all in memory. A
+  subtree over the 50 k-shape limit is refused at once, from the manifest,
+  before anything is fetched. Eviction pauses while a flatten waits, as for
+  a pick.
+
+**Correctness.**
+- Core: a streamed flatten of placements in a remote 20 k-placement list,
+  once its needs are fetched, copies exactly what in-core copies. Subtree
+  sizes equal the design's flat count on two fixtures. The server pack test
+  checks the manifest's counts.
+- `edit_sync_test` gained **20b**: after the whole scenario (moves, deletes,
+  adds, vertex edits, booleans, a shape drawn into a master, flatten and its
+  undo), A and B draw the same pixels.
+  - With `STREAMED=1`, B and the late joiner C open the fixture out of core
+    while A stays in-core. All **33 checks pass**, and A and B differ in
+    **0 of 619,200 pixels**.
+  - In-core, all 32 pass.
+- `stream_edit_test` on caravel: "edit this placement only" on a standard
+  cell inside caravel_core, whose placements are remote. Streamed copies the
+  same **53 shapes** into caravel_core as in-core, in **31 ms** including
+  the fetches, and the views are identical.

@@ -52,8 +52,13 @@ front.
   - Edits made at one view vanished after a zoom (a pre-existing overlay
     bug, fixed in-core too).
 
-  Next: rooms and "edit this placement only" (SLICE B), then server-side
-  export (SLICE C).
+* **7.4 SLICE B — rooms and "edit this placement only".** Streamed designs
+  join rooms. Pack v5 carries each cell's placement count and subtree size,
+  so a streamed client can choose the hop to flatten and fetch the subtree
+  first. The two-peer test with B (and the late joiner) streamed passes all
+  33 checks, and A and B end pixel-identical (0 of 619,200). On caravel, a
+  streamed flatten inside caravel_core copies the same 53 shapes as in-core
+  (31 ms with fetches). Next: server-side export (SLICE C).
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).

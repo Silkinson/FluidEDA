@@ -1093,6 +1093,14 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
             let placement_offsets =
                 fluideda_core::pack::parse_index(&bytes_of(pix).await?).map_err(|e| e.to_string())?;
             let bbox = js_sys::Array::from(&get_val(&m, "world_bbox"));
+            // Per-cell counts (pack v5); absent from an older manifest.
+            let counts = |k: &str| -> Vec<u64> {
+                let v = get_val(&m, k);
+                if !v.is_object() {
+                    return Vec::new();
+                }
+                js_sys::Array::from(&v).iter().map(|x| x.as_f64().unwrap_or(0.0) as u64).collect()
+            };
             let layers = js_sys::Array::from(&get_val(&m, "layers"));
             let hash_slot: crate::design::HashSlot = Rc::new(RefCell::new(Some((hash.clone(), 0.0))));
             let msg = crate::design::WorkerMsg {
@@ -1117,6 +1125,8 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
                     geometry_bytes: geo_bytes as u64,
                     skeleton_bytes: sk_bytes as u64,
                     fetch_ms: js_sys::Date::now() - t0,
+                    placement_counts: counts("placement_counts"),
+                    subtree_shapes: counts("subtree_shapes"),
                 }),
             };
             crate::design::Reconstruction::new(msg).map_err(|e| format!("pack skeleton: {e}"))

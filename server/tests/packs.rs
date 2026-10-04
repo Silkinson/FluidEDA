@@ -40,6 +40,10 @@ async fn a_stored_design_becomes_a_streamable_pack() {
     fluideda_core::pack::annotate_chunk_looks(&mut db);
     assert_eq!((m.design.as_str(), m.cells, m.ids), (design.as_str(), db.cells.len(), fluideda_core::SHAPE_ID_SCHEME));
     assert_eq!(m.chunks as u32, *fluideda_core::pack::chunk_base(&db).last().unwrap());
+    // What "edit this placement only" decides with on a streamed client (v5).
+    assert_eq!(m.placement_counts, fluideda_core::placement_counts(&db));
+    assert_eq!(m.subtree_shapes, fluideda_core::subtree_shapes(&db));
+    assert_eq!(m.placement_counts[db.top], 1);
 
     // The skeleton is the design's cell table: it installs as-is.
     let (_, skeleton) = get(&hub, &format!("/blobs/{}", m.skeleton.hash), None).await;

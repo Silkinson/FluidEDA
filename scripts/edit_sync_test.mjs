@@ -12,18 +12,26 @@
 //       store and the whole room state, and matches A exactly;
 //   22. a peer with ANOTHER design is refused (and the room is untouched),
 //       then loads the room's design from the store and converges.
+// Phase 7.4 adds 20b: converged peers draw the same pixels. With STREAMED=1,
+// peer B and the late joiner C open the fixture OUT OF CORE (streamed from
+// the server's pack; every pick and edit fetches the chunks it needs) while A
+// stays in-core: the same scenario must converge, pixel-identical.
 //
 // Prereqs (started by the caller):
 //   cargo run -p fluideda-server &        # server on :9000 (store: ./store)
 //   trunk serve --release &               # app on :8080, proxies /ws, /blobs, /rooms
 //
 // Each run uses a fresh room (rooms persist on the server now).
-// Run: node scripts/edit_sync_test.mjs
+// Run: node scripts/edit_sync_test.mjs   (STREAMED=1 for a streamed B and C)
+import { createHash } from 'node:crypto';
 import { launch } from './launch.mjs';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8080';
 const ROOM = process.env.ROOM || `sync-${Date.now()}`;
 const URL = `${BASE}/?file=/assets/edit_fixture.gds&room=${ROOM}`; // TOP has direct editable shapes
+const STREAMED = !!process.env.STREAMED;
+const SERVER = process.env.SERVER || 'http://127.0.0.1:9000';
+const CLIP = { x: 420, y: 0, width: 860, height: 720 }; // the canvas right of the side panel
 // The edit-derived counts two converged peers must agree on.
 const SHAPE_STATE = ['edited', 'moves', 'deletes', 'adds', 'geom_edits', 'hidden', 'adds_nontop', 'top_shapes'];
 const same = (a, b) => SHAPE_STATE.every((k) => a[k] === b[k]);
@@ -39,6 +47,43 @@ async function state(page) {
     try { return JSON.parse(window.__fluideda_state || '{}'); } catch { return {}; }
   });
 }
+// Send a command and wait until the app has taken it (one per frame).
+async function cmdWait(page, c) {
+  await cmd(page, c);
+  await page.waitForFunction(() => !window.__fluideda_cmd, null, { timeout: 10000 });
+  await sleep(100);
+}
+// Until nothing is being fetched, tessellated or waited for, held for ~1 s.
+async function settle(page) {
+  let last = '', stable = 0;
+  for (let i = 0; i < 300; i++) {
+    const q = await page.evaluate(() => JSON.parse(window.__fluideda_perf || '{}'));
+    const busy = q.in_flight || q.p_in_flight || q.s_in_flight || q.pick_pending || q.wants || q.retess || q.flatten_pending;
+    const sig = `${q.uploaded}/${q.stream_fetched}/${q.s_fetched}`;
+    if (!busy && sig === last) { if (++stable >= 5) return q; } else stable = 0;
+    last = sig;
+    await sleep(200);
+  }
+  throw new Error('did not settle');
+}
+async function diff(page, a, b) {
+  return page.evaluate(async ([a, b]) => {
+    const load = async (b64) => {
+      const bmp = await createImageBitmap(await (await fetch(`data:image/png;base64,${b64}`)).blob());
+      const c = new OffscreenCanvas(bmp.width, bmp.height);
+      const g = c.getContext('2d');
+      g.drawImage(bmp, 0, 0);
+      return g.getImageData(0, 0, bmp.width, bmp.height).data;
+    };
+    const [x, y] = [await load(a), await load(b)];
+    let px = 0;
+    for (let i = 0; i < x.length; i += 4) {
+      if (x[i] !== y[i] || x[i + 1] !== y[i + 1] || x[i + 2] !== y[i + 2]) px++;
+    }
+    return { px, total: x.length / 4 };
+  }, [a.toString('base64'), b.toString('base64')]);
+}
+
 // Poll until predicate(state) is true, or throw.
 async function waitFor(page, pred, what, timeout = 15000) {
   const t0 = Date.now();
@@ -60,9 +105,20 @@ async function main() {
   const check = (cond, msg) => { console.log(`${cond ? 'PASS' : 'FAIL'}  ${msg}`); if (!cond) fails.push(msg); };
 
   try {
+    // STREAMED: B opens the fixture from the server's pack, so the server
+    // must hold it (content-addressed: its name is its SHA-256).
+    let urlB = URL;
+    if (STREAMED) {
+      const bytes = Buffer.from(await (await fetch(`${BASE}/assets/edit_fixture.gds`)).arrayBuffer());
+      const hash = createHash('sha256').update(bytes).digest('hex');
+      const r = await fetch(`${SERVER}/blobs/${hash}`, { method: 'PUT', body: bytes });
+      if (!r.ok) throw new Error(`storing the fixture: HTTP ${r.status}`);
+      urlB = `${BASE}/?stream=${hash}&room=${ROOM}`;
+      console.log(`      B streams the fixture (${hash.slice(0, 12)}) from the server's pack`);
+    }
     // The fixture must autoload (TOP shapes available) in both pages.
-    for (const [p, name] of [[A, 'A'], [B, 'B']]) {
-      await p.goto(URL);
+    for (const [p, name, url] of [[A, 'A', URL], [B, 'B', urlB]]) {
+      await p.goto(url);
       await waitFor(p, (s) => s.top_shapes >= 5, `${name}: fixture loaded`);
     }
 
@@ -159,6 +215,8 @@ async function main() {
     // 11. CONCURRENT vertex edits of the SAME shape (TOP 4): last-writer-wins —
     //     both sides must settle on identical state (one record; counts equal).
     await cmd(A, 'select 4'); await cmd(B, 'select 4'); await sleep(200);
+    // (A streamed B fetches the shape's chunk on selection.)
+    await waitFor(B, (s) => s.selected === 4 && s.sel_points > 0, "B has shape 4's geometry");
     await cmd(A, 'vertex 1 -500 0');
     await cmd(B, 'vertex 2 0 -500');
     await sleep(1200); // let LWW settle both ways
@@ -258,6 +316,23 @@ async function main() {
     const a20 = await waitFor(A, (s) => s.hidden === 0 && s.adds === s0.adds, "A sees B's undo of the flatten");
     check(a20.hidden === 0 && a20.adds === s0.adds, 'one undo restores the flattened placement everywhere');
 
+    // 20b. Converged peers draw the same pixels (Phase 7.4: B may be streamed).
+    //      Selections cleared; the view keeps clear of the origin, where each
+    //      page draws the other's cursor.
+    await waitFor(B, (s) => same(s, a20), 'B matches A');
+    for (const p of [A, B]) {
+      await cmdWait(p, 'pick -90000 -90000');
+      await cmdWait(p, 'view 4000 3000 6000');
+    }
+    await settle(A);
+    const qb = await settle(B);
+    await sleep(300);
+    const [pa, pb] = [await A.screenshot({ clip: CLIP }), await B.screenshot({ clip: CLIP })];
+    const d20 = await diff(A, pa, pb);
+    check(d20.px === 0,
+      `A and B draw the same pixels (${d20.px} of ${d20.total} differ)` +
+      (STREAMED ? `; B streamed: ${qb.stream_fetched} chunks drawn, ${qb.s_fetched} fetched for picks and edits` : ''));
+
     // --- Phase 6: the server keeps the room ------------------------------------
 
     // 21. A LATE joiner: C opens only the room link. The design comes from the
@@ -276,11 +351,16 @@ async function main() {
     C.on('pageerror', (e) => clog.push(`[pageerror] ${e.message}`));
     C.on('crash', () => clog.push('[crash]'));
     process.on('exit', () => { if (fails.length) console.log('C console:\n' + clog.slice(-25).join('\n')); });
-    await C.goto(`${BASE}/?room=${ROOM}`);
+    // (STREAMED: C opens the room's design out of core too.)
+    await C.goto(`${BASE}/?room=${ROOM}${STREAMED ? '&streamed' : ''}`);
     const c21 = await waitFor(C, (s) => s.synced && same(s, aNow), 'C (late joiner) matches A', 30000);
     check(c21.design_hash === aNow.design_hash && c21.room_design === aNow.design_hash,
       `C loaded the room's design from /blobs (${c21.design_hash.slice(0, 12)})`);
     check(same(c21, aNow), `late joiner converges to A exactly ${JSON.stringify(pick(c21))}`);
+    if (STREAMED) {
+      const cp = await C.evaluate(() => JSON.parse(window.__fluideda_perf || '{}'));
+      check(cp.streaming === true, `C opened the room's design streamed (?room=…&streamed): ${cp.streaming}`);
+    }
 
     // ...and is a full peer: its edit reaches A.
     await cmd(C, 'select 1'); await sleep(150); await cmd(C, 'nudge');

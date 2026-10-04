@@ -46,8 +46,9 @@ use std::io::{self, Write};
 /// carries placement chunk tables (Phase 7.3). 3: big placement lists are
 /// remote — a cell table plus placement records (Phase 7.3 SLICE B). 4: the
 /// cell table carries each shape chunk's look — its layers' coverage
-/// (SLICE C).
-pub const PACK_VERSION: u32 = 4;
+/// (SLICE C). 5: the manifest carries each cell's placement count and
+/// flattened subtree size (Phase 7.4: "edit this placement only").
+pub const PACK_VERSION: u32 = 5;
 
 /// At most this many layers describe a chunk's look (the densest ones).
 pub const LOOK_LAYERS: usize = 8;
@@ -435,6 +436,47 @@ mod tests {
         // Only what the picks touched is resident: far from all of MESH.
         let resident = streamed.cell(mesh).remote_shapes.as_ref().unwrap().chunks.iter().filter(|c| c.is_some()).count();
         assert!(resident < db.cell(mesh).chunks.len());
+
+        // "Edit this placement only" on remote placements of CORE: once its
+        // needs are fetched, a streamed flatten copies exactly what in-core
+        // copies. Evict CORE's placements first, so the placement itself is
+        // the first need.
+        for c in streamed.cells[core].remote.as_mut().unwrap().chunks.iter_mut() {
+            *c = None;
+        }
+        let sizes = crate::subtree_shapes(&db);
+        assert_eq!((sizes[leaf], sizes[core]), (2, 40_000));
+        for ii in [0u32, 7_777, 19_999] {
+            let key = (core, ii, 0, 0);
+            let mut rounds = 0;
+            loop {
+                let needs = crate::flatten_needs(&streamed, key);
+                if needs.is_empty() {
+                    break;
+                }
+                rounds += 1;
+                assert!(rounds < 5, "flatten needs must converge");
+                for need in needs {
+                    match need {
+                        ChunkNeed::Shapes(c, ci) => {
+                            let k = (base[c] + ci) as usize;
+                            let store = decode_store(&geometry[offsets[k] as usize..offsets[k + 1] as usize]).unwrap();
+                            streamed.cells[c].remote_shapes.as_mut().unwrap().chunks[ci as usize] = Some(store);
+                        }
+                        ChunkNeed::Placements(c, ci) => {
+                            let k = (p_base[c] + ci) as usize;
+                            let rec = &placements[p_offsets[k] as usize..p_offsets[k + 1] as usize];
+                            let insts = crate::serialize::decode_instances(rec, db.cells.len()).unwrap();
+                            streamed.cells[c].remote.as_mut().unwrap().chunks[ci as usize] = Some(insts);
+                        }
+                    }
+                }
+            }
+            let want = crate::flatten_placement(&db, &none, key, crate::FLATTEN_LIMIT).unwrap();
+            let got = crate::flatten_placement(&streamed, &none, key, crate::FLATTEN_LIMIT).unwrap();
+            assert_eq!(got, want, "flatten of {key:?}");
+            assert_eq!(got.len(), 2);
+        }
     }
 
     #[test]

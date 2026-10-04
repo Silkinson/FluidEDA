@@ -68,6 +68,37 @@ pub fn placement_counts(db: &CellDb) -> Vec<u64> {
     counts
 }
 
+/// How many shapes each cell's subtree holds with the hierarchy flattened —
+/// its own shapes plus every placement's subtree, saturating. A streamed
+/// client checks a placement against [`FLATTEN_LIMIT`] with it before
+/// fetching the subtree (Phase 7.4; the server computes it with the pack).
+pub fn subtree_shapes(db: &CellDb) -> Vec<u64> {
+    let n = db.cells.len();
+    let mut memo: Vec<Option<u64>> = vec![None; n];
+    for root in 0..n {
+        let mut stack = vec![(root, false)];
+        while let Some((id, expanded)) = stack.pop() {
+            if memo[id].is_some() {
+                continue;
+            }
+            let cell = db.cell(id);
+            if expanded {
+                let mut total = cell.shape_count() as u64;
+                for inst in &cell.instances {
+                    // (A cycle — not valid GDS — reads as an empty child.)
+                    let child = memo[inst.child].unwrap_or(0);
+                    total = total.saturating_add(child.saturating_mul(inst.count()));
+                }
+                memo[id] = Some(total);
+                continue;
+            }
+            stack.push((id, true));
+            stack.extend(cell.instances.iter().filter(|i| memo[i.child].is_none()).map(|i| (i.child, false)));
+        }
+    }
+    memo.into_iter().map(|m| m.unwrap_or(0)).collect()
+}
+
 /// The hop of `path` to flatten: the deepest whose parent cell is placed
 /// exactly once (so hiding the element hides exactly the clicked placement).
 /// `None` for an empty path (a TOP-cell shape — nothing to flatten).
@@ -96,13 +127,18 @@ pub fn flatten_placement(db: &CellDb, overlay: &EditOverlay, key: PlacementKey, 
 }
 
 /// What a streamed design must have in memory before placement `key` can be
-/// flattened (Phase 7.4): every shape chunk and placement chunk of its
-/// subtree that is not resident. Empty in-core.
+/// flattened (Phase 7.4): the placement itself, then every shape chunk and
+/// placement chunk of its subtree that is not resident. Empty in-core.
 pub fn flatten_needs(db: &CellDb, key: PlacementKey) -> Vec<crate::pick::ChunkNeed> {
     let (parent, ii, _, _) = key;
     let mut needs = Vec::new();
     let Some(&root) = db.cell(parent).resident_instances().find(|&(i, _)| i == ii).map(|(_, inst)| inst.child).as_ref()
     else {
+        // The placement's own chunk first: its child is not known before.
+        let p = db.cell(parent);
+        if p.remote.is_some() {
+            needs.extend(p.inst_chunk_of(ii).map(|ci| crate::pick::ChunkNeed::Placements(parent, ci)));
+        }
         return needs;
     };
     let mut seen = std::collections::HashSet::new();
@@ -256,6 +292,18 @@ mod tests {
         let path = vec![(db.top, 0, 0, 5), (row, 0, 7, 0)];
         assert_eq!(flatten_hop(&path, &counts), Some(0));
         assert_eq!(flatten_hop(&[], &counts), None);
+    }
+
+    #[test]
+    fn subtree_sizes_count_arrays_and_nesting() {
+        let db = tiny();
+        let sizes = subtree_shapes(&db);
+        let (mid, leaf) = (db.id_of("MID").unwrap(), db.id_of("LEAF").unwrap());
+        assert_eq!((sizes[leaf], sizes[mid], sizes[db.top]), (2, 3, 1 + 6 * 3));
+        // The whole design's flattened size, the same way the loader counts it.
+        assert_eq!(sizes[db.top], db.flat_shape_count());
+        let hier = crate::gds::load_gds_db(HIER).unwrap();
+        assert_eq!(subtree_shapes(&hier)[hier.top], hier.flat_shape_count());
     }
 
     #[test]

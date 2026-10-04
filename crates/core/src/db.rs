@@ -196,6 +196,12 @@ impl Cell {
         }
     }
 
+    /// The placement chunk holding placement `ii` (chunks are contiguous runs).
+    pub fn inst_chunk_of(&self, ii: u32) -> Option<u32> {
+        let ci = self.inst_chunks.partition_point(|c| c.end <= ii);
+        (ci < self.inst_chunks.len() && self.inst_chunks[ci].start <= ii).then_some(ci as u32)
+    }
+
     /// How many placements the cell has, in memory or not.
     pub fn placement_count(&self) -> usize {
         match &self.remote {

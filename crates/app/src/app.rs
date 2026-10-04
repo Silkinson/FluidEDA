@@ -252,6 +252,17 @@ enum PickMode {
     Replace,
     /// Toggle the shape in the selection (a shift-click).
     Toggle,
+    /// Replace the selection, then "edit this placement only" there.
+    Flatten,
+}
+
+/// A streamed design's "edit this placement only" waiting for the
+/// placement's subtree to be in memory (Phase 7.4).
+#[derive(Debug, Clone, Copy)]
+struct PendingFlatten {
+    key: fluideda_core::PlacementKey,
+    world: Option<Vec2>,
+    since: f64,
 }
 
 /// What a left-click selects / a drag edits (Phase 5: base shapes and drawn
@@ -363,6 +374,8 @@ pub struct FluidApp {
     stream: Option<Stream>,
     /// A streamed design's pick waiting for chunks (Phase 7.4).
     pending_pick: Option<PendingPick>,
+    /// A streamed design's flatten waiting for its subtree (Phase 7.4).
+    pending_flatten: Option<PendingFlatten>,
     /// Cull wall time per frame: smoothed, and the worst since `perf_reset`.
     cull_ms: f64,
     cull_max_ms: f64,
@@ -600,7 +613,7 @@ impl FluidApp {
         // ?room=<name> (Phase 6): join it once the design is in. Without a
         // ?file=, the design is the room's own — look it up first.
         let room_query = webio::query_room().filter(|r| valid_room(r));
-        let room_lookup = (room_query.is_some() && file.is_none()).then(|| {
+        let room_lookup = (room_query.is_some() && file.is_none() && stream_hash.is_none()).then(|| {
             let slot: webio::RoomSlot = Rc::new(RefCell::new(None));
             webio::fetch_room(room_query.clone().unwrap(), slot.clone());
             slot
@@ -628,6 +641,7 @@ impl FluidApp {
             pending_hash: None,
             stream: None,
             pending_pick: None,
+            pending_flatten: None,
             cull_ms: 0.0,
             cull_max_ms: 0.0,
             loading: None,
@@ -774,6 +788,7 @@ impl FluidApp {
         self.pending_hash = design.pending_hash;
         self.stream = design.stream.map(|info| Stream::new(info, &self.db));
         self.pending_pick = None;
+        self.pending_flatten = None;
         if self.stream.is_some() {
             // Shapes arrive by chunk (Phase 7.4): the cells read them through
             // their chunk stores.
@@ -939,6 +954,7 @@ impl FluidApp {
                 match pp.mode {
                     PickMode::Replace => self.apply_pick(pp.world, hit),
                     PickMode::Toggle => self.apply_toggle(pp.world, hit),
+                    PickMode::Flatten => self.apply_pick_flatten(pp.world, hit),
                 }
             }
             Err(needs) => {
@@ -952,6 +968,23 @@ impl FluidApp {
         }
     }
 
+    /// Pick at `world`, then "edit this placement only" there (the
+    /// `flatten_at` driver) — on a streamed design, once the pick has its
+    /// chunks.
+    fn pick_and_flatten(&mut self, world: Vec2) {
+        match self.pick(world) {
+            Ok(hit) => self.apply_pick_flatten(world, hit),
+            Err(needs) => self.defer_pick(world, PickMode::Flatten, needs),
+        }
+    }
+
+    fn apply_pick_flatten(&mut self, world: Vec2, hit: Option<(Selection, Transform)>) {
+        self.apply_pick(world, hit);
+        if self.selected.is_some() {
+            self.flatten_selection_placement(Some(world));
+        }
+    }
+
     // --- Phase 5d SLICE 4: edit one placement only ---------------------------
 
     /// "Edit this placement only": flatten the clicked placement of the primary
@@ -960,22 +993,64 @@ impl FluidApp {
     /// hiding the placement. One transaction (one undo step). Afterwards the
     /// flattened copy under the same point is selected, ready to edit.
     fn flatten_selection_placement(&mut self, world: Option<Vec2>) {
-        if self.stream.is_some() {
-            // Which hop to flatten needs every cell's placement count, which a
-            // streamed client does not have.
-            self.status = "edit this placement only: not available on a streamed design yet".into();
+        let path = self.selected_path.clone();
+        let counts = match &self.stream {
+            // A streamed client cannot count placements it has not fetched:
+            // the server's pack carries the counts (v5, Phase 7.4).
+            Some(st) => st.info.placement_counts.clone(),
+            None => self.placement_counts.get_or_insert_with(|| fluideda_core::placement_counts(&self.db)).clone(),
+        };
+        if counts.is_empty() {
+            self.status = "edit this placement only: the server's pack of this design has no placement counts".into();
             return;
         }
-        let path = self.selected_path.clone();
-        let counts = self
-            .placement_counts
-            .get_or_insert_with(|| fluideda_core::placement_counts(&self.db))
-            .clone();
         let Some(hop) = fluideda_core::flatten_hop(&path, &counts) else {
             self.status = "already a top-level shape — edit it directly".into();
             return;
         };
         let key = path[hop];
+        if self.stream.is_some() {
+            // The subtree must be in memory first: it is fetched, and the
+            // flatten runs when it is (`retry_flatten`).
+            self.pending_flatten = Some(PendingFlatten { key, world, since: self.last_frame });
+            self.retry_flatten();
+            return;
+        }
+        self.flatten_key(key, world);
+    }
+
+    /// Try a parked flatten again (Phase 7.4): refuse it at once when the
+    /// server says the subtree is over the limit, else fetch what it still
+    /// needs, and run it once nothing is missing.
+    fn retry_flatten(&mut self) {
+        let Some(pf) = self.pending_flatten else { return };
+        let (parent, ii, _, _) = pf.key;
+        let child = self.db.cell(parent).resident_instances().find(|&(i, _)| i == ii).map(|(_, inst)| inst.child);
+        let size = child.zip(self.stream.as_ref()).and_then(|(c, st)| st.info.subtree_shapes.get(c).copied());
+        if size.is_some_and(|n| n > fluideda_core::FLATTEN_LIMIT as u64) {
+            self.pending_flatten = None;
+            self.status = format!(
+                "too big to flatten here (> {} shapes) — pick something smaller",
+                fluideda_core::FLATTEN_LIMIT
+            );
+            return;
+        }
+        let needs = fluideda_core::flatten_needs(&self.db, pf.key);
+        if needs.is_empty() {
+            self.pending_flatten = None;
+            self.status.clear();
+            self.flatten_key(pf.key, pf.world);
+        } else if self.last_frame - pf.since > STREAM_PICK_TIMEOUT_S {
+            self.pending_flatten = None;
+            self.status = format!("edit this placement only gave up: {} chunk(s) did not arrive", needs.len());
+        } else if let Some(st) = &mut self.stream {
+            self.status = "fetching the placement's geometry…".into();
+            st.wants.extend(needs);
+        }
+    }
+
+    /// Flatten placement `key` now: its subtree is in memory.
+    fn flatten_key(&mut self, key: fluideda_core::PlacementKey, world: Option<Vec2>) {
         let shapes = match fluideda_core::flatten_placement(&self.db, &self.overlay, key, fluideda_core::FLATTEN_LIMIT) {
             Ok(s) => s,
             Err(n) => {
@@ -1764,6 +1839,7 @@ impl FluidApp {
             self.stream_placements(&visible);
             self.stream_shapes();
             self.retry_pick();
+            self.retry_flatten();
             let rebuilt = self.stream_chunks(renderer, &device, &visible);
             self.upload_overlay(renderer, &device, &visible);
             if editing {
@@ -1918,10 +1994,11 @@ impl FluidApp {
     /// over budget — never a pinned one. An arrival an edit was waiting for
     /// reconciles the overlay again.
     fn stream_shapes(&mut self) {
-        // A pick still waiting may need everything fetched for it so far (a
-        // placement chunk, then the shapes it reveals): nothing is evicted
-        // until it is done, or a tight budget could keep it from finishing.
-        let hold = self.pending_pick.is_some();
+        // A pick or flatten still waiting may need everything fetched for it
+        // so far (a placement chunk, then the shapes it reveals): nothing is
+        // evicted until it is done, or a tight budget could keep it from
+        // finishing.
+        let hold = self.pending_pick.is_some() || self.pending_flatten.is_some();
         let pinned = match &self.stream {
             Some(st) if st.s_resident_bytes > st.s_budget && !hold => self.pinned_shape_chunks(),
             Some(_) => HashSet::new(),
@@ -2089,7 +2166,7 @@ impl FluidApp {
         }
         // Over budget: drop the least recently walked (never this frame's, nor
         // anything while a pick is waiting — see `stream_shapes`).
-        if st.p_resident_bytes > st.p_budget && self.pending_pick.is_none() {
+        if st.p_resident_bytes > st.p_budget && self.pending_pick.is_none() && self.pending_flatten.is_none() {
             let mut old: Vec<(u64, (CellId, u32))> =
                 st.p_last_used.iter().filter(|(_, &f)| f < st.frame).map(|(&k, &f)| (f, k)).collect();
             old.sort_unstable();
@@ -2435,7 +2512,7 @@ impl FluidApp {
              \"p_evicted\":{},\"p_in_flight\":{},\"p_wanted\":{},\"p_failures\":{},\"dense_inst\":{},\"proxies\":{},\
              \"s_fetched\":{},\"s_fetched_bytes\":{},\"s_resident\":{},\"s_resident_bytes\":{},\"s_evicted\":{},\
              \"s_in_flight\":{},\"s_failures\":{},\"wants\":{},\"pick_pending\":{},\"pick_us\":{:.0},\
-             \"retess\":{}}}",
+             \"retess\":{},\"flatten_pending\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -2502,6 +2579,7 @@ impl FluidApp {
             self.pending_pick.is_some(),
             self.last_pick_us,
             self.stream.as_ref().map_or(0, |s| s.retess.len()),
+            self.pending_flatten.is_some(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -2570,7 +2648,7 @@ impl FluidApp {
             if self.auto_rejoin {
                 ui.small(format!("reconnecting… (attempt {})", self.reconnects));
             }
-            if ui.add_enabled(self.stream.is_none(), egui::Button::new("Join room")).clicked() {
+            if ui.button("Join room").clicked() {
                 self.request_join();
             }
             // Refused for having another design: offer the room's own.
@@ -2596,18 +2674,19 @@ impl FluidApp {
         self.status = format!("loading {name} from room {}…", self.room);
         self.load_in_flight = true;
         self.pending_join = true;
-        webio::spawn_worker_fetch(format!("/blobs/{hash}"), Some(name.to_string()), self.design_slot.clone());
+        if webio::query_flag("streamed") {
+            // `?room=R&streamed`: open the room's design out of core (7.4).
+            webio::fetch_pack(hash.to_string(), name.to_string(), self.design_slot.clone());
+        } else {
+            webio::spawn_worker_fetch(format!("/blobs/{hash}"), Some(name.to_string()), self.design_slot.clone());
+        }
     }
 
     /// Join now — or, while a design is loading or its hash is still being
     /// computed, as soon as it is in (the join must name the design).
     fn request_join(&mut self) {
-        if self.stream.is_some() {
-            // A streamed design holds no base geometry, so peers' edits of
-            // base shapes could not be shown: rooms need the design in-core.
-            self.status = "rooms need the design loaded in-core (this one is streamed)".to_string();
-            return;
-        }
+        // (A streamed design joins like any other since Phase 7.4: peers'
+        // edits fetch the chunks they touch.)
         if self.load_in_flight || self.loading.is_some() || self.pending_hash.is_some() {
             self.pending_join = true;
         } else {
@@ -3144,10 +3223,7 @@ impl FluidApp {
                 let x = parts.next().and_then(|s| s.parse::<f32>().ok());
                 let y = parts.next().and_then(|s| s.parse::<f32>().ok());
                 if let (Some(x), Some(y)) = (x, y) {
-                    self.pick_at(Vec2::new(x, y));
-                    if self.selected.is_some() {
-                        self.flatten_selection_placement(Some(Vec2::new(x, y)));
-                    }
+                    self.pick_and_flatten(Vec2::new(x, y));
                 }
             }
             Some("draw_into") => {

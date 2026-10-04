@@ -52,7 +52,7 @@ pub use drc::{
     DrcGridBuilder, DrcKind, DrcRules, DrcStep, LayerRule, PassStats, TileInput, TileJob, TileKey, Violation,
 };
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, PlacementKey, Shape};
-pub use flatten::{flatten_hop, flatten_needs, flatten_placement, placement_counts, FLATTEN_LIMIT};
+pub use flatten::{flatten_hop, flatten_needs, flatten_placement, placement_counts, subtree_shapes, FLATTEN_LIMIT};
 pub use gds_write::write_gds;
 pub use oasis_write::write_oasis;
 pub use index::ShapeIndex;

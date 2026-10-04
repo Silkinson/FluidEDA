@@ -49,6 +49,12 @@ pub struct StreamInfo {
     pub skeleton_bytes: u64,
     /// Manifest + skeleton + index fetch, wall ms.
     pub fetch_ms: f64,
+    /// Per cell: how many times it is placed in the whole design, and how
+    /// many shapes its subtree flattens to (pack v5, Phase 7.4) — what "edit
+    /// this placement only" decides with, which a client cannot count from
+    /// the placements it has fetched. Empty from an older pack.
+    pub placement_counts: Vec<u64>,
+    pub subtree_shapes: Vec<u64>,
 }
 
 /// Where a design's bytes came from — what the app reads again when a room

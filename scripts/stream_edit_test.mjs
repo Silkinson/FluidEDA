@@ -9,7 +9,8 @@
 //      shape, move a vertex of another and nudge a third, in both pages. The
 //      streamed page redraws the edited chunks from the copies it fetched; the
 //      screenshots must match pixel for pixel. Undoing all three restores the
-//      original pixels.
+//      original pixels. "Edit this placement only" there (a standard cell in
+//      caravel_core, whose placements are remote) copies the same shapes.
 //   3. MEMORY — with a 1 MB shape budget the streamed page evicts what its
 //      picks fetched but keeps what its edits and selection need: after picks
 //      all over the die, the edited view still matches in-core exactly. (Both
@@ -214,6 +215,30 @@ async function main() {
     const d3 = await diff(local, before, undoneS);
     check(d2.px === 0 && d3.px === 0,
       `undo ×3 restores the original view: in-core ${d2.px}, streamed ${d3.px} pixels differ`);
+    // "Edit this placement only" at the first target: the standard cell
+    // there is flattened into caravel_core, whose placements are remote in
+    // the pack — the streamed page fetches the placement, then its subtree.
+    const flat = async (page) => {
+      const t = Date.now();
+      await cmd(page, `flatten_at ${targets[0][0]} ${targets[0][1]}`);
+      await page.waitForFunction(() => {
+        const p = JSON.parse(window.__fluideda_perf || '{}');
+        const s = JSON.parse(window.__fluideda_state || '{}');
+        return !p.pick_pending && !p.flatten_pending && s.hidden === 1;
+      }, null, { timeout: 30000, polling: 16 });
+      const ms = Date.now() - t;
+      return { s: await state(page), ms };
+    };
+    const fl = await flat(local), fs = await flat(streamed);
+    const flatL = await shoot(local, VIEWS[EDIT_VIEW]);
+    const flatS = await shoot(streamed, VIEWS[EDIT_VIEW]);
+    const d5 = await diff(local, flatL, flatS);
+    check(fs.s.adds === fl.s.adds && fl.s.adds > 0 && d5.px === 0 && fs.s.adds_nontop === fl.s.adds_nontop,
+      `edit this placement only: in-core ${fl.s.adds} shapes copied into the parent, streamed ${fs.s.adds} ` +
+      `(${fs.ms} ms incl. fetching); views ${d5.px === 0 ? 'identical' : `differ by ${d5.px} px`}`);
+    await cmd(local, 'undo');
+    await cmd(streamed, 'undo');
+
     const qs = await perf(streamed);
     check(qs.stream_failures === 0 && qs.s_failures === 0 && qs.p_failures === 0,
       `streamed: no failed chunk reads (draw ${qs.stream_failures}, shapes ${qs.s_failures}, placements ${qs.p_failures})`);
