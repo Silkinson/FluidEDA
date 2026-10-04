@@ -21,6 +21,20 @@
 //! A record's columns are exactly what [`crate::tessellate_columns`] takes and
 //! what [`crate::store::ShapeStore::chunk_columns`] yields in-core, so a
 //! streamed chunk tessellates identically to a local one (tested).
+//!
+//! **Pack v3 streams the hierarchy too** (Phase 7.3 SLICE B). The skeleton
+//! becomes a *cell table* ([`crate::serialize::cell_table_meta`]): a cell with
+//! more than [`INLINE_PLACEMENTS`] placements lists only their count, and its
+//! placements are two more blobs —
+//!
+//! * **placements** — one record per placement chunk of such a cell
+//!   ([`crate::serialize::encode_instances`]), in [`inst_chunk_base`] order
+//!   (inline cells' chunks are empty ranges);
+//! * **placement index** — byte offsets into it, like the geometry index.
+//!
+//! caravel's 25 MB skeleton becomes a cell table of a few hundred KB: only
+//! caravel_core's 460 k standard-cell placements (and two smaller lists) are
+//! remote, fetched as the view needs them.
 
 use crate::db::CellDb;
 use anyhow::{bail, Result};
@@ -29,8 +43,48 @@ use std::io::{self, Write};
 
 /// Bumped whenever the pack layout (or anything baked into it — chunking,
 /// shape numbering) changes; servers key cached packs by it. 2: the skeleton
-/// carries placement chunk tables (Phase 7.3).
-pub const PACK_VERSION: u32 = 2;
+/// carries placement chunk tables (Phase 7.3). 3: big placement lists are
+/// remote — a cell table plus placement records (Phase 7.3 SLICE B).
+pub const PACK_VERSION: u32 = 3;
+
+/// A cell with at most this many placements keeps them in the cell table;
+/// above it, they are fetched by placement chunk. Most cells have a handful
+/// (fetching them would cost a round trip per hierarchy level for nothing);
+/// the lists that matter are the huge ones.
+pub const INLINE_PLACEMENTS: usize = 512;
+
+/// The first global placement-chunk number of each cell, cells in order,
+/// followed by the total (the placement index's numbering).
+pub fn inst_chunk_base(db: &CellDb) -> Vec<u32> {
+    let mut base = Vec::with_capacity(db.cells.len() + 1);
+    let mut n = 0u32;
+    for cell in &db.cells {
+        base.push(n);
+        n += cell.inst_chunks.len() as u32;
+    }
+    base.push(n);
+    base
+}
+
+/// Write the placement records of every cell with more than `inline_max`
+/// placements (other cells' chunks are empty ranges), in
+/// [`inst_chunk_base`] order. Returns the index (`chunks + 1` offsets).
+pub fn write_placements(db: &CellDb, inline_max: usize, out: &mut impl Write) -> io::Result<Vec<u64>> {
+    let mut offsets = vec![0u64];
+    let mut pos = 0u64;
+    for cell in &db.cells {
+        let remote = cell.instances.len() > inline_max;
+        for ch in &cell.inst_chunks {
+            if remote {
+                let rec = crate::serialize::encode_instances(&cell.instances[ch.start as usize..ch.end as usize]);
+                out.write_all(&rec)?;
+                pos += rec.len() as u64;
+            }
+            offsets.push(pos);
+        }
+    }
+    Ok(offsets)
+}
 
 /// The first global chunk number of each cell, cells in order, followed by
 /// the total: cell `c`'s chunk `i` is chunk `base[c] + i` of the pack.
@@ -153,6 +207,95 @@ mod tests {
         if let Ok(b) = std::fs::read("../../testdata/sky130_fd_sc_hd_merged.gds") {
             check(&b, "sky130");
         }
+    }
+
+    /// Pack v3: the cell table installs with the big placement lists
+    /// remote; once their records arrive, the cull selects exactly what it
+    /// does in-core at any view where no chunk is dense.
+    #[test]
+    fn a_streamed_hierarchy_culls_like_the_in_core_one_once_resident() {
+        use crate::db::{CellDbBuilder, Instance, InstanceKind};
+        use crate::transform::{Bboxf, Transform};
+        use crate::types::{Layer, Point};
+        let mut b = CellDbBuilder::new();
+        let top = b.intern("TOP");
+        let core = b.intern("CORE");
+        let leaf = b.intern("LEAF");
+        b.cell_mut(leaf).shapes.push(Layer::new(1, 0), [Point::new(0, 0), Point::new(400, 0), Point::new(400, 900), Point::new(0, 900)]);
+        b.cell_mut(top).shapes.push(Layer::new(2, 0), [Point::new(0, 0), Point::new(9, 0), Point::new(9, 9), Point::new(0, 9)]);
+        for i in 0..20_000i32 {
+            b.cell_mut(core).instances.push(Instance {
+                child: leaf,
+                transform: Transform::translate(((i % 200) * 500) as f64, ((i / 200) * 1_000) as f64),
+                kind: InstanceKind::Single,
+            });
+        }
+        for k in 0..3 {
+            b.cell_mut(top).instances.push(Instance {
+                child: core,
+                transform: Transform::translate((k * 120_000) as f64, 0.0),
+                kind: InstanceKind::Single,
+            });
+        }
+        let db = b.build().unwrap();
+        assert!(db.cell(core).inst_chunks.len() > 1);
+
+        // The pack's two placement artefacts, then the client's view of them.
+        let table = crate::serialize::cell_table_meta(&db, INLINE_PLACEMENTS);
+        let mut placements = Vec::new();
+        let offsets = write_placements(&db, INLINE_PLACEMENTS, &mut placements).unwrap();
+        assert!(table.len() < crate::skeleton_meta(&db).len() / 20, "the cell table drops the big list");
+        let (mut streamed, _) = crate::ProgressiveLoad::new(&table).unwrap();
+        assert!(streamed.cell(core).remote.is_some() && streamed.cell(top).remote.is_none());
+        assert!(streamed.cell(core).instances.is_empty());
+
+        let view = Bboxf { min_x: 125_000.0, min_y: 20_000.0, max_x: 160_000.0, max_y: 40_000.0 };
+        let before = crate::cull(&streamed, &view, 0.05, 4.0);
+        assert!(!before.placements_wanted.is_empty(), "visible remote chunks are asked for");
+        // Deliver every wanted chunk from the placement records.
+        let base = inst_chunk_base(&db);
+        for &(c, ci) in &before.placements_wanted {
+            let k = (base[c] + ci) as usize;
+            let rec = &placements[offsets[k] as usize..offsets[k + 1] as usize];
+            let insts = crate::serialize::decode_instances(rec, db.cells.len()).unwrap();
+            streamed.cells[c].remote.as_mut().unwrap().chunks[ci as usize] = Some(insts);
+        }
+        let after = crate::cull(&streamed, &view, 0.05, 4.0);
+        assert!(after.placements_wanted.is_empty());
+        let local = crate::cull(&db, &view, 0.05, 4.0);
+        let key = |v: &crate::VisibleSet| {
+            let mut d: Vec<(usize, u32, usize)> = v.draws.iter().map(|d| (d.cell, d.chunk, d.transforms.len())).collect();
+            d.sort();
+            (d, v.proxies.len())
+        };
+        assert_eq!(key(&after), key(&local), "resident ⇒ same selection as in-core");
+
+        // Zoomed out, the big list draws as one proxy per chunk, unfetched.
+        let fit = Bboxf { min_x: -1e5, min_y: -1e5, max_x: 5e5, max_y: 3e5 };
+        let far = crate::cull(&streamed, &fit, 0.0005, 4.0);
+        assert!(far.stats.dense_inst_chunks > 0 && far.placements_wanted.is_empty());
+        assert!(far.stats.nodes_visited < crate::cull(&db, &fit, 0.0005, 4.0).stats.nodes_visited / 10);
+    }
+
+    #[test]
+    fn placement_records_round_trip_and_reject_garbage() {
+        use crate::db::{Instance, InstanceKind};
+        use crate::transform::Transform;
+        let insts = vec![
+            Instance { child: 2, transform: Transform::translate(5.0, -7.0), kind: InstanceKind::Single },
+            Instance {
+                child: 0,
+                transform: Transform::translate(1.0, 2.0),
+                kind: InstanceKind::Array { cols: 3, rows: 4, col_step: [10.0, 0.0], row_step: [0.0, 20.0] },
+            },
+        ];
+        let rec = crate::serialize::encode_instances(&insts);
+        let back = crate::serialize::decode_instances(&rec, 3).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0].child, back[0].transform), (2, insts[0].transform));
+        assert!(matches!(back[1].kind, InstanceKind::Array { cols: 3, rows: 4, .. }));
+        assert!(crate::serialize::decode_instances(&rec, 2).is_err(), "child out of range");
+        assert!(crate::serialize::decode_instances(&rec[..rec.len() - 1], 3).is_err(), "truncated");
     }
 
     #[test]

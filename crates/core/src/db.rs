@@ -91,7 +91,18 @@ pub struct Cell {
     /// with the footprint (cell frame) of the placements it holds. Empty iff
     /// there are no instances; a cell with few placements has one chunk.
     pub inst_chunks: Vec<Chunk>,
+    /// A streamed design's cell whose placements are fetched by chunk
+    /// (Phase 7.3 SLICE B): `instances` stays empty and the chunks that have
+    /// arrived live here. `None` for every in-core cell.
+    pub remote: Option<RemotePlacements>,
     index: OnceCell<ShapeIndex>,
+}
+
+/// The resident placement chunks of a remote cell. Chunk `i` holds the
+/// instances numbered `inst_chunks[i].start..end`, in order.
+#[derive(Debug, Default)]
+pub struct RemotePlacements {
+    pub chunks: Vec<Option<Vec<Instance>>>,
 }
 
 impl Cell {
@@ -102,8 +113,15 @@ impl Cell {
             instances: Vec::new(),
             chunks: Vec::new(),
             inst_chunks: Vec::new(),
+            remote: None,
             index: OnceCell::new(),
         }
+    }
+
+    /// Mark this cell's placements as fetched by chunk, none resident yet
+    /// (a streamed design's cell table, Phase 7.3 SLICE B).
+    pub fn make_remote(&mut self) {
+        self.remote = Some(RemotePlacements { chunks: (0..self.inst_chunks.len()).map(|_| None).collect() });
     }
 
     /// Replace the cell's shape store (Phase 5c progressive load: a skeleton
@@ -216,7 +234,7 @@ impl Cell {
         chunks: Vec<Chunk>,
         inst_chunks: Vec<Chunk>,
     ) -> Self {
-        Self { name, shapes, instances, chunks, inst_chunks, index: OnceCell::new() }
+        Self { name, shapes, instances, chunks, inst_chunks, remote: None, index: OnceCell::new() }
     }
 }
 
@@ -423,9 +441,9 @@ impl CellDbBuilder {
             let boxes: Vec<Bbox> =
                 cell.instances.iter().map(|inst| placement_bbox(inst, &local_bboxes[inst.child])).collect();
             let (order, inst_chunks) = chunk::chunk_instances(&boxes);
+            drop(boxes);
             if let Some(order) = order {
-                let old = std::mem::take(&mut cell.instances);
-                cell.instances = order.iter().map(|&i| old[i as usize]).collect();
+                permute_in_place(&mut cell.instances, &order);
             }
             cell.inst_chunks = inst_chunks;
         }
@@ -490,6 +508,33 @@ fn compute_local_bboxes(cells: &[Cell]) -> Vec<Bbox> {
     bboxes
 }
 
+/// Reorder `v` so that `v[new] = old_v[order[new]]`, in place: one pass per
+/// cycle of the permutation, with a bitset instead of a second copy of `v`
+/// (a 50 M-placement cell is 5 GB of instances — copying it would double the
+/// parse peak).
+fn permute_in_place<T: Copy>(v: &mut [T], order: &[u32]) {
+    debug_assert_eq!(v.len(), order.len());
+    let mut done = vec![0u64; v.len().div_ceil(64)];
+    for start in 0..v.len() {
+        if done[start / 64] >> (start % 64) & 1 == 1 {
+            continue;
+        }
+        // Rotate the cycle start → order[start] → order[order[start]] → … .
+        let first = v[start];
+        let mut i = start;
+        loop {
+            done[i / 64] |= 1 << (i % 64);
+            let src = order[i] as usize;
+            if src == start {
+                v[i] = first;
+                break;
+            }
+            v[i] = v[src];
+            i = src;
+        }
+    }
+}
+
 /// Instance `inst`'s footprint in its parent's frame, given its child's local
 /// bbox: one placement, or an AREF's whole array (its four extreme elements
 /// bound it). Empty for an empty child.
@@ -514,4 +559,20 @@ fn expand_by_transform(b: &mut Bbox, child_b: &Bbox, t: Transform) {
     let f = t.apply_bbox(child_b);
     b.expand(Point::new(f.min_x.floor() as i32, f.min_y.floor() as i32));
     b.expand(Point::new(f.max_x.ceil() as i32, f.max_y.ceil() as i32));
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permuting_in_place_matches_a_gather() {
+        let order: Vec<u32> = vec![3, 0, 4, 1, 2, 5, 7, 6];
+        let src: Vec<u32> = (10..18).collect();
+        let mut v = src.clone();
+        permute_in_place(&mut v, &order);
+        let want: Vec<u32> = order.iter().map(|&i| src[i as usize]).collect();
+        assert_eq!(v, want);
+    }
 }

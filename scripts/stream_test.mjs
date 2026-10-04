@@ -6,6 +6,8 @@
 //   2. RESIDENCY — panning a streamed design under a small GPU budget evicts
 //      least-recently-drawn chunks (GPU bytes stay near the budget), and a
 //      view revisited is fetched again and renders the same.
+//   3. PLACEMENTS (pack v3) — the same for the remote placement lists, under
+//      a tiny placement budget.
 //
 // Prereqs: the server (:9000) holding the design blob, trunk serve (:8080,
 // proxying /blobs, /packs). The design defaults to caravel's GDS:
@@ -16,14 +18,21 @@ import { launch } from './launch.mjs';
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8080';
 const H = process.env.DESIGN || '54b338e882819b4393279de3258337fad202718ff7dda9e4be413e07776c90d7';
-// World views (nm): [cx, cy, span] — the busiest 30 µm windows of a 300 µm
-// scan of caravel (pad-ring IO cells, 480–770 placements each), tight enough
-// that no chunk is dense. (The die's middle is the empty user-project area.)
+// World views (nm): [cx, cy, span], tight enough that no chunk is dense.
+// The first four are the busiest 30 µm windows of a 300 µm scan of caravel
+// (pad-ring IO cells, placed inline by the top). The last four sit on the
+// densest placement chunks of the cells whose placements are *remote* in a
+// pack v3 (fetched by chunk): caravel_core, housekeeping, RAM128 and
+// caravel_clocking. (The die's middle is the empty user-project area.)
 const VIEWS = [
   [3_150_000, 5_000_000, 30_000],
   [1_950_000, 5_000_000, 30_000],
   [150_000, 2_000_000, 30_000],
   [3_450_000, 1_700_000, 30_000],
+  [1_907_290, 1_027_860, 30_000],
+  [3_146_240, 675_220, 30_000],
+  [653_950, 766_300, 30_000],
+  [1_804_110, 441_100, 30_000],
 ];
 const CLIP = { x: 420, y: 0, width: 860, height: 800 }; // the canvas right of the side panel
 
@@ -39,8 +48,9 @@ async function settle(p) {
   let last = '', stable = 0;
   for (let i = 0; i < 400; i++) {
     const q = await perf(p);
-    const sig = `${q.uploaded}/${q.stream_fetched}/${q.in_flight}`;
-    if (q.in_flight === 0 && sig === last) { if (++stable >= 5) return q; } else stable = 0;
+    // Placement chunks (pack v3) arrive before the shape chunks they reveal.
+    const sig = `${q.uploaded}/${q.stream_fetched}/${q.in_flight}/${q.p_fetched}/${q.p_in_flight ?? 0}`;
+    if (q.in_flight === 0 && !q.p_in_flight && sig === last) { if (++stable >= 5) return q; } else stable = 0;
     last = sig;
     await sleep(200);
   }
@@ -116,9 +126,10 @@ async function main() {
     for (let i = 0; i < VIEWS.length; i++) {
       const s = await shoot(streamed, VIEWS[i]);
       const d = await diff(streamed, inCore[i].png, s.png);
-      check(d.px === 0 && s.perf.stream_dense === 0 && s.perf.instances > 100,
+      check(d.px === 0 && s.perf.stream_dense === 0 && s.perf.dense_inst === 0 && s.perf.instances > 100,
         `view ${i + 1} ${VIEWS[i].join(',')}: streamed = in-core pixel for pixel (${d.px} of ${d.total} differ; ` +
-        `${s.perf.instances} placements; ${s.perf.uploaded} chunks resident, ${(s.perf.gpu_bytes / 1e6).toFixed(1)} MB)`);
+        `${s.perf.instances} placements; ${s.perf.uploaded} chunks + ${s.perf.p_resident} placement chunks resident, ` +
+        `${(s.perf.gpu_bytes / 1e6).toFixed(1)} MB)`);
     }
     const sp = await perf(streamed);
     console.log(`      streamed: first frame ${sm.ttff_ms.toFixed(0)} ms, fetched ${sp.stream_fetched} chunks ` +
@@ -153,6 +164,24 @@ async function main() {
     check(d.px === 0 && back.perf.stream_fetched > after.stream_fetched - 1,
       `the first view, revisited after eviction, is fetched again and matches (${d.px} px differ)`);
     await pan.context().close();
+
+    // --- 3. placement residency (pack v3) -------------------------------------
+    // The remote placement lists under a 1 MB placement budget: cycling the
+    // four remote-placement views twice must evict placement chunks, and a
+    // view revisited after its placements were evicted must render the same.
+    const tight = await open(browser, `${BASE}/?stream=${H}&placement_budget=1`,
+      () => JSON.parse(window.__fluideda_perf || '{}').streaming);
+    const remoteViews = VIEWS.slice(4);
+    const firstRemote = await shoot(tight, remoteViews[0]);
+    for (let round = 0; round < 2; round++) {
+      for (const v of remoteViews.slice(1)) await shoot(tight, v);
+    }
+    const again = await shoot(tight, remoteViews[0]);
+    const dr = await diff(tight, firstRemote.png, again.png);
+    check(again.perf.p_evicted > 0 && dr.px === 0,
+      `placement chunks under a 1 MB budget: ${again.perf.p_evicted} evicted, ${again.perf.p_fetched} fetched; ` +
+      `the first view re-fetched its placements and matches (${dr.px} px differ)`);
+    await tight.context().close();
   } catch (e) {
     check(false, `exception: ${e.message}`);
   } finally {

@@ -19,7 +19,8 @@ const BASE = process.env.BASE || 'http://127.0.0.1:8080';
 const DESIGNS = (process.env.DESIGNS ||
   'caravel:54b338e882819b4393279de3258337fad202718ff7dda9e4be413e07776c90d7,' +
   'flat_11M:d61d884a598dba5355d7d469642986748adda24703656be996e973e56f081c0d,' +
-  'flat_32M:d3164d433559f79d2989fbe2fedb22d2febbe6f35d5baea6350d28e41a1a37cb')
+  'flat_32M:d3164d433559f79d2989fbe2fedb22d2febbe6f35d5baea6350d28e41a1a37cb,' +
+  'place_50M:13c494692d65dfb9295d2be78e3a5e8a4e3998b9bee47e943f982ff61f0412db')
   .split(',').map((d) => d.split(':'));
 const TIMEOUT = 240_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -28,7 +29,14 @@ const mb = (b) => `${(b / 1e6).toFixed(0)} MB`;
 async function inCore(browser, hash) {
   const page = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
   let error = null;
-  page.on('console', (m) => { if (/panicked|load failed|parse failed/i.test(m.text())) error ??= m.text().split('\n')[0].slice(0, 120); });
+  // A failed worker parse shows as a panic, a load error, or a bare wasm trap
+  // (`unreachable` — an allocation failure aborting).
+  page.on('console', (m) => {
+    const t = m.text();
+    if (m.type() === 'error' && /panicked|load failed|parse failed|unreachable|out of memory|allocation failed/i.test(t)) {
+      error ??= t.split('\n')[0].slice(0, 120);
+    }
+  });
   page.on('crash', () => { error ??= 'page crashed'; });
   const t0 = Date.now();
   await page.goto(`${BASE}/?file=/blobs/${hash}`);
@@ -39,7 +47,11 @@ async function inCore(browser, hash) {
     await sleep(200);
   }
   await page.context().close();
-  if (error || !(m && m.geometry_ms > 0)) return `in-core: FAILED (${error || 'timeout'}) after ${((Date.now() - t0) / 1000).toFixed(0)} s`;
+  // The embedded sample's metrics are on the page from the start: only a
+  // big file's count as loaded.
+  if (error || !(m && m.geometry_ms > 0 && m.file_bytes > 1e6)) {
+    return `in-core: FAILED (${error || 'timeout'}) after ${((Date.now() - t0) / 1000).toFixed(0)} s`;
+  }
   return `in-core: first frame ${m.ttff_ms.toFixed(0)} ms, all geometry ${m.geometry_ms.toFixed(0)} ms; ` +
     `worker parse peak ${mb(m.parse_heap_bytes)}, main heap ${mb(m.wasm_heap_bytes)}`;
 }
@@ -48,8 +60,8 @@ async function settle(page) {
   let last = '', stable = 0;
   for (let i = 0; i < 600; i++) {
     const p = await page.evaluate(() => JSON.parse(window.__fluideda_perf));
-    const sig = `${p.uploaded}/${p.in_flight}/${p.stream_fetched}`;
-    if (p.in_flight === 0 && sig === last) { if (++stable >= 5) return p; } else stable = 0;
+    const sig = `${p.uploaded}/${p.in_flight}/${p.stream_fetched}/${p.p_fetched}`;
+    if (p.in_flight === 0 && !p.p_in_flight && sig === last) { if (++stable >= 5) return p; } else stable = 0;
     last = sig;
     await sleep(100);
   }
@@ -68,10 +80,12 @@ async function streamed(browser, hash) {
   await page.waitForFunction(() => !window.__fluideda_cmd);
   const leaf = await settle(page);
   await page.context().close();
-  return `streamed: first frame ${m.ttff_ms.toFixed(0)} ms (skeleton ${mb(fit.stream_skeleton_bytes)}, pack fetch ${fit.stream_pack_ms.toFixed(0)} ms); ` +
-    `fit: ${fit.stream_fetched} chunks ${mb(fit.stream_fetched_bytes)} fetched, ${fit.stream_dense} dense; ` +
-    `leaf: ${leaf.stream_fetched - fit.stream_fetched} more (${mb(leaf.stream_fetched_bytes - fit.stream_fetched_bytes)}); ` +
-    `of ${mb(fit.stream_geometry_bytes)} geometry; main heap ${mb(leaf.wasm_heap)}, GPU ${mb(leaf.gpu_bytes)}`;
+  return `streamed: first frame ${m.ttff_ms.toFixed(0)} ms (cell table ${(fit.stream_skeleton_bytes / 1e3).toFixed(0)} KB, pack fetch ${fit.stream_pack_ms.toFixed(0)} ms); ` +
+    `fit: ${fit.stream_fetched} chunks ${mb(fit.stream_fetched_bytes)} + ${fit.p_fetched} placement chunks fetched, ` +
+    `${fit.stream_dense} + ${fit.dense_inst} dense, cull ${fit.cull_ms.toFixed(2)} ms, heap ${mb(fit.wasm_heap)}; ` +
+    `leaf: ${leaf.stream_fetched - fit.stream_fetched} more (${mb(leaf.stream_fetched_bytes - fit.stream_fetched_bytes)}) + ` +
+    `${leaf.p_fetched - fit.p_fetched} placement chunks; of ${mb(fit.stream_geometry_bytes)} geometry; ` +
+    `main heap ${mb(leaf.wasm_heap)}, GPU ${mb(leaf.gpu_bytes)}`;
 }
 
 const browser = await launch();

@@ -1076,6 +1076,7 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
                 (get_str(&b, "hash").unwrap_or_default(), get_f64(&b, "bytes"))
             };
             let ((sk, sk_bytes), (geo, geo_bytes), (ix, _)) = (blob("skeleton"), blob("geometry"), blob("index"));
+            let ((pl, _), (pix, _)) = (blob("placements"), blob("placement_index"));
             let bytes_of = |h: String| async move {
                 let u = format!("/blobs/{h}");
                 let r = http(&u, "GET", None).await?;
@@ -1089,6 +1090,8 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
             };
             let skeleton = bytes_of(sk).await?;
             let offsets = fluideda_core::pack::parse_index(&bytes_of(ix).await?).map_err(|e| e.to_string())?;
+            let placement_offsets =
+                fluideda_core::pack::parse_index(&bytes_of(pix).await?).map_err(|e| e.to_string())?;
             let bbox = js_sys::Array::from(&get_val(&m, "world_bbox"));
             let layers = js_sys::Array::from(&get_val(&m, "layers"));
             let hash_slot: crate::design::HashSlot = Rc::new(RefCell::new(Some((hash.clone(), 0.0))));
@@ -1109,6 +1112,8 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
                 stream: Some(crate::design::StreamInfo {
                     geometry_url: format!("/blobs/{geo}"),
                     offsets,
+                    placements_url: format!("/blobs/{pl}"),
+                    placement_offsets,
                     geometry_bytes: geo_bytes as u64,
                     skeleton_bytes: sk_bytes as u64,
                     fetch_ms: js_sys::Date::now() - t0,
@@ -1123,3 +1128,77 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_pack(_hash: String, _name: String, _slot: DesignSlot) {}
+
+/// A placement chunk of a streamed design, arrived (Phase 7.3 SLICE B).
+pub struct PlacementReply {
+    pub cell: usize,
+    pub chunk: u32,
+    /// The stream it was asked for (a reply for a replaced design is dropped).
+    pub gen: u32,
+    pub result: Result<Vec<fluideda_core::Instance>, String>,
+    pub bytes: usize,
+    pub ms: f64,
+}
+
+pub type PlacementSlot = Rc<RefCell<Vec<PlacementReply>>>;
+
+/// Fetch placement chunk `(cell, chunk)` — bytes `start..end` of the pack's
+/// placements blob — and decode it into `slot`. On the main thread: a record
+/// is ~100 KB and decodes in well under a millisecond.
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_placements(url: String, start: u64, end: u64, cell: usize, chunk: u32, gen: u32, cell_count: usize, slot: PlacementSlot) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let t0 = js_sys::Date::now();
+        let result = async {
+            let win = web_sys::window().ok_or("no window")?;
+            let init = web_sys::RequestInit::new();
+            let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+            headers.set("Range", &format!("bytes={start}-{}", end - 1)).map_err(|e| format!("{e:?}"))?;
+            init.set_headers(&headers);
+            let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
+            let resp: web_sys::Response = {
+                use wasm_bindgen::JsCast;
+                wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&req))
+                    .await
+                    .map_err(|e| format!("GET {url}: {e:?}"))?
+                    .dyn_into()
+                    .map_err(|_| "not a Response".to_string())?
+            };
+            if resp.status() != 206 && resp.status() != 200 {
+                return Err(format!("GET {url}: HTTP {}", resp.status()));
+            }
+            let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("GET {url}: {e:?}"))?;
+            let mut bytes = js_sys::Uint8Array::new(&buf).to_vec();
+            if resp.status() == 200 {
+                // The server ignored Range: cut the record out.
+                bytes = bytes.get(start as usize..end as usize).ok_or("short placements blob")?.to_vec();
+            }
+            let insts = fluideda_core::serialize::decode_instances(&bytes, cell_count).map_err(|e| e.to_string())?;
+            Ok::<_, String>((insts, bytes.len()))
+        }
+        .await;
+        let ms = js_sys::Date::now() - t0;
+        let (result, bytes) = match result {
+            Ok((insts, n)) => (Ok(insts), n),
+            Err(e) => (Err(e), 0),
+        };
+        slot.borrow_mut().push(PlacementReply { cell, chunk, gen, result, bytes, ms });
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_placements(
+    _url: String,
+    _start: u64,
+    _end: u64,
+    _cell: usize,
+    _chunk: u32,
+    _gen: u32,
+    _cell_count: usize,
+    _slot: PlacementSlot,
+) {
+}

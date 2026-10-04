@@ -2,7 +2,8 @@
 
 **Status: in progress on `phase7`.** The owner moved 7.3 (stream the
 hierarchy) to the front. It runs as three slices: **A** placement chunks in
-the core, **B** streaming the hierarchy (pack v3), **C** coloured proxies.
+the core (done), **B** streaming the hierarchy, pack v3 (done), **C**
+coloured proxies.
 
 ## 7.3 SLICE A — placement chunks
 
@@ -63,3 +64,68 @@ this is ~9–10 ms of main-thread time saved on every mid and leaf frame.
 cull in wasm: 553,551 placements each become a proxy box. Slice B's density
 rule (one proxy per dense placement chunk) removes that for streamed
 designs; applying it in-core is the obvious first step of 7.6.
+
+## 7.3 SLICE B — streaming the hierarchy (pack v3)
+
+**Problem.** A streamed design still downloaded every cell's full placement
+list before its first frame: caravel's 25 MB skeleton (460 k placements) became
+180 MB of browser heap. A design with tens of millions of placements could not
+stream at all.
+
+**Design.**
+- **Pack v3.** The skeleton becomes a *cell table* (format v3): a cell with
+  more than 512 placements lists only their count and its placement chunk
+  table. Its placements are one record per placement chunk in a *placements*
+  blob, with a byte-offset *placement index*. Small cells stay inline, so the
+  hierarchy costs no round trips except where it is big.
+- **Remote cells.** `Cell::remote` holds the placement chunks that have
+  arrived. The cull walks a remote cell a chunk at a time:
+  - a chunk whose placements would average under `min_pixel` across draws as
+    one proxy, resident or not — so a zoomed-out view's work is bounded by
+    the screen, not the placement count;
+  - a visible chunk that has not arrived draws as a proxy and is reported in
+    `placements_wanted`;
+  - a resident one is walked like in-core placements and reported in
+    `placements_used`.
+- **Residency (app).** Placement chunks are fetched on the main thread by byte
+  range (a record is ~100 KB and decodes in well under a millisecond), at most
+  16 in flight. Arrivals are slotted into their cells, and the least recently
+  walked chunks are evicted over 64 MB (`?placement_budget=`).
+- The skeleton format bump (v3: a per-cell inline/remote flag) is internal;
+  shape and placement numbering are unchanged from SLICE A.
+- In-core placement sorting now permutes in place (a 50 M-placement list is
+  5 GB; copying it would double the parse peak).
+
+**Correctness.**
+- Core test: a 20 k-placement cell, streamed, culls exactly like in-core once
+  its wanted chunks arrive; zoomed out it draws one proxy per chunk and
+  visits under a tenth of the nodes.
+- `stream_test`: eight views now, four of them on the densest placement
+  chunks of the remote lists (caravel_core, housekeeping, RAM128,
+  caravel_clocking): **0 pixels** differ from in-core at all eight.
+- Under a 1 MB placement budget, cycling the remote views evicts 20 placement
+  chunks; the first view re-fetches its placements and matches pixel for
+  pixel.
+- The shape-chunk residency test and the two-browser sync test still pass.
+
+**Measured** (`outofcore_bench.mjs`, WebGPU, headless; packs cached):
+
+| design | cell table | streamed first frame | streamed main heap (fit · leaf) | fit cull | in-core |
+|---|--:|--:|--:|--:|---|
+| caravel (460 k placements) | **430 KB** (was a 25 MB skeleton) | 87 ms | **16 MB** · 16 MB (was 180 MB) | 2.7 ms (in-core 17.5) | 1.7 s first frame, 309 MB + 1.1 GB worker |
+| flat_11M | 18 KB | 81 ms | 6 MB · 6 MB | 0.13 ms | 3.9 s, 534 MB + 2.2 GB worker |
+| flat_32M | 25 KB | 77 ms | 6 MB · 8 MB | 0.15 ms | fails (allocation panic) |
+| **place_50M** (50 M placements) | 394 KB | **92 ms** | **8 MB · 9 MB** | 0.45 ms | **fails** (wasm abort after 4 s) |
+
+- **place_50M** (`scripts/gen_placements.py 50`): a 1.3 GB GDS whose size is
+  its placements — a TOP with 50 M standard-cell placements in rows, 350 M
+  shapes flattened. Server pack build: 39 s (parse 18 s), peak RSS 5.0 GB;
+  2.65 GB of placement records in 16,384 chunks. At fit the browser draws
+  16,384 placement-chunk proxies and fetches nothing; a leaf view fetches 4
+  placement chunks and 4 shape chunks.
+- caravel at fit: 32,053 proxies (in-core: 553,551) and 5 placement chunks
+  fetched.
+- Fixed in the bench: it reported the embedded sample's metrics as a
+  successful in-core load when the worker died with a bare wasm trap
+  (`unreachable`). It now treats traps as failures and requires the big
+  file's metrics.

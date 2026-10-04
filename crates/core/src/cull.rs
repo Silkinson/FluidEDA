@@ -13,7 +13,7 @@
 //! visible def, feeding a single instanced draw of that cell's mesh.
 
 use crate::chunk::ChunkId;
-use crate::db::{CellDb, CellId, InstanceKind};
+use crate::db::{Cell, CellDb, CellId, Instance, InstanceKind, RemotePlacements};
 use crate::edit::{EditOverlay, Shape};
 use crate::transform::{Bboxf, Transform};
 use crate::types::Bbox;
@@ -52,6 +52,11 @@ pub struct VisibleSet {
     /// the base by the renderer; the base half of every move is suppressed via
     /// [`CellDraw::dirty`], so nothing double-draws.
     pub overlay: Vec<Shape>,
+    /// Streamed designs (Phase 7.3 SLICE B): placement chunks on screen that
+    /// have not arrived (drawn as proxies until they do) …
+    pub placements_wanted: Vec<(CellId, u32)>,
+    /// … and resident ones walked this frame (their residency's "last used").
+    pub placements_used: Vec<(CellId, u32)>,
     pub stats: CullStats,
 }
 
@@ -72,6 +77,8 @@ pub struct CullStats {
     /// Placement chunks skipped whole because their footprint missed the view
     /// (Phase 7.3).
     pub inst_chunks_skipped: u64,
+    /// Streamed cells' placement chunks drawn as one proxy for density.
+    pub dense_inst_chunks: u64,
 }
 
 /// Cull the design against a world-space viewport.
@@ -337,6 +344,10 @@ impl CullCtx<'_> {
         // Phase 5d: placements hidden by "edit this placement only" are skipped
         // (their geometry is drawn as the parent's added shapes instead).
         let hides = self.overlay.is_some_and(|o| o.hides_in(id));
+        if let Some(remote) = &cell.remote {
+            self.walk_remote(id, cell, remote, world_tf, hides);
+            return;
+        }
         let chunk_view =
             (cell.inst_chunks.len() > 1 && self.grown.is_empty()).then(|| world_tf.inverse().apply_bboxf(&self.view));
         for ch in &cell.inst_chunks {
@@ -345,15 +356,50 @@ impl CullCtx<'_> {
                 continue;
             }
             for ii in ch.start as usize..ch.end as usize {
-                self.descend(id, ii, world_tf, hides);
+                self.descend(id, ii, cell.instances[ii], world_tf, hides);
             }
         }
     }
 
-    /// Walk placement `ii` of cell `id` (`world_tf` = the cell's own world
-    /// transform).
-    fn descend(&mut self, id: CellId, ii: usize, world_tf: Transform, hides: bool) {
-        let inst = self.db.cell(id).instances[ii];
+    /// The placements of a streamed cell (Phase 7.3 SLICE B), a placement
+    /// chunk at a time. A chunk whose placements would average under
+    /// `min_pixel` across draws as one proxy, resident or not — so the work
+    /// at a zoomed-out view is bounded by the screen, not the placement
+    /// count. A visible chunk that has not arrived draws as a proxy and is
+    /// asked for (`placements_wanted`); a resident one is walked like
+    /// in-core placements and reported in `placements_used`.
+    fn walk_remote(&mut self, id: CellId, cell: &Cell, remote: &RemotePlacements, world_tf: Transform, hides: bool) {
+        let local_view = world_tf.inverse().apply_bboxf(&self.view);
+        for (ci, ch) in cell.inst_chunks.iter().enumerate() {
+            if !bbox_intersects(&ch.bbox, &local_view) {
+                self.set.stats.inst_chunks_skipped += 1;
+                continue;
+            }
+            let wb = world_tf.apply_bbox(&ch.bbox);
+            let px = (wb.width() * self.px_per_nm).max(1.0) * (wb.height() * self.px_per_nm).max(1.0);
+            if px < ch.len() as f64 * self.min_pixel * self.min_pixel {
+                self.set.proxies.push(clip(&wb, &self.view));
+                self.set.stats.dense_inst_chunks += 1;
+                continue;
+            }
+            match remote.chunks.get(ci) {
+                Some(Some(insts)) => {
+                    self.set.placements_used.push((id, ci as u32));
+                    for (k, &inst) in insts.iter().enumerate() {
+                        self.descend(id, ch.start as usize + k, inst, world_tf, hides);
+                    }
+                }
+                _ => {
+                    self.set.proxies.push(clip(&wb, &self.view));
+                    self.set.placements_wanted.push((id, ci as u32));
+                }
+            }
+        }
+    }
+
+    /// Walk placement `inst` (number `ii`) of cell `id` (`world_tf` = the
+    /// cell's own world transform).
+    fn descend(&mut self, id: CellId, ii: usize, inst: Instance, world_tf: Transform, hides: bool) {
         match inst.kind {
             InstanceKind::Single => {
                 if hides && self.overlay.is_some_and(|o| o.is_hidden((id, ii as u32, 0, 0))) {

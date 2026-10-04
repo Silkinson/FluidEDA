@@ -48,6 +48,11 @@ const STREAM_MAX_IN_FLIGHT: usize = 32;
 const STREAM_BUDGET_BYTES: usize = 384 << 20;
 /// Streaming: seconds before a failed chunk fetch is retried.
 const STREAM_RETRY_S: f64 = 2.0;
+/// Streaming (Phase 7.3 SLICE B): placement-chunk fetches in flight at once.
+const STREAM_PLACEMENTS_IN_FLIGHT: usize = 16;
+/// Streaming: resident placements kept before the least recently walked
+/// placement chunks are evicted. `?placement_budget=<MB>` overrides it.
+const STREAM_PLACEMENT_BUDGET: usize = 64 << 20;
 
 /// Drawing grid (Phase 5 SLICE 1): every authored coordinate snaps to this many
 /// nm. Small enough to be invisible at any sane zoom, big enough that a drawn
@@ -84,6 +89,28 @@ struct Stream {
     stale: usize,
     /// GPU bytes kept before evicting.
     budget: usize,
+
+    // Placement chunks (Phase 7.3 SLICE B): the remote cells' placements.
+    /// First placement-chunk number of each cell (`pack::inst_chunk_base`).
+    inst_base: Vec<u32>,
+    /// Arrivals land here (main-thread fetches).
+    placements: webio::PlacementSlot,
+    /// This stream's id: a reply for a replaced design is dropped.
+    gen: u32,
+    p_inflight: HashSet<(CellId, u32)>,
+    p_retry_at: HashMap<(CellId, u32), f64>,
+    /// Frame each resident placement chunk was last walked in, and its size.
+    p_last_used: HashMap<(CellId, u32), u64>,
+    p_bytes: HashMap<(CellId, u32), usize>,
+    p_resident_bytes: usize,
+    p_budget: usize,
+    p_fetched: usize,
+    p_fetched_bytes: usize,
+    p_fetch_ms: f64,
+    p_evicted: usize,
+    p_failures: usize,
+    /// Placement chunks the last cull asked for.
+    p_wanted: usize,
 }
 
 impl Stream {
@@ -104,6 +131,26 @@ impl Stream {
             budget: webio::query_param("stream_budget")
                 .and_then(|mb| mb.parse::<usize>().ok())
                 .map_or(STREAM_BUDGET_BYTES, |mb| mb << 20),
+            inst_base: fluideda_core::pack::inst_chunk_base(db),
+            placements: Rc::new(RefCell::new(Vec::new())),
+            gen: {
+                static GEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+                GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
+            p_inflight: HashSet::new(),
+            p_retry_at: HashMap::new(),
+            p_last_used: HashMap::new(),
+            p_bytes: HashMap::new(),
+            p_resident_bytes: 0,
+            p_budget: webio::query_param("placement_budget")
+                .and_then(|mb| mb.parse::<usize>().ok())
+                .map_or(STREAM_PLACEMENT_BUDGET, |mb| mb << 20),
+            p_fetched: 0,
+            p_fetched_bytes: 0,
+            p_fetch_ms: 0.0,
+            p_evicted: 0,
+            p_failures: 0,
+            p_wanted: 0,
         }
     }
 
@@ -1524,6 +1571,7 @@ impl FluidApp {
         let visible = self.visible.clone();
 
         if self.stream.is_some() {
+            self.stream_placements(&visible);
             self.stream_chunks(renderer, &visible);
             self.gpu_bytes = renderer.uploaded_bytes();
             self.draw_calls = renderer.draw_calls();
@@ -1615,12 +1663,106 @@ impl FluidApp {
         self.draw_calls = renderer.draw_calls();
     }
 
+    /// Placement residency, once per frame, before the shape chunks (Phase
+    /// 7.3 SLICE B): install arrived placement chunks into their cells (the
+    /// next cull walks them), mark the ones the cull walked as used, request
+    /// the ones it asked for, and evict the least recently walked over budget.
+    fn stream_placements(&mut self, visible: &VisibleSet) {
+        let Some(st) = self.stream.as_mut() else { return };
+        st.frame += 1;
+        let now = self.last_frame;
+        let replies: Vec<webio::PlacementReply> = std::mem::take(&mut *st.placements.borrow_mut());
+        for r in replies {
+            if r.gen != st.gen {
+                continue; // asked for by a design that has since been replaced
+            }
+            let key = (r.cell, r.chunk);
+            st.p_inflight.remove(&key);
+            match r.result {
+                Ok(insts) => {
+                    let bytes = insts.len() * std::mem::size_of::<fluideda_core::Instance>();
+                    let slot = self
+                        .db
+                        .cells
+                        .get_mut(r.cell)
+                        .and_then(|c| c.remote.as_mut())
+                        .and_then(|rm| rm.chunks.get_mut(r.chunk as usize));
+                    if let Some(slot) = slot {
+                        if slot.is_none() {
+                            st.p_resident_bytes += bytes;
+                            st.p_bytes.insert(key, bytes);
+                        }
+                        *slot = Some(insts);
+                        st.p_last_used.insert(key, st.frame);
+                        st.p_fetched += 1;
+                        st.p_fetched_bytes += r.bytes;
+                        st.p_fetch_ms += r.ms;
+                        st.p_retry_at.remove(&key);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("placement chunk {key:?}: {e}");
+                    st.p_failures += 1;
+                    st.p_retry_at.insert(key, now + STREAM_RETRY_S);
+                }
+            }
+        }
+        for &key in &visible.placements_used {
+            st.p_last_used.insert(key, st.frame);
+        }
+        st.p_wanted = visible.placements_wanted.len();
+        for &key in &visible.placements_wanted {
+            if st.p_inflight.len() >= STREAM_PLACEMENTS_IN_FLIGHT {
+                break;
+            }
+            if st.p_inflight.contains(&key) || st.p_retry_at.get(&key).is_some_and(|&t| now < t) {
+                continue;
+            }
+            let resident = self.db.cells[key.0].remote.as_ref().and_then(|r| r.chunks.get(key.1 as usize)).is_some_and(|c| c.is_some());
+            if resident {
+                continue; // arrived after this frame's cull
+            }
+            let k = (st.inst_base[key.0] + key.1) as usize;
+            let (start, end) = (st.info.placement_offsets[k], st.info.placement_offsets[k + 1]);
+            if start == end {
+                continue;
+            }
+            webio::fetch_placements(
+                st.info.placements_url.clone(),
+                start,
+                end,
+                key.0,
+                key.1,
+                st.gen,
+                self.db.cells.len(),
+                st.placements.clone(),
+            );
+            st.p_inflight.insert(key);
+        }
+        // Over budget: drop the least recently walked (never this frame's).
+        if st.p_resident_bytes > st.p_budget {
+            let mut old: Vec<(u64, (CellId, u32))> =
+                st.p_last_used.iter().filter(|(_, &f)| f < st.frame).map(|(&k, &f)| (f, k)).collect();
+            old.sort_unstable();
+            for (_, key) in old {
+                if st.p_resident_bytes <= st.p_budget * 9 / 10 {
+                    break;
+                }
+                if let Some(rm) = self.db.cells[key.0].remote.as_mut() {
+                    rm.chunks[key.1 as usize] = None;
+                }
+                st.p_resident_bytes -= st.p_bytes.remove(&key).unwrap_or(0);
+                st.p_last_used.remove(&key);
+                st.p_evicted += 1;
+            }
+        }
+    }
+
     /// Streaming residency, once per frame (Phase 6 SLICE 3): fetch the chunks
     /// on screen that are not too dense for their size, and evict the least
     /// recently drawn ones once the GPU budget is exceeded.
     fn stream_chunks(&mut self, renderer: &mut fluideda_render::HierRenderer, visible: &VisibleSet) {
         let Some(st) = self.stream.as_mut() else { return };
-        st.frame += 1;
         st.dense = 0;
         let scale = self.camera.scale as f64; // px per nm
         let now = self.last_frame;
@@ -1864,7 +2006,9 @@ impl FluidApp {
              \"gpu_bytes\":{},\"streaming\":{},\"stream_fetched\":{},\"stream_fetched_bytes\":{},\
              \"stream_fetch_ms\":{:.1},\"stream_evicted\":{},\"stream_failures\":{},\"stream_dense\":{},\
              \"stream_skeleton_bytes\":{},\"stream_geometry_bytes\":{},\"stream_pack_ms\":{:.1},\"wasm_heap\":{},\
-             \"stream_stale\":{},\"instances\":{},\"cull_ms\":{:.3},\"cull_max_ms\":{:.2},\"nodes_visited\":{}}}",
+             \"stream_stale\":{},\"instances\":{},\"cull_ms\":{:.3},\"cull_max_ms\":{:.2},\"nodes_visited\":{},\
+             \"p_fetched\":{},\"p_fetched_bytes\":{},\"p_fetch_ms\":{:.1},\"p_resident\":{},\"p_resident_bytes\":{},\
+             \"p_evicted\":{},\"p_in_flight\":{},\"p_wanted\":{},\"p_failures\":{},\"dense_inst\":{},\"proxies\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -1909,6 +2053,17 @@ impl FluidApp {
             self.cull_ms,
             self.cull_max_ms,
             self.cull_stats.nodes_visited,
+            self.stream.as_ref().map_or(0, |s| s.p_fetched),
+            self.stream.as_ref().map_or(0, |s| s.p_fetched_bytes),
+            self.stream.as_ref().map_or(0.0, |s| s.p_fetch_ms),
+            self.stream.as_ref().map_or(0, |s| s.p_last_used.len()),
+            self.stream.as_ref().map_or(0, |s| s.p_resident_bytes),
+            self.stream.as_ref().map_or(0, |s| s.p_evicted),
+            self.stream.as_ref().map_or(0, |s| s.p_inflight.len()),
+            self.stream.as_ref().map_or(0, |s| s.p_wanted),
+            self.stream.as_ref().map_or(0, |s| s.p_failures),
+            self.cull_stats.dense_inst_chunks,
+            self.visible.proxies.len(),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -2895,6 +3050,13 @@ impl FluidApp {
                     st.fetched_bytes / 1_048_576,
                     st.evicted,
                     st.dense
+                ));
+                ui.small(format!(
+                    "placements: {} chunks resident ({} MB) · fetched {} · evicted {}",
+                    st.p_last_used.len(),
+                    st.p_resident_bytes / 1_048_576,
+                    st.p_fetched,
+                    st.p_evicted
                 ));
             }
             ui.add_enabled(self.stream.is_none(), egui::Checkbox::new(&mut self.edit_mode, "Edit mode (click to select)"));

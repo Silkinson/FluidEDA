@@ -46,6 +46,7 @@ web-sys = { version = "0.3", features = [
     "HtmlAnchorElement",
     "Request",
     "RequestInit",
+    "Headers",
     "RequestMode",
     "Response",
     # Phase 2b STEP 2 — off-main-thread parse worker.

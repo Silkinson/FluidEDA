@@ -38,7 +38,9 @@ use anyhow::{bail, Result};
 
 const MAGIC: u32 = u32::from_le_bytes(*b"FEDB");
 /// 2: each cell also carries its placement chunk table (Phase 7.3).
-const VERSION: u32 = 2;
+/// 3: a cell's instances are inline, or *remote* — only counted here, and
+/// fetched by placement chunk (a streamed design, Phase 7.3 SLICE B).
+const VERSION: u32 = 3;
 
 /// A serialized `CellDb`: three Pod columns (transferred as typed arrays) plus a
 /// metadata blob. Field order mirrors what the worker hands to `postMessage`.
@@ -61,12 +63,16 @@ pub fn serialize(db: &CellDb) -> DbColumns {
     let mut coords = Vec::new();
     let mut starts = Vec::new();
     let mut layers = Vec::new();
-    let meta = write_meta(db, |cell| {
-        let (c, s, l) = cell.shapes.columns();
-        coords.extend_from_slice(c);
-        starts.extend(s.iter().copied());
-        layers.extend(l.iter().map(|&lay| pack_layer(lay)));
-    });
+    let meta = write_meta(
+        db,
+        |cell| {
+            let (c, s, l) = cell.shapes.columns();
+            coords.extend_from_slice(c);
+            starts.extend(s.iter().copied());
+            layers.extend(l.iter().map(|&lay| pack_layer(lay)));
+        },
+        |_| true,
+    );
     DbColumns { coords, starts, layers, meta }
 }
 
@@ -74,12 +80,84 @@ pub fn serialize(db: &CellDb) -> DbColumns {
 /// (Phase 6 SLICE 3: a design pack's skeleton; its geometry is laid out per
 /// chunk instead, see [`crate::pack`]).
 pub fn skeleton_meta(db: &CellDb) -> Vec<u8> {
-    write_meta(db, |_| {})
+    write_meta(db, |_| {}, |_| true)
+}
+
+/// The skeleton of a streamed design (Phase 7.3 SLICE B): like
+/// [`skeleton_meta`], but a cell with more than `inline_max` instances lists
+/// only their count — its placements are fetched by placement chunk
+/// ([`encode_instances`] records, see [`crate::pack`]).
+pub fn cell_table_meta(db: &CellDb, inline_max: usize) -> Vec<u8> {
+    write_meta(db, |_| {}, |cell| cell.instances.len() <= inline_max)
+}
+
+/// A run of instances as a self-contained record: `[n u32]` then `n`
+/// instances in the metadata blob's encoding (a placement chunk of a
+/// streamed design).
+pub fn encode_instances(insts: &[Instance]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(insts.len() as u32);
+    for inst in insts {
+        write_instance(&mut w, inst);
+    }
+    w.into_vec()
+}
+
+/// The inverse of [`encode_instances`]; every child id must be below
+/// `cell_count`.
+pub fn decode_instances(bytes: &[u8], cell_count: usize) -> Result<Vec<Instance>> {
+    let mut r = Reader::new(bytes);
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n.min(bytes.len() / 57 + 1));
+    for _ in 0..n {
+        out.push(read_instance(&mut r, cell_count)?);
+    }
+    if r.pos != bytes.len() {
+        bail!("placement record: {} trailing bytes", bytes.len() - r.pos);
+    }
+    Ok(out)
+}
+
+fn write_instance(w: &mut Writer, inst: &Instance) {
+    w.u32(inst.child as u32);
+    w.transform(&inst.transform);
+    match inst.kind {
+        InstanceKind::Single => w.u8(0),
+        InstanceKind::Array { cols, rows, col_step, row_step } => {
+            w.u8(1);
+            w.i32(cols);
+            w.i32(rows);
+            w.f64(col_step[0]);
+            w.f64(col_step[1]);
+            w.f64(row_step[0]);
+            w.f64(row_step[1]);
+        }
+    }
+}
+
+fn read_instance(r: &mut Reader, cell_count: usize) -> Result<Instance> {
+    let child = r.u32()? as CellId;
+    let transform = r.transform()?;
+    let kind = match r.u8()? {
+        0 => InstanceKind::Single,
+        1 => InstanceKind::Array {
+            cols: r.i32()?,
+            rows: r.i32()?,
+            col_step: [r.f64()?, r.f64()?],
+            row_step: [r.f64()?, r.f64()?],
+        },
+        t => bail!("bad instance kind tag {t}"),
+    };
+    if child >= cell_count {
+        bail!("CellDb blob: instance of unknown cell {child}");
+    }
+    Ok(Instance { child, transform, kind })
 }
 
 /// The metadata blob, calling `columns` on each cell in order (where
-/// [`serialize`] concatenates the geometry columns).
-fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell)) -> Vec<u8> {
+/// [`serialize`] concatenates the geometry columns); `inline` says whether a
+/// cell's instances are written out or only counted.
+fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell), inline: impl Fn(&Cell) -> bool) -> Vec<u8> {
     let mut meta = Writer::new();
 
     meta.u32(MAGIC);
@@ -98,23 +176,15 @@ fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell)) -> Vec<u8> {
         meta.u32(cell.name.len() as u32);
         meta.bytes(cell.name.as_bytes());
 
-        // Instances.
+        // Instances: written out, or only counted (remote — Phase 7.3).
         meta.u32(cell.instances.len() as u32);
-        for inst in &cell.instances {
-            meta.u32(inst.child as u32);
-            meta.transform(&inst.transform);
-            match inst.kind {
-                InstanceKind::Single => meta.u8(0),
-                InstanceKind::Array { cols, rows, col_step, row_step } => {
-                    meta.u8(1);
-                    meta.i32(cols);
-                    meta.i32(rows);
-                    meta.f64(col_step[0]);
-                    meta.f64(col_step[1]);
-                    meta.f64(row_step[0]);
-                    meta.f64(row_step[1]);
-                }
+        if inline(cell) {
+            meta.u8(0);
+            for inst in &cell.instances {
+                write_instance(&mut meta, inst);
             }
+        } else {
+            meta.u8(1);
         }
 
         // Chunk tables: shapes, then placements (Phase 7.3).
@@ -284,28 +354,24 @@ impl SkeletonParse {
             let name_len = r.u32()? as usize;
             let name = String::from_utf8(r.bytes(name_len)?.to_vec())?;
             let n_inst = r.u32()? as usize;
-            let mut instances = Vec::with_capacity(n_inst);
-            for _ in 0..n_inst {
-                let child = r.u32()? as CellId;
-                let transform = r.transform()?;
-                let kind = match r.u8()? {
-                    0 => InstanceKind::Single,
-                    1 => InstanceKind::Array {
-                        cols: r.i32()?,
-                        rows: r.i32()?,
-                        col_step: [r.f64()?, r.f64()?],
-                        row_step: [r.f64()?, r.f64()?],
-                    },
-                    t => bail!("bad instance kind tag {t}"),
-                };
-                if child >= self.cell_count {
-                    bail!("CellDb blob: instance of unknown cell {child}");
+            let remote = match r.u8()? {
+                0 => false,
+                1 => true,
+                t => bail!("bad instance list tag {t}"),
+            };
+            let mut instances = Vec::with_capacity(if remote { 0 } else { n_inst.min(self.meta.len() / 57 + 1) });
+            if !remote {
+                for _ in 0..n_inst {
+                    instances.push(read_instance(&mut r, self.cell_count)?);
                 }
-                instances.push(Instance { child, transform, kind });
             }
             let chunks = read_chunks(&mut r, n_shapes)?;
             let inst_chunks = read_chunks(&mut r, n_inst)?;
-            self.cells.push(Cell::from_parts(name, ShapeStore::new(), instances, chunks, inst_chunks));
+            let mut cell = Cell::from_parts(name, ShapeStore::new(), instances, chunks, inst_chunks);
+            if remote {
+                cell.make_remote();
+            }
+            self.cells.push(cell);
         }
         self.pos = r.pos;
         Ok(true)

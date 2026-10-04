@@ -27,6 +27,14 @@ front.
   per-frame cull in the browser drops **10.0 → 0.73 ms at mid** and
   **9.7 → 0.37 ms at leaf**; fit is unchanged. Placement numbering changed
   (`SHAPE_ID_SCHEME` 3, `PACK_VERSION` 2).
+* **7.3 SLICE B — streaming the hierarchy (pack v3).** Big placement lists
+  are remote: a cell table (caravel 430 KB, was a 25 MB skeleton) plus
+  placement-chunk records fetched as the view needs them, evicted LRU over a
+  budget. Dense placement chunks draw as one proxy, so fit-view work is
+  bounded by the screen. Streamed caravel: **16 MB** heap at fit (was 180 MB),
+  still 0 pixels off in-core at eight views. A generated **50 M-placement**
+  design (1.3 GB GDS) opens streamed in 92 ms with a 9 MB heap; in-core it
+  fails.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -216,7 +224,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
-| 7 — scale + collaboration | `phase7` | ◑ 7.3 SLICE A done | 7.3 first (owner's order). SLICE A: placement chunks — caravel's in-browser cull at mid 10.0 → 0.73 ms/frame, leaf 9.7 → 0.37 ms/frame, output identical. Next: stream the hierarchy (pack v3), coloured proxies |
+| 7 — scale + collaboration | `phase7` | ◑ 7.3 SLICES A–B done | 7.3 first (owner's order). SLICE A: placement chunks — caravel's in-browser cull at mid 10.0 → 0.73 ms/frame, leaf 9.7 → 0.37 ms/frame, output identical. SLICE B: pack v3 streams the hierarchy — streamed caravel heap 180 → 16 MB; a 50 M-placement design that fails in-core opens streamed (9 MB). Next: coloured proxies |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -241,7 +249,8 @@ still byte-identical).
 | DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 | room link → design + edits (late joiner) | **1.41 s** | Phase 6 SLICE 2: `?room=` only — room lookup, caravel (291 MB) from the blob store, the room state from the server (first frame 998 ms; WebGPU, headless) |
-| largest design that opens | **2 GB / 32 M polygons, streamed** (in-core: fails) | Phase 6 SLICE 3: streamed, browser memory scales with the screen + hierarchy, not geometry — flat_32M main heap 8 MB, flat_11M 6 MB (in-core 534 MB + 2.2 GB worker peak) |
+| largest design that opens | **2 GB / 32 M polygons, or 50 M placements, streamed** (in-core: both fail) | Phase 7.3 SLICE B: the hierarchy streams too — a 50 M-placement design opens in 92 ms with a 9 MB heap |
+| out-of-core memory (Phase 6) | streamed heap 6–8 MB | Phase 6 SLICE 3: streamed, browser memory scales with the screen + hierarchy, not geometry — flat_32M main heap 8 MB, flat_11M 6 MB (in-core 534 MB + 2.2 GB worker peak) |
 | first frame, streamed | caravel **79 ms** / flat_32M 45 ms | skeleton + chunk index from the server's pack, then on-screen chunks by byte range (in-core caravel: 873 ms) |
 | reconnect after a server restart | ~0.5 s | first retry at 0.5 s (backoff doubles to 8 s); the room comes back from its WAL or snapshot and offline edits merge |
 
@@ -425,8 +434,9 @@ still byte-identical).
   out-of-core streaming from server-built packs — browser memory follows the
   screen and the hierarchy, not the geometry (a 2 GB / 32 M-polygon design that
   fails in-core opens with an 8 MB main heap). What remains is measured:
-  - the **skeleton is the new floor**: caravel's 460 k placements are 180 MB
-    of streamed heap, so a production SoC needs the hierarchy streamed too;
+  - ~~the skeleton is the new floor~~ **RESOLVED** (Phase 7.3 SLICE B):
+    big placement lists stream by chunk — caravel's streamed heap 180 → 16 MB,
+    and a 50 M-placement design opens in 9 MB;
   - streamed designs are **view-only** (no pick/edit/DRC/export/rooms);
     editing out of core needs chunk-level residency in the `ShapeStore`;
   - dense chunks draw as neutral proxies (a per-chunk layer summary could

@@ -31,9 +31,15 @@ pub struct Manifest {
     pub pack: u32,
     /// The shape-id scheme of the parser that built it.
     pub ids: u32,
+    /// The cell table (v3): the skeleton, with big placement lists remote.
     pub skeleton: BlobRef,
     pub geometry: BlobRef,
     pub index: BlobRef,
+    /// Placement records of the remote lists, and their byte offsets (v3).
+    pub placements: BlobRef,
+    pub placement_index: BlobRef,
+    /// Cells with more placements than this are remote.
+    pub inline_placements: usize,
     pub cells: usize,
     pub chunks: usize,
     /// Distinct polygons (shapes stored in cells).
@@ -58,7 +64,13 @@ pub fn ensure(store: &Store, design: &str) -> io::Result<Option<Manifest>> {
     let path = manifest_path(store, design);
     if let Ok(text) = fs::read_to_string(&path) {
         match serde_json::from_str::<Manifest>(&text) {
-            Ok(m) if [&m.skeleton, &m.geometry, &m.index].iter().all(|b| store.has_blob(&b.hash)) => return Ok(Some(m)),
+            Ok(m)
+                if [&m.skeleton, &m.geometry, &m.index, &m.placements, &m.placement_index]
+                    .iter()
+                    .all(|b| store.has_blob(&b.hash)) =>
+            {
+                return Ok(Some(m))
+            }
             _ => log::warn!("pack {}: cached manifest unusable; rebuilding", &design[..12]),
         }
     }
@@ -80,20 +92,16 @@ fn build(store: &Store, design: &str) -> io::Result<Manifest> {
     drop(bytes);
     let parse_ms = t0.elapsed().as_secs_f64() * 1e3;
 
-    let skeleton = fluideda_core::skeleton_meta(&db);
+    let skeleton = fluideda_core::serialize::cell_table_meta(&db, pack::INLINE_PLACEMENTS);
     let skeleton = BlobRef { bytes: skeleton.len() as u64, hash: store.put_blob(&skeleton)? };
 
-    // Geometry streams to a temp file through the hasher: never whole in memory.
-    let tmp = store.tmp_path();
-    let mut w = HashingWriter { out: BufWriter::with_capacity(1 << 20, File::create(&tmp)?), hash: Sha256::new(), n: 0 };
-    let offsets = pack::write_geometry(&db, &mut w)?;
-    let HashingWriter { out, hash, n } = w;
-    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-    let geometry = BlobRef { hash: hex(&hash.finalize()), bytes: n };
-    store.commit_blob(&tmp, &geometry.hash)?;
-
+    let (geometry, offsets) = write_streamed(store, |w| pack::write_geometry(&db, w))?;
     let index = pack::index_bytes(&offsets);
     let index = BlobRef { bytes: index.len() as u64, hash: store.put_blob(&index)? };
+
+    let (placements, p_offsets) = write_streamed(store, |w| pack::write_placements(&db, pack::INLINE_PLACEMENTS, w))?;
+    let placement_index = pack::index_bytes(&p_offsets);
+    let placement_index = BlobRef { bytes: placement_index.len() as u64, hash: store.put_blob(&placement_index)? };
 
     let wb = db.world_bbox();
     let m = Manifest {
@@ -103,6 +111,9 @@ fn build(store: &Store, design: &str) -> io::Result<Manifest> {
         skeleton,
         geometry,
         index,
+        placements,
+        placement_index,
+        inline_placements: pack::INLINE_PLACEMENTS,
         cells: db.cells.len(),
         chunks: offsets.len() - 1,
         shapes: db.cells.iter().map(|c| c.shapes.len() as u64).sum(),
@@ -112,7 +123,7 @@ fn build(store: &Store, design: &str) -> io::Result<Manifest> {
         build_ms: t0.elapsed().as_secs_f64() * 1e3,
     };
     log::info!(
-        "pack {}: {} cells, {} chunks, {} shapes; parse {:.0} ms, total {:.0} ms; skeleton {} B, geometry {} B",
+        "pack {}: {} cells, {} chunks, {} shapes; parse {:.0} ms, total {:.0} ms; cell table {} B, geometry {} B, placements {} B",
         &design[..12],
         m.cells,
         m.chunks,
@@ -120,9 +131,23 @@ fn build(store: &Store, design: &str) -> io::Result<Manifest> {
         parse_ms,
         m.build_ms,
         m.skeleton.bytes,
-        m.geometry.bytes
+        m.geometry.bytes,
+        m.placements.bytes
     );
     Ok(m)
+}
+
+/// Write a blob through `write` to a temp file while hashing it — never
+/// whole in memory — and store it. Returns the blob and what `write` returned.
+fn write_streamed<T>(store: &Store, write: impl FnOnce(&mut HashingWriter<BufWriter<File>>) -> io::Result<T>) -> io::Result<(BlobRef, T)> {
+    let tmp = store.tmp_path();
+    let mut w = HashingWriter { out: BufWriter::with_capacity(1 << 20, File::create(&tmp)?), hash: Sha256::new(), n: 0 };
+    let value = write(&mut w)?;
+    let HashingWriter { out, hash, n } = w;
+    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    let blob = BlobRef { hash: hex(&hash.finalize()), bytes: n };
+    store.commit_blob(&tmp, &blob.hash)?;
+    Ok((blob, value))
 }
 
 /// Writes through to `out` while hashing and counting.

@@ -40,9 +40,13 @@ async fn a_stored_design_becomes_a_streamable_pack() {
     assert_eq!((m.design.as_str(), m.cells, m.ids), (design.as_str(), db.cells.len(), fluideda_core::SHAPE_ID_SCHEME));
     assert_eq!(m.chunks as u32, *fluideda_core::pack::chunk_base(&db).last().unwrap());
 
-    // The skeleton is the design's metadata blob: it installs as-is.
+    // The skeleton is the design's cell table: it installs as-is.
     let (_, skeleton) = get(&hub, &format!("/blobs/{}", m.skeleton.hash), None).await;
-    assert_eq!(skeleton, fluideda_core::skeleton_meta(&db));
+    assert_eq!(skeleton, fluideda_core::serialize::cell_table_meta(&db, m.inline_placements));
+    let (_, p_index) = get(&hub, &format!("/blobs/{}", m.placement_index.hash), None).await;
+    let p_offsets = fluideda_core::pack::parse_index(&p_index).unwrap();
+    assert_eq!(p_offsets.len() as u32, *fluideda_core::pack::inst_chunk_base(&db).last().unwrap() + 1);
+    assert_eq!(*p_offsets.last().unwrap(), m.placements.bytes);
     let (_, index) = get(&hub, &format!("/blobs/{}", m.index.hash), None).await;
     let offsets = fluideda_core::pack::parse_index(&index).unwrap();
     assert_eq!(*offsets.last().unwrap(), m.geometry.bytes);

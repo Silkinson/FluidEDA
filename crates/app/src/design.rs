@@ -40,6 +40,11 @@ pub struct Design {
 pub struct StreamInfo {
     pub geometry_url: String,
     pub offsets: Vec<u64>,
+    /// Pack v3 (Phase 7.3 SLICE B): the remote placement lists' records —
+    /// placement chunk `k` is bytes `placement_offsets[k]..[k+1]`, `k`
+    /// numbered by `fluideda_core::pack::inst_chunk_base`.
+    pub placements_url: String,
+    pub placement_offsets: Vec<u64>,
     pub geometry_bytes: u64,
     pub skeleton_bytes: u64,
     /// Manifest + skeleton + index fetch, wall ms.
