@@ -80,7 +80,9 @@ pub fn flatten_hop(path: &[PlacementKey], counts: &[u64]) -> Option<usize> {
 /// were counted before giving up).
 pub fn flatten_placement(db: &CellDb, overlay: &EditOverlay, key: PlacementKey, limit: usize) -> Result<Vec<Shape>, usize> {
     let (parent, ii, c, r) = key;
-    let Some(inst) = db.cell(parent).instances.get(ii as usize) else { return Ok(Vec::new()) };
+    let Some(inst) = db.cell(parent).resident_instances().find(|&(i, _)| i == ii).map(|(_, inst)| inst) else {
+        return Ok(Vec::new());
+    };
     let in_range = match inst.kind {
         InstanceKind::Single => c == 0 && r == 0,
         InstanceKind::Array { cols, rows, .. } => (0..cols).contains(&c) && (0..rows).contains(&r),
@@ -91,6 +93,40 @@ pub fn flatten_placement(db: &CellDb, overlay: &EditOverlay, key: PlacementKey, 
     let mut out = Vec::new();
     collect(db, overlay, inst.child, inst.placement(c, r), limit, &mut out)?;
     Ok(out)
+}
+
+/// What a streamed design must have in memory before placement `key` can be
+/// flattened (Phase 7.4): every shape chunk and placement chunk of its
+/// subtree that is not resident. Empty in-core.
+pub fn flatten_needs(db: &CellDb, key: PlacementKey) -> Vec<crate::pick::ChunkNeed> {
+    let (parent, ii, _, _) = key;
+    let mut needs = Vec::new();
+    let Some(&root) = db.cell(parent).resident_instances().find(|&(i, _)| i == ii).map(|(_, inst)| inst.child).as_ref()
+    else {
+        return needs;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let cell = db.cell(id);
+        for ci in 0..cell.chunks.len() {
+            if !cell.chunk_resident(ci) {
+                needs.push(crate::pick::ChunkNeed::Shapes(id, ci as u32));
+            }
+        }
+        if let Some(remote) = &cell.remote {
+            for (ci, c) in remote.chunks.iter().enumerate() {
+                if c.is_none() {
+                    needs.push(crate::pick::ChunkNeed::Placements(id, ci as u32));
+                }
+            }
+        }
+        stack.extend(cell.resident_instances().map(|(_, inst)| inst.child));
+    }
+    needs
 }
 
 /// Everything drawn, flattened to TOP's frame: the composite of base + overlay
@@ -128,23 +164,30 @@ fn collect(
         }
     };
     let suppressed = overlay.suppressed_in(id);
-    for i in 0..cell.shapes.len() {
-        if suppressed.is_some_and(|s| s.contains(&(i as u32))) {
-            continue;
+    // Shapes through the chunk stores: a streamed design's subtree must be
+    // resident first (`flatten_needs`).
+    for ci in 0..cell.chunks.len() {
+        let Some((store, base)) = cell.chunk_store(ci) else { continue };
+        let ch = cell.chunks[ci];
+        for i in ch.start..ch.end {
+            if suppressed.is_some_and(|s| s.contains(&i)) {
+                continue;
+            }
+            let j = (i - base) as usize;
+            push(out, Shape { layer: store.layer(j), points: map(store.points(j)) })?;
         }
-        push(out, Shape { layer: cell.shapes.layer(i), points: map(cell.shapes.points(i)) })?;
     }
     for s in overlay.live_shapes_in(id) {
         push(out, Shape { layer: s.layer, points: map(&s.points) })?;
     }
-    for (ii, inst) in cell.instances.iter().enumerate() {
+    for (ii, inst) in cell.resident_instances() {
         let (cols, rows) = match inst.kind {
             InstanceKind::Single => (1, 1),
             InstanceKind::Array { cols, rows, .. } => (cols.max(0), rows.max(0)),
         };
         for r in 0..rows {
             for c in 0..cols {
-                if overlay.is_hidden((id, ii as u32, c, r)) {
+                if overlay.is_hidden((id, ii, c, r)) {
                     continue;
                 }
                 collect(db, overlay, inst.child, tf.then(&inst.placement(c, r)), limit, out)?;

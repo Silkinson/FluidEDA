@@ -202,6 +202,15 @@ pub fn decode_record(rec: &[u8]) -> Result<(Vec<i32>, Vec<u32>, Vec<u32>)> {
     Ok((coords, starts, layers))
 }
 
+/// One chunk record as a shape store of its own (its shape `j` is the
+/// chunk's shape `start + j`): what a streamed client keeps in memory to
+/// pick and edit (Phase 7.4).
+pub fn decode_store(rec: &[u8]) -> Result<crate::store::ShapeStore> {
+    let (coords, starts, layers) = decode_record(rec)?;
+    let layers = bytemuck::cast_slice::<u32, crate::types::Layer>(&layers).to_vec();
+    Ok(crate::store::ShapeStore::from_columns(coords, starts, layers))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +352,89 @@ mod tests {
         let plain = crate::load_layout_db(include_bytes!("../../../assets/hier.gds")).unwrap();
         let (back, _) = crate::ProgressiveLoad::new(&crate::skeleton_meta(&plain)).unwrap();
         assert!(back.cells.iter().all(|c| c.chunk_looks.is_empty()));
+    }
+
+    /// Phase 7.4: a streamed design picks what in-core picks, once it has
+    /// fetched exactly the chunks the pick reports missing — repeatedly, as
+    /// fetched placements reveal more of the hierarchy under the point.
+    #[test]
+    fn a_streamed_pick_fetches_what_it_needs_then_matches_in_core() {
+        use crate::db::{CellDbBuilder, Instance, InstanceKind};
+        use crate::edit::EditOverlay;
+        use crate::pick::ChunkNeed;
+        use crate::transform::Transform;
+        use crate::types::{Layer, Point};
+        // A CORE with 20 k placements of a LEAF (remote in the pack), a big
+        // flat MESH (several shape chunks) and a TOP placing both.
+        let rect = |x: i32, y: i32, w: i32, h: i32| [Point::new(x, y), Point::new(x + w, y), Point::new(x + w, y + h), Point::new(x, y + h)];
+        let mut b = CellDbBuilder::new();
+        let top = b.intern("TOP");
+        let core = b.intern("CORE");
+        let leaf = b.intern("LEAF");
+        let mesh = b.intern("MESH");
+        b.cell_mut(leaf).shapes.push(Layer::new(1, 0), rect(0, 0, 400, 900));
+        b.cell_mut(leaf).shapes.push(Layer::new(2, 0), rect(100, 100, 100, 500));
+        for i in 0..150_000i32 {
+            b.cell_mut(mesh).shapes.push(Layer::new(3, 0), rect((i % 400) * 300, (i / 400) * 300, 200, 200));
+        }
+        for i in 0..20_000i32 {
+            b.cell_mut(core).instances.push(Instance {
+                child: leaf,
+                transform: Transform::translate(((i % 200) * 500) as f64, ((i / 200) * 1_000) as f64),
+                kind: InstanceKind::Single,
+            });
+        }
+        for (child, x) in [(core, 0.0), (mesh, 200_000.0)] {
+            b.cell_mut(top).instances.push(Instance { child, transform: Transform::translate(x, 0.0), kind: InstanceKind::Single });
+        }
+        let db = b.build().unwrap();
+        assert!(db.cell(mesh).chunks.len() > 1, "MESH must have several shape chunks");
+
+        // The pack, and a client holding only its cell table.
+        let mut geometry = Vec::new();
+        let offsets = write_geometry(&db, &mut geometry).unwrap();
+        let mut placements = Vec::new();
+        let p_offsets = write_placements(&db, INLINE_PLACEMENTS, &mut placements).unwrap();
+        let (base, p_base) = (chunk_base(&db), inst_chunk_base(&db));
+        let (mut streamed, _) = crate::ProgressiveLoad::new(&crate::serialize::cell_table_meta(&db, INLINE_PLACEMENTS)).unwrap();
+        for cell in &mut streamed.cells {
+            cell.make_remote_shapes();
+        }
+
+        let none = EditOverlay::new();
+        let points = [(250, 450), (9_850, 7_150), (200_000 + 1_000, 1_000), (200_000 + 60_250, 30_250), (-5, -5), (50_150, 99_100)];
+        for (x, y) in points {
+            let at = Point::new(x, y);
+            let mut rounds = 0;
+            let hit = loop {
+                let (hit, needs) = crate::pick_composite_needs(&streamed, &none, at);
+                if needs.is_empty() {
+                    break hit;
+                }
+                rounds += 1;
+                assert!(rounds < 10, "needs must converge");
+                for need in needs {
+                    match need {
+                        ChunkNeed::Shapes(c, ci) => {
+                            let k = (base[c] + ci) as usize;
+                            let store = decode_store(&geometry[offsets[k] as usize..offsets[k + 1] as usize]).unwrap();
+                            streamed.cells[c].remote_shapes.as_mut().unwrap().chunks[ci as usize] = Some(store);
+                        }
+                        ChunkNeed::Placements(c, ci) => {
+                            let k = (p_base[c] + ci) as usize;
+                            let rec = &placements[p_offsets[k] as usize..p_offsets[k + 1] as usize];
+                            let insts = crate::serialize::decode_instances(rec, db.cells.len()).unwrap();
+                            streamed.cells[c].remote.as_mut().unwrap().chunks[ci as usize] = Some(insts);
+                        }
+                    }
+                }
+            };
+            let local = crate::pick_composite(&db, &none, at);
+            assert_eq!(hit.as_ref().map(|h| (h.target, h.path.clone())), local.as_ref().map(|h| (h.target, h.path.clone())), "pick at {at:?}");
+        }
+        // Only what the picks touched is resident: far from all of MESH.
+        let resident = streamed.cell(mesh).remote_shapes.as_ref().unwrap().chunks.iter().filter(|c| c.is_some()).count();
+        assert!(resident < db.cell(mesh).chunks.len());
     }
 
     #[test]

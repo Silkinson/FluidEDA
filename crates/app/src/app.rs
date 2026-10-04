@@ -53,6 +53,14 @@ const STREAM_PLACEMENTS_IN_FLIGHT: usize = 16;
 /// Streaming: resident placements kept before the least recently walked
 /// placement chunks are evicted. `?placement_budget=<MB>` overrides it.
 const STREAM_PLACEMENT_BUDGET: usize = 64 << 20;
+/// Streaming (Phase 7.4): shape chunks held in main memory for picking and
+/// editing before the least recently needed unpinned ones are evicted.
+/// `?shape_budget=<MB>` overrides it.
+const STREAM_SHAPE_BUDGET: usize = 128 << 20;
+/// Streaming: shape-chunk fetches in flight on the main thread at once.
+const STREAM_SHAPES_IN_FLIGHT: usize = 8;
+/// Streaming: a pick still waiting for chunks after this long gives up (s).
+const STREAM_PICK_TIMEOUT_S: f64 = 15.0;
 
 /// Drawing grid (Phase 5 SLICE 1): every authored coordinate snaps to this many
 /// nm. Small enough to be invisible at any sane zoom, big enough that a drawn
@@ -111,6 +119,33 @@ struct Stream {
     p_failures: usize,
     /// Placement chunks the last cull asked for.
     p_wanted: usize,
+
+    // Shape chunks in main memory (Phase 7.4): what picking and editing read.
+    // The tessellation worker fetches chunks for drawing on its own; these
+    // copies are fetched only when a pick, an edit or an edited chunk's
+    // redraw needs one.
+    /// Arrivals land here (main-thread fetches).
+    shapes: webio::ShapeSlot,
+    /// Shape and placement chunks asked for and not yet in memory.
+    wants: std::collections::BTreeSet<fluideda_core::ChunkNeed>,
+    s_inflight: HashSet<(CellId, u32)>,
+    s_retry_at: HashMap<(CellId, u32), f64>,
+    /// Frame each resident shape chunk last arrived or was asked for, and its size.
+    s_last_used: HashMap<(CellId, u32), u64>,
+    s_bytes: HashMap<(CellId, u32), usize>,
+    s_resident_bytes: usize,
+    s_budget: usize,
+    s_fetched: usize,
+    s_fetched_bytes: usize,
+    s_evicted: usize,
+    s_failures: usize,
+    /// Shape chunks the edit overlay waits for (a moved shape's base), so an
+    /// arrival among them reconciles again.
+    edit_wants: HashSet<(CellId, u32)>,
+    /// Drawn chunks whose suppressed shapes may have changed (edits).
+    retess: HashSet<(CellId, u32)>,
+    /// The suppressed shapes each drawn edited chunk was tessellated without.
+    drawn_suppressed: HashMap<(CellId, u32), Vec<u32>>,
 }
 
 impl Stream {
@@ -151,6 +186,23 @@ impl Stream {
             p_evicted: 0,
             p_failures: 0,
             p_wanted: 0,
+            shapes: Rc::new(RefCell::new(Vec::new())),
+            wants: std::collections::BTreeSet::new(),
+            s_inflight: HashSet::new(),
+            s_retry_at: HashMap::new(),
+            s_last_used: HashMap::new(),
+            s_bytes: HashMap::new(),
+            s_resident_bytes: 0,
+            s_budget: webio::query_param("shape_budget")
+                .and_then(|mb| mb.parse::<usize>().ok())
+                .map_or(STREAM_SHAPE_BUDGET, |mb| mb << 20),
+            s_fetched: 0,
+            s_fetched_bytes: 0,
+            s_evicted: 0,
+            s_failures: 0,
+            edit_wants: HashSet::new(),
+            retess: HashSet::new(),
+            drawn_suppressed: HashMap::new(),
         }
     }
 
@@ -159,6 +211,47 @@ impl Stream {
         let k = (self.base[cell] + chunk) as usize;
         (self.info.offsets[k], self.info.offsets[k + 1])
     }
+
+    /// Fetch placement chunk `key` on the main thread (by byte range).
+    fn fetch_placements(&mut self, key: (CellId, u32), cells: usize) {
+        let k = (self.inst_base[key.0] + key.1) as usize;
+        let (start, end) = (self.info.placement_offsets[k], self.info.placement_offsets[k + 1]);
+        if start == end {
+            return;
+        }
+        let (url, slot) = (self.info.placements_url.clone(), self.placements.clone());
+        webio::fetch_placements(url, start, end, key.0, key.1, self.gen, cells, slot);
+        self.p_inflight.insert(key);
+    }
+
+    /// Fetch shape chunk `key` into main memory (Phase 7.4).
+    fn fetch_shapes(&mut self, key: (CellId, u32)) {
+        let (start, end) = self.range(key.0, key.1);
+        if start == end {
+            return;
+        }
+        webio::fetch_shape_chunk(self.info.geometry_url.clone(), start, end, key.0, key.1, self.gen, self.shapes.clone());
+        self.s_inflight.insert(key);
+    }
+}
+
+/// A pick on a streamed design waiting for the chunks under its point
+/// (Phase 7.4): retried each frame until nothing it needs is missing.
+#[derive(Debug, Clone, Copy)]
+struct PendingPick {
+    world: Vec2,
+    mode: PickMode,
+    /// App time it was asked at (s), for the timeout.
+    since: f64,
+}
+
+/// What a finished pick does with its hit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PickMode {
+    /// Replace the selection (a click).
+    Replace,
+    /// Toggle the shape in the selection (a shift-click).
+    Toggle,
 }
 
 /// What a left-click selects / a drag edits (Phase 5: base shapes and drawn
@@ -268,6 +361,8 @@ pub struct FluidApp {
     pending_hash: Option<design::HashSlot>,
     /// The installed design is streamed (Phase 6 SLICE 3): its residency.
     stream: Option<Stream>,
+    /// A streamed design's pick waiting for chunks (Phase 7.4).
+    pending_pick: Option<PendingPick>,
     /// Cull wall time per frame: smoothed, and the worst since `perf_reset`.
     cull_ms: f64,
     cull_max_ms: f64,
@@ -395,6 +490,10 @@ pub struct FluidApp {
     renderer_drop_cells: HashSet<CellId>,
     /// Overlay geometry needs re-upload (set when the overlay changed).
     overlay_dirty: bool,
+    /// The overlay geometry on the GPU (world nm). The cull emits only what is
+    /// in view, so a view change re-uploads it when the set differs (Phase 7.4
+    /// fix: an edit made at one view showed nowhere else until the next edit).
+    overlay_uploaded: Vec<fluideda_core::Shape>,
     /// Last hit-test latency, shown in the panel (the lazy-index-build cost).
     last_pick_us: f64,
     /// Instrumentation for the last edit: chunks re-tessellated + wall time.
@@ -528,6 +627,7 @@ impl FluidApp {
             load_in_flight: file.is_some() || stream_hash.is_some(),
             pending_hash: None,
             stream: None,
+            pending_pick: None,
             cull_ms: 0.0,
             cull_max_ms: 0.0,
             loading: None,
@@ -581,6 +681,7 @@ impl FluidApp {
             dirty_keys: HashSet::new(),
             renderer_drop_cells: HashSet::new(),
             overlay_dirty: false,
+            overlay_uploaded: Vec::new(),
             last_pick_us: 0.0,
             last_edit_chunks: 0,
             last_edit_ms: 0.0,
@@ -672,6 +773,14 @@ impl FluidApp {
         self.design_source = design.source.clone();
         self.pending_hash = design.pending_hash;
         self.stream = design.stream.map(|info| Stream::new(info, &self.db));
+        self.pending_pick = None;
+        if self.stream.is_some() {
+            // Shapes arrive by chunk (Phase 7.4): the cells read them through
+            // their chunk stores.
+            for cell in &mut self.db.cells {
+                cell.make_remote_shapes();
+            }
+        }
         self.refresh_proxy_colours();
         // `?instwalk`: collapse placement chunks (the pre-7.3 walk) — the
         // same-build A/B knob for the cull.
@@ -685,9 +794,8 @@ impl FluidApp {
             }
         }
         if self.stream.is_some() {
-            // View-only: nothing geometry-backed (picking, edits, DRC, export)
-            // can work on cells that hold no shapes.
-            self.edit_mode = false;
+            // Picking and editing fetch the chunks they need (Phase 7.4); DRC
+            // and a local export would need the whole design in memory.
             self.drc_enabled = false;
         }
         self.joined_url = None;
@@ -719,7 +827,14 @@ impl FluidApp {
     /// instance hierarchy and resolves to a cell **master** + shape, plus the
     /// clicked placement's world transform.
     fn pick_at(&mut self, world: Vec2) {
-        let hit = self.pick(world);
+        match self.pick(world) {
+            Ok(hit) => self.apply_pick(world, hit),
+            Err(needs) => self.defer_pick(world, PickMode::Replace, needs),
+        }
+    }
+
+    /// Make a finished click pick the selection.
+    fn apply_pick(&mut self, world: Vec2, hit: Option<(Selection, Transform)>) {
         self.selection_set = hit.into_iter().collect();
         self.set_primary(hit);
         self.selected_path = if hit.is_some() { std::mem::take(&mut self.last_pick_path) } else { Vec::new() };
@@ -731,7 +846,15 @@ impl FluidApp {
     /// handles, moves and nudges act on); toggling the primary out promotes the
     /// most recently added remaining member.
     fn pick_toggle(&mut self, world: Vec2) {
-        let Some((sel, tf)) = self.pick(world) else { return };
+        match self.pick(world) {
+            Ok(hit) => self.apply_toggle(world, hit),
+            Err(needs) => self.defer_pick(world, PickMode::Toggle, needs),
+        }
+    }
+
+    /// Toggle a finished shift-click pick's hit in the selection.
+    fn apply_toggle(&mut self, world: Vec2, hit: Option<(Selection, Transform)>) {
+        let Some((sel, tf)) = hit else { return };
         if let Some(pos) = self.selection_set.iter().position(|(s, _)| *s == sel) {
             self.selection_set.remove(pos);
             let next = self.selection_set.last().copied();
@@ -770,22 +893,63 @@ impl FluidApp {
     /// what is *drawn* there (Phase 5d composite pick): base shapes minus
     /// tombstones, moved / vertex-edited copies where they now are, and drawn
     /// shapes in any cell at any placement, resolved to a cell master.
-    fn pick(&mut self, world: Vec2) -> Option<(Selection, Transform)> {
+    ///
+    /// A streamed design may not have the chunks under the point in memory
+    /// (Phase 7.4): then the answer is `Err` with what to fetch first.
+    fn pick(&mut self, world: Vec2) -> Result<Option<(Selection, Transform)>, Vec<fluideda_core::ChunkNeed>> {
         if self.geometry_pending() {
-            return None; // geometry still arriving (Phase 5c): nothing to hit-test yet
+            return Ok(None); // geometry still arriving (Phase 5c): nothing to hit-test yet
         }
         let p = Point::new(world.x.round() as i32, world.y.round() as i32);
         let t = web_time::Instant::now();
-        let hit = fluideda_core::pick_composite(&self.db, &self.overlay, p);
+        let (hit, needs) = fluideda_core::pick_composite_needs(&self.db, &self.overlay, p);
         self.last_pick_us = t.elapsed().as_secs_f64() * 1e6;
-        let hit = hit?;
+        if !needs.is_empty() {
+            return Err(needs);
+        }
+        let Some(hit) = hit else { return Ok(None) };
         // Remember where it was hit — the path "edit this placement only" uses.
         self.last_pick_path = hit.path.clone();
         let sel = match hit.target {
             fluideda_core::PickTarget::Base(id) => Selection::Base(id),
             fluideda_core::PickTarget::Added(id) => Selection::Added(id),
         };
-        Some((sel, hit.world_tf))
+        Ok(Some((sel, hit.world_tf)))
+    }
+
+    /// Park a pick until the chunks it needs are in memory (Phase 7.4). A
+    /// newer pick replaces an older one still waiting.
+    fn defer_pick(&mut self, world: Vec2, mode: PickMode, needs: Vec<fluideda_core::ChunkNeed>) {
+        if let Some(st) = &mut self.stream {
+            st.wants.extend(needs);
+        }
+        self.pending_pick = Some(PendingPick { world, mode, since: self.last_frame });
+        self.status = "fetching geometry under the pointer…".into();
+    }
+
+    /// Try a parked pick again: it finishes once nothing under its point is
+    /// missing, asks for whatever the chunks that arrived revealed (a placement
+    /// chunk leads to its children's chunks), or gives up after a while.
+    fn retry_pick(&mut self) {
+        let Some(pp) = self.pending_pick else { return };
+        match self.pick(pp.world) {
+            Ok(hit) => {
+                self.pending_pick = None;
+                self.status.clear();
+                match pp.mode {
+                    PickMode::Replace => self.apply_pick(pp.world, hit),
+                    PickMode::Toggle => self.apply_toggle(pp.world, hit),
+                }
+            }
+            Err(needs) => {
+                if self.last_frame - pp.since > STREAM_PICK_TIMEOUT_S {
+                    self.pending_pick = None;
+                    self.status = format!("pick gave up: {} chunk(s) under the pointer did not arrive", needs.len());
+                } else if let Some(st) = &mut self.stream {
+                    st.wants.extend(needs);
+                }
+            }
+        }
     }
 
     // --- Phase 5d SLICE 4: edit one placement only ---------------------------
@@ -796,6 +960,12 @@ impl FluidApp {
     /// hiding the placement. One transaction (one undo step). Afterwards the
     /// flattened copy under the same point is selected, ready to edit.
     fn flatten_selection_placement(&mut self, world: Option<Vec2>) {
+        if self.stream.is_some() {
+            // Which hop to flatten needs every cell's placement count, which a
+            // streamed client does not have.
+            self.status = "edit this placement only: not available on a streamed design yet".into();
+            return;
+        }
         let path = self.selected_path.clone();
         let counts = self
             .placement_counts
@@ -871,7 +1041,7 @@ impl FluidApp {
                 .is_some_and(|a| fluideda_core::point_in_polygon(&a.shape.points, p)),
             Selection::Base(id) => match self.overlay.edited.get(&id) {
                 Some(moved) => fluideda_core::point_in_polygon(&moved.points, p),
-                None => fluideda_core::point_in_polygon(self.db.cell(id.0).shapes.points(id.1 as usize), p),
+                None => self.db.cell(id.0).shape_points(id.1 as usize).is_some_and(|pts| fluideda_core::point_in_polygon(pts, p)),
             },
         }
     }
@@ -885,11 +1055,7 @@ impl FluidApp {
                 Some(s) => Some((s.layer, s.points.clone())),
                 None => {
                     let c = self.db.cell(id.0);
-                    if (id.1 as usize) < c.shapes.len() {
-                        Some((c.shapes.layer(id.1 as usize), c.shapes.points(id.1 as usize).to_vec()))
-                    } else {
-                        None
-                    }
+                    Some((c.shape_layer(id.1 as usize)?, c.shape_points(id.1 as usize)?.to_vec()))
                 }
             },
         }
@@ -1009,7 +1175,7 @@ impl FluidApp {
     fn preview_ring(&mut self, sel: Selection, pts: Vec<Point>) {
         match sel {
             Selection::Base(id) => {
-                let layer = self.db.cell(id.0).shapes.layer(id.1 as usize);
+                let Some(layer) = self.db.cell(id.0).shape_layer(id.1 as usize) else { return };
                 self.overlay.move_shape(id, fluideda_core::Shape { layer, points: pts });
                 self.invalidate(id);
             }
@@ -1049,7 +1215,7 @@ impl FluidApp {
     fn existing_delta(&self, id: BaseShapeId) -> (i32, i32) {
         match self.overlay.edited.get(&id) {
             Some(moved) => {
-                let base = self.db.cell(id.0).shapes.points(id.1 as usize);
+                let base = self.db.cell(id.0).shape_points(id.1 as usize).unwrap_or(&[]);
                 match (base.first(), moved.points.first()) {
                     (Some(b), Some(m)) => (m.x - b.x, m.y - b.y),
                     _ => (0, 0),
@@ -1066,8 +1232,9 @@ impl FluidApp {
     /// ([`commit_move`](Self::commit_move)).
     fn preview_move(&mut self, id: BaseShapeId, dx: i32, dy: i32) {
         let cell = self.db.cell(id.0);
-        let layer = cell.shapes.layer(id.1 as usize);
-        let pts = cell.shapes.points(id.1 as usize);
+        let (Some(layer), Some(pts)) = (cell.shape_layer(id.1 as usize), cell.shape_points(id.1 as usize)) else {
+            return; // a streamed chunk not in memory (it is fetched on selection)
+        };
         let moved = fluideda_core::edit::translate(layer, pts, dx, dy);
         self.overlay.move_shape(id, moved);
         self.move_delta = (dx, dy);
@@ -1358,6 +1525,17 @@ impl FluidApp {
     /// re-tessellation stays under a frame; the split preserves shape indices, so
     /// it is safe for the CRDT and can happen independently on each peer.
     fn invalidate(&mut self, id: BaseShapeId) {
+        if let Some(st) = &mut self.stream {
+            // A streamed design keeps the pack's chunk numbering (its byte
+            // offsets are per chunk), so no finer split (Phase 7.4): the
+            // edited chunk is redrawn from its copy in memory.
+            if let Some(chunk) = self.db.cell(id.0).chunk_of(id.1) {
+                st.wants.insert(fluideda_core::ChunkNeed::Shapes(id.0, chunk));
+                self.dirty_keys.insert((id.0, chunk));
+            }
+            self.overlay_dirty = true;
+            return;
+        }
         if let Some(chunk) = self.db.cell(id.0).chunk_of(id.1) {
             let big = {
                 let c = &self.db.cells[id.0].chunks[chunk as usize];
@@ -1524,6 +1702,11 @@ impl FluidApp {
         for cell in self.renderer_drop_cells.drain() {
             renderer.drop_cell(cell);
         }
+        // A streamed design redraws an edited chunk in place once its copy is
+        // in memory (Phase 7.4), rather than dropping it to a proxy.
+        if let Some(st) = &mut self.stream {
+            st.retess.extend(self.dirty_keys.drain());
+        }
         for key in self.dirty_keys.drain() {
             renderer.drop_chunk(key);
             self.uploaded.remove(&key);
@@ -1565,6 +1748,12 @@ impl FluidApp {
                 st.fetch_ms += reply.fetch_ms;
                 st.last_drawn.insert(key, st.frame);
                 st.retry_at.remove(&key);
+                // The worker drew the whole chunk: if an edit has suppressed
+                // shapes in it meanwhile, redraw it without them (Phase 7.4).
+                st.drawn_suppressed.remove(&key);
+                if self.overlay.suppressed_in(key.0).is_some() {
+                    st.retess.insert(key);
+                }
             }
         }
 
@@ -1573,7 +1762,14 @@ impl FluidApp {
 
         if self.stream.is_some() {
             self.stream_placements(&visible);
-            self.stream_chunks(renderer, &visible);
+            self.stream_shapes();
+            self.retry_pick();
+            let rebuilt = self.stream_chunks(renderer, &device, &visible);
+            self.upload_overlay(renderer, &device, &visible);
+            if editing {
+                self.last_edit_chunks = rebuilt;
+                self.last_edit_ms = edit_t.elapsed().as_secs_f64() * 1e3;
+            }
             self.gpu_bytes = renderer.uploaded_bytes();
             self.draw_calls = renderer.draw_calls();
             return;
@@ -1649,12 +1845,7 @@ impl FluidApp {
             rebuilt += 1;
         }
 
-        // Re-upload the (tiny) overlay geometry when it changed.
-        if self.overlay_dirty {
-            let meshes = fluideda_core::tessellate_shapes(&visible.overlay);
-            renderer.upload_overlay(&device, &meshes);
-            self.overlay_dirty = false;
-        }
+        self.upload_overlay(renderer, &device, &visible);
 
         if editing {
             self.last_edit_chunks = rebuilt;
@@ -1662,6 +1853,17 @@ impl FluidApp {
         }
         self.gpu_bytes = renderer.uploaded_bytes();
         self.draw_calls = renderer.draw_calls();
+    }
+
+    /// Re-upload the (tiny) overlay geometry when it changed: an edit, or a
+    /// view showing a different part of it.
+    fn upload_overlay(&mut self, renderer: &mut fluideda_render::HierRenderer, device: &wgpu::Device, visible: &VisibleSet) {
+        if self.overlay_dirty || visible.overlay != self.overlay_uploaded {
+            let meshes = fluideda_core::tessellate_shapes(&visible.overlay);
+            renderer.upload_overlay(device, &meshes);
+            self.overlay_uploaded = visible.overlay.clone();
+            self.overlay_dirty = false;
+        }
     }
 
     /// Colour every shape chunk's proxy by its look (Phase 7.3 SLICE C): what
@@ -1677,6 +1879,150 @@ impl FluidApp {
             } else {
                 cell.chunk_looks.iter().map(|look| fluideda_render::composite_rgba(look, |l| hidden.contains(&l))).collect()
             };
+        }
+    }
+
+    /// Ask for base shape `id`'s chunk to be in memory (a streamed design's
+    /// selection, Phase 7.4). In-core it always is.
+    fn want_shape_of(&mut self, id: BaseShapeId) {
+        let Some(ci) = self.db.cell(id.0).chunk_of(id.1) else { return };
+        if let Some(st) = &mut self.stream {
+            if !self.db.cell(id.0).chunk_resident(ci as usize) {
+                st.wants.insert(fluideda_core::ChunkNeed::Shapes(id.0, ci));
+            }
+        }
+    }
+
+    /// The shape chunks a streamed design must keep in memory (Phase 7.4):
+    /// those of edited shapes (their redraw and the overlay read them), of
+    /// edits still waiting to materialize, and of the selection.
+    fn pinned_shape_chunks(&self) -> HashSet<(CellId, u32)> {
+        let of = |&(c, i): &BaseShapeId| self.db.cell(c).chunk_of(i).map(|ci| (c, ci));
+        let mut pinned: HashSet<(CellId, u32)> = self.overlay.deleted.iter().filter_map(of).collect();
+        pinned.extend(self.selection_set.iter().filter_map(|(s, _)| match s {
+            Selection::Base(id) => of(id),
+            Selection::Added(_) => None,
+        }));
+        if let Some(Selection::Base(id)) = self.selected {
+            pinned.extend(of(&id));
+        }
+        if let Some(st) = &self.stream {
+            pinned.extend(st.edit_wants.iter().copied());
+        }
+        pinned
+    }
+
+    /// Main-memory chunk residency, once per frame (Phase 7.4): install the
+    /// shape chunks that arrived, fetch the shape and placement chunks picks
+    /// and edits asked for, and evict the least recently needed shape chunks
+    /// over budget — never a pinned one. An arrival an edit was waiting for
+    /// reconciles the overlay again.
+    fn stream_shapes(&mut self) {
+        // A pick still waiting may need everything fetched for it so far (a
+        // placement chunk, then the shapes it reveals): nothing is evicted
+        // until it is done, or a tight budget could keep it from finishing.
+        let hold = self.pending_pick.is_some();
+        let pinned = match &self.stream {
+            Some(st) if st.s_resident_bytes > st.s_budget && !hold => self.pinned_shape_chunks(),
+            Some(_) => HashSet::new(),
+            None => return,
+        };
+        let Some(st) = self.stream.as_mut() else { return };
+        let now = self.last_frame;
+        let mut edit_arrived = false;
+        let replies: Vec<webio::ShapeReply> = std::mem::take(&mut *st.shapes.borrow_mut());
+        for r in replies {
+            if r.gen != st.gen {
+                continue; // asked for by a design that has since been replaced
+            }
+            let key = (r.cell, r.chunk);
+            st.s_inflight.remove(&key);
+            match r.result {
+                Ok(store) => {
+                    let slot = self
+                        .db
+                        .cells
+                        .get_mut(r.cell)
+                        .and_then(|c| c.remote_shapes.as_mut())
+                        .and_then(|rs| rs.chunks.get_mut(r.chunk as usize));
+                    if let Some(slot) = slot {
+                        if slot.is_none() {
+                            st.s_resident_bytes += r.bytes;
+                            st.s_bytes.insert(key, r.bytes);
+                        }
+                        *slot = Some(store);
+                        st.s_last_used.insert(key, st.frame);
+                        st.s_fetched += 1;
+                        st.s_fetched_bytes += r.bytes;
+                        st.s_retry_at.remove(&key);
+                        edit_arrived |= st.edit_wants.contains(&key);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("shape chunk {key:?}: {e}");
+                    st.s_failures += 1;
+                    st.s_retry_at.insert(key, now + STREAM_RETRY_S);
+                }
+            }
+        }
+        let wants: Vec<fluideda_core::ChunkNeed> = st.wants.iter().copied().collect();
+        for need in wants {
+            match need {
+                fluideda_core::ChunkNeed::Shapes(cell, ci) => {
+                    let key = (cell, ci);
+                    if self.db.cells[cell].chunk_resident(ci as usize) {
+                        st.wants.remove(&need);
+                        st.s_last_used.insert(key, st.frame);
+                    } else if !st.s_inflight.contains(&key)
+                        && st.s_inflight.len() < STREAM_SHAPES_IN_FLIGHT
+                        && !st.s_retry_at.get(&key).is_some_and(|&t| now < t)
+                    {
+                        st.fetch_shapes(key);
+                    }
+                }
+                fluideda_core::ChunkNeed::Placements(cell, ci) => {
+                    let key = (cell, ci);
+                    let resident = self.db.cells[cell]
+                        .remote
+                        .as_ref()
+                        .and_then(|r| r.chunks.get(ci as usize))
+                        .is_some_and(|c| c.is_some());
+                    if resident {
+                        st.wants.remove(&need);
+                        st.p_last_used.insert(key, st.frame);
+                    } else if !st.p_inflight.contains(&key)
+                        && st.p_inflight.len() < STREAM_PLACEMENTS_IN_FLIGHT
+                        && !st.p_retry_at.get(&key).is_some_and(|&t| now < t)
+                    {
+                        st.fetch_placements(key, self.db.cells.len());
+                    }
+                }
+            }
+        }
+        // Over budget: drop the least recently needed unpinned chunks (never
+        // one that arrived or was asked for this frame).
+        if st.s_resident_bytes > st.s_budget && !hold {
+            let mut old: Vec<(u64, (CellId, u32))> = st
+                .s_last_used
+                .iter()
+                .filter(|(k, &f)| f < st.frame && !pinned.contains(k))
+                .map(|(&k, &f)| (f, k))
+                .collect();
+            old.sort_unstable();
+            for (_, key) in old {
+                if st.s_resident_bytes <= st.s_budget * 9 / 10 {
+                    break;
+                }
+                if let Some(rs) = self.db.cells[key.0].remote_shapes.as_mut() {
+                    rs.chunks[key.1 as usize] = None;
+                }
+                st.s_resident_bytes -= st.s_bytes.remove(&key).unwrap_or(0);
+                st.s_last_used.remove(&key);
+                st.s_evicted += 1;
+            }
+        }
+        if edit_arrived {
+            self.reconcile_edits();
         }
     }
 
@@ -1739,25 +2085,11 @@ impl FluidApp {
             if resident {
                 continue; // arrived after this frame's cull
             }
-            let k = (st.inst_base[key.0] + key.1) as usize;
-            let (start, end) = (st.info.placement_offsets[k], st.info.placement_offsets[k + 1]);
-            if start == end {
-                continue;
-            }
-            webio::fetch_placements(
-                st.info.placements_url.clone(),
-                start,
-                end,
-                key.0,
-                key.1,
-                st.gen,
-                self.db.cells.len(),
-                st.placements.clone(),
-            );
-            st.p_inflight.insert(key);
+            st.fetch_placements(key, self.db.cells.len());
         }
-        // Over budget: drop the least recently walked (never this frame's).
-        if st.p_resident_bytes > st.p_budget {
+        // Over budget: drop the least recently walked (never this frame's, nor
+        // anything while a pick is waiting — see `stream_shapes`).
+        if st.p_resident_bytes > st.p_budget && self.pending_pick.is_none() {
             let mut old: Vec<(u64, (CellId, u32))> =
                 st.p_last_used.iter().filter(|(_, &f)| f < st.frame).map(|(&k, &f)| (f, k)).collect();
             old.sort_unstable();
@@ -1777,13 +2109,56 @@ impl FluidApp {
 
     /// Streaming residency, once per frame (Phase 6 SLICE 3): fetch the chunks
     /// on screen that are not too dense for their size, and evict the least
-    /// recently drawn ones once the GPU budget is exceeded.
-    fn stream_chunks(&mut self, renderer: &mut fluideda_render::HierRenderer, visible: &VisibleSet) {
-        let Some(st) = self.stream.as_mut() else { return };
+    /// recently drawn ones once the GPU budget is exceeded. Returns how many
+    /// edited chunks it tessellated here (Phase 7.4).
+    fn stream_chunks(
+        &mut self,
+        renderer: &mut fluideda_render::HierRenderer,
+        device: &wgpu::Device,
+        visible: &VisibleSet,
+    ) -> usize {
+        let Some(st) = self.stream.as_mut() else { return 0 };
         st.dense = 0;
         let scale = self.camera.scale as f64; // px per nm
         let now = self.last_frame;
         let mut dispatched = 0usize;
+        let mut rebuilt = 0usize;
+        // Edited chunks on the GPU (Phase 7.4): redraw one whose suppressed
+        // shapes changed from its copy in memory. Until the copy arrives the
+        // old drawing stays (no proxy flash).
+        let retess: Vec<(CellId, u32)> = st.retess.iter().copied().collect();
+        for key in retess {
+            if !self.uploaded.contains(&key) {
+                st.retess.remove(&key); // not drawn now: drawn filtered when it shows
+                continue;
+            }
+            let sup = chunk_suppressed(&self.db, &self.overlay, key);
+            if st.drawn_suppressed.get(&key).map_or(sup.is_empty(), |d| *d == sup) {
+                st.retess.remove(&key);
+                continue;
+            }
+            let t = web_time::Instant::now();
+            match tessellate_resident(&self.db, key, &sup) {
+                Some(meshes) => {
+                    self.tess_accum_ms += t.elapsed().as_secs_f64() * 1e3;
+                    renderer.drop_chunk(key);
+                    renderer.upload_chunk(device, key, &meshes);
+                    st.drawn_suppressed.insert(key, sup);
+                    st.retess.remove(&key);
+                    rebuilt += 1;
+                }
+                None if sup.is_empty() => {
+                    // Nothing to hide any more: the worker draws it whole again.
+                    renderer.drop_chunk(key);
+                    self.uploaded.remove(&key);
+                    st.drawn_suppressed.remove(&key);
+                    st.retess.remove(&key);
+                }
+                None => {
+                    st.wants.insert(fluideda_core::ChunkNeed::Shapes(key.0, key.1));
+                }
+            }
+        }
         for d in &visible.draws {
             let key = (d.cell, d.chunk);
             if self.uploaded.contains(&key) {
@@ -1801,6 +2176,28 @@ impl FluidApp {
                 st.dense += 1;
                 continue;
             }
+            // An edited chunk draws without its suppressed shapes, from its
+            // copy in memory (Phase 7.4); a proxy holds until that arrives.
+            if d.dirty {
+                let sup = chunk_suppressed(&self.db, &self.overlay, key);
+                if !sup.is_empty() {
+                    let t = web_time::Instant::now();
+                    match tessellate_resident(&self.db, key, &sup) {
+                        Some(meshes) => {
+                            self.tess_accum_ms += t.elapsed().as_secs_f64() * 1e3;
+                            renderer.upload_chunk(device, key, &meshes);
+                            self.uploaded.insert(key);
+                            st.drawn_suppressed.insert(key, sup);
+                            st.last_drawn.insert(key, st.frame);
+                            rebuilt += 1;
+                        }
+                        None => {
+                            st.wants.insert(fluideda_core::ChunkNeed::Shapes(key.0, key.1));
+                        }
+                    }
+                    continue;
+                }
+            }
             if self.tess_pending.len() >= STREAM_MAX_IN_FLIGHT || dispatched >= TESS_JOBS_PER_FRAME {
                 continue; // stays a proxy this frame
             }
@@ -1809,13 +2206,21 @@ impl FluidApp {
                     Ok(w) => self.tess = Some(w),
                     Err(e) => {
                         log::error!("tess worker unavailable: {e}");
-                        return;
+                        return rebuilt;
                     }
                 }
             }
             let (start, end) = st.range(d.cell, d.chunk);
             if let Some(w) = &self.tess {
-                w.post_fetch(d.cell, d.chunk, self.tess_gen, &st.info.geometry_url, start, end);
+                // A chunk a pick or an edit already brought into main memory
+                // is tessellated from that copy, not downloaded again.
+                match self.db.cells[d.cell].chunk_store(d.chunk as usize) {
+                    Some((store, _)) => {
+                        let (coords, starts, layers) = store.chunk_columns(0, store.len() as u32);
+                        w.post(d.cell, d.chunk, self.tess_gen, coords, &starts, layers);
+                    }
+                    None => w.post_fetch(d.cell, d.chunk, self.tess_gen, &st.info.geometry_url, start, end),
+                }
                 self.tess_pending.insert(key);
                 dispatched += 1;
             }
@@ -1832,10 +2237,12 @@ impl FluidApp {
                 renderer.drop_chunk(key);
                 self.uploaded.remove(&key);
                 st.last_drawn.remove(&key);
+                st.drawn_suppressed.remove(&key);
                 st.evicted += 1;
             }
         }
         st.stale = st.last_drawn.values().filter(|&&f| f < st.frame).count();
+        rebuilt
     }
 
     /// Consume any pending drag-drop / fetched / picked file.
@@ -2025,7 +2432,10 @@ impl FluidApp {
              \"stream_skeleton_bytes\":{},\"stream_geometry_bytes\":{},\"stream_pack_ms\":{:.1},\"wasm_heap\":{},\
              \"stream_stale\":{},\"instances\":{},\"cull_ms\":{:.3},\"cull_max_ms\":{:.2},\"nodes_visited\":{},\
              \"p_fetched\":{},\"p_fetched_bytes\":{},\"p_fetch_ms\":{:.1},\"p_resident\":{},\"p_resident_bytes\":{},\
-             \"p_evicted\":{},\"p_in_flight\":{},\"p_wanted\":{},\"p_failures\":{},\"dense_inst\":{},\"proxies\":{}}}",
+             \"p_evicted\":{},\"p_in_flight\":{},\"p_wanted\":{},\"p_failures\":{},\"dense_inst\":{},\"proxies\":{},\
+             \"s_fetched\":{},\"s_fetched_bytes\":{},\"s_resident\":{},\"s_resident_bytes\":{},\"s_evicted\":{},\
+             \"s_in_flight\":{},\"s_failures\":{},\"wants\":{},\"pick_pending\":{},\"pick_us\":{:.0},\
+             \"retess\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -2081,6 +2491,17 @@ impl FluidApp {
             self.stream.as_ref().map_or(0, |s| s.p_failures),
             self.cull_stats.dense_inst_chunks,
             self.visible.proxies.len(),
+            self.stream.as_ref().map_or(0, |s| s.s_fetched),
+            self.stream.as_ref().map_or(0, |s| s.s_fetched_bytes),
+            self.stream.as_ref().map_or(0, |s| s.s_bytes.len()),
+            self.stream.as_ref().map_or(0, |s| s.s_resident_bytes),
+            self.stream.as_ref().map_or(0, |s| s.s_evicted),
+            self.stream.as_ref().map_or(0, |s| s.s_inflight.len()),
+            self.stream.as_ref().map_or(0, |s| s.s_failures),
+            self.stream.as_ref().map_or(0, |s| s.wants.len()),
+            self.pending_pick.is_some(),
+            self.last_pick_us,
+            self.stream.as_ref().map_or(0, |s| s.retess.len()),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -2311,7 +2732,14 @@ impl FluidApp {
             .into_iter()
             .filter_map(|(id, k)| matches!(k, fluideda_sync::EditKind::SetPoints(_)).then_some(id))
             .collect();
-        let new = self.overlay_from_crdt();
+        let (new, waiting) = self.overlay_from_crdt();
+        // A streamed design materializes an edit once its base shape's chunk
+        // is in memory (Phase 7.4): fetch the missing ones; their arrival
+        // reconciles again.
+        if let Some(st) = &mut self.stream {
+            st.wants.extend(waiting.iter().map(|&(c, i)| fluideda_core::ChunkNeed::Shapes(c, i)));
+            st.edit_wants = waiting.into_iter().collect();
+        }
         let added_changed = new.added != self.overlay.added;
         if !added_changed
             && new.deleted == self.overlay.deleted
@@ -2371,34 +2799,38 @@ impl FluidApp {
     /// Build an `EditOverlay` from the CRDT's edit records, translating each move
     /// against this client's base geometry. Out-of-range ids (a peer on a
     /// different file) are ignored rather than panicking.
-    fn overlay_from_crdt(&self) -> EditOverlay {
+    ///
+    /// A streamed design's move or vertex edit needs its base shape's chunk in
+    /// memory (Phase 7.4); until then it is left out, and the chunks it waits
+    /// for are returned.
+    fn overlay_from_crdt(&self) -> (EditOverlay, Vec<(CellId, u32)>) {
         let mut o = EditOverlay::new();
+        let mut waiting = Vec::new();
         for (id, kind) in self.session.edits() {
             let (cell, idx) = id;
-            if cell >= self.db.cells.len() || idx as usize >= self.db.cell(cell).shapes.len() {
+            if cell >= self.db.cells.len() || idx as usize >= self.db.cell(cell).shape_count() {
                 continue;
             }
-            match kind {
-                fluideda_sync::EditKind::Delete => o.delete(id),
-                fluideda_sync::EditKind::Move { dx, dy } => {
-                    let c = self.db.cell(cell);
-                    let moved =
-                        fluideda_core::edit::translate(c.shapes.layer(idx as usize), c.shapes.points(idx as usize), dx, dy);
-                    o.move_shape(id, moved);
+            let c = self.db.cell(cell);
+            let base = c.shape_layer(idx as usize).zip(c.shape_points(idx as usize));
+            match (kind, base) {
+                (fluideda_sync::EditKind::Delete, _) => o.delete(id),
+                (fluideda_sync::EditKind::Move { dx, dy }, Some((layer, pts))) => {
+                    o.move_shape(id, fluideda_core::edit::translate(layer, pts, dx, dy));
                 }
                 // A vertex edit ships the full ring (SLICE 2 amendment); the layer
                 // comes from the receiver's own base — it never changes.
-                fluideda_sync::EditKind::SetPoints(points) => {
-                    let layer = self.db.cell(cell).shapes.layer(idx as usize);
+                (fluideda_sync::EditKind::SetPoints(points), Some((layer, _))) => {
                     o.move_shape(id, fluideda_core::Shape { layer, points });
                 }
+                (_, None) => waiting.extend(c.chunk_of(idx).map(|ci| (cell, ci))),
             }
         }
         // Hidden placements (Phase 5d "edit this placement only"). Out-of-range
         // keys (a peer on a different file) are ignored.
         for key in self.session.hidden() {
             let (parent, ii, _, _) = key;
-            if parent < self.db.cells.len() && (ii as usize) < self.db.cell(parent).instances.len() {
+            if parent < self.db.cells.len() && (ii as usize) < self.db.cell(parent).placement_count() {
                 o.hide_placement(key);
             }
         }
@@ -2412,8 +2844,36 @@ impl FluidApp {
             }
             o.add(id, g.cell, fluideda_core::Shape { layer: g.layer, points: g.points });
         }
-        o
+        waiting.sort_unstable();
+        waiting.dedup();
+        (o, waiting)
     }
+}
+
+/// The suppressed (deleted or moved-away) base shapes of chunk `(cell, ci)`,
+/// sorted: what its drawing must leave out.
+fn chunk_suppressed(db: &CellDb, overlay: &EditOverlay, (cell, ci): (CellId, u32)) -> Vec<u32> {
+    let Some(set) = overlay.suppressed_in(cell) else { return Vec::new() };
+    let Some(ch) = db.cell(cell).chunks.get(ci as usize) else { return Vec::new() };
+    let mut v: Vec<u32> = set.iter().copied().filter(|i| (ch.start..ch.end).contains(i)).collect();
+    v.sort_unstable();
+    v
+}
+
+/// Tessellate chunk `(cell, ci)` from its copy in memory without the shapes
+/// in `suppressed` (cell indices); `None` while a streamed chunk is not in
+/// memory (Phase 7.4).
+fn tessellate_resident(
+    db: &CellDb,
+    (cell, ci): (CellId, u32),
+    suppressed: &[u32],
+) -> Option<Vec<fluideda_core::LayerMesh>> {
+    let c = db.cell(cell);
+    let (store, base) = c.chunk_store(ci as usize)?;
+    let ch = c.chunks[ci as usize];
+    let local = fluideda_core::chunk::Chunk { start: ch.start - base, end: ch.end - base, bbox: ch.bbox };
+    let skip: HashSet<u32> = suppressed.iter().map(|&i| i - base).collect();
+    Some(fluideda_core::tessellate_chunk_filtered(store, &local, &skip))
 }
 
 /// Bbox of a ring (cell-local nm).
@@ -2437,7 +2897,8 @@ fn edit_regions(
 ) -> Vec<(CellId, fluideda_core::Bbox)> {
     let mut out = Vec::new();
     for &id in changed {
-        let mut b = ring_bbox(db.cell(id.0).shapes.points(id.1 as usize));
+        // (A streamed chunk not in memory contributes only the copies.)
+        let mut b = ring_bbox(db.cell(id.0).shape_points(id.1 as usize).unwrap_or(&[]));
         for s in [old.edited.get(&id), new.edited.get(&id)].into_iter().flatten() {
             let r = ring_bbox(&s.points);
             b.expand(r.min);
@@ -2577,7 +3038,7 @@ impl FluidApp {
             sel,
             sel_cell,
             sel_added,
-            self.db.cell(top).shapes.len(),
+            self.db.cell(top).shape_count(),
             self.drc.violation_count(),
             self.drc.pending_tiles(),
             // Vertex count of the selection's current geometry (Phase 5d:
@@ -2652,7 +3113,8 @@ impl FluidApp {
                     (Some(i), None) => (top, i),
                     _ => return,
                 };
-                if cell < self.db.cells.len() && (idx as usize) < self.db.cell(cell).shapes.len() {
+                if cell < self.db.cells.len() && (idx as usize) < self.db.cell(cell).shape_count() {
+                    self.want_shape_of((cell, idx));
                     self.selected = Some(Selection::Base((cell, idx)));
                     self.selection_set = vec![(Selection::Base((cell, idx)), Transform::IDENTITY)];
                     self.selected_path.clear();
@@ -2666,7 +3128,8 @@ impl FluidApp {
                 let c = parts.next().and_then(|s| s.parse::<usize>().ok());
                 let i = parts.next().and_then(|s| s.parse::<u32>().ok());
                 if let (Some(c), Some(i)) = (c, i) {
-                    if c < self.db.cells.len() && (i as usize) < self.db.cell(c).shapes.len() {
+                    if c < self.db.cells.len() && (i as usize) < self.db.cell(c).shape_count() {
+                        self.want_shape_of((c, i));
                         let hit = (Selection::Base((c, i)), Transform::IDENTITY);
                         if !self.selection_set.contains(&hit) {
                             self.selection_set.push(hit);
@@ -3061,8 +3524,8 @@ impl FluidApp {
             ui.separator();
             ui.label("Editing");
             if let Some(st) = &self.stream {
-                // Phase 6 SLICE 3: a streamed design is view-only.
-                ui.small("streamed from the server: view-only");
+                // Phase 7.4: a streamed design fetches what picks and edits need.
+                ui.small("streamed from the server: geometry fetched as needed");
                 ui.small(format!(
                     "resident {} chunks · {} MB GPU",
                     self.uploaded.len(),
@@ -3082,8 +3545,15 @@ impl FluidApp {
                     st.p_fetched,
                     st.p_evicted
                 ));
+                ui.small(format!(
+                    "shapes in memory: {} chunks ({} MB) · fetched {} · evicted {}",
+                    st.s_bytes.len(),
+                    st.s_resident_bytes / 1_048_576,
+                    st.s_fetched,
+                    st.s_evicted
+                ));
             }
-            ui.add_enabled(self.stream.is_none(), egui::Checkbox::new(&mut self.edit_mode, "Edit mode (click to select)"));
+            ui.checkbox(&mut self.edit_mode, "Edit mode (click to select)");
             if self.edit_mode {
                 // Phase 5 SLICE 1: the canvas tools + the layer new shapes draw on.
                 ui.horizontal(|ui| {
@@ -3536,7 +4006,7 @@ impl FluidApp {
                 let pts: Vec<Point> = match sel {
                     Selection::Base((cell, idx)) => match self.overlay.edited.get(&(cell, idx)) {
                         Some(shape) => shape.points.clone(),
-                        None => self.db.cell(cell).shapes.points(idx as usize).to_vec(),
+                        None => self.db.cell(cell).shape_points(idx as usize).map(<[Point]>::to_vec).unwrap_or_default(),
                     },
                     Selection::Added(id) => self
                         .overlay

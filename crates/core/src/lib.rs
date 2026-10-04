@@ -52,11 +52,14 @@ pub use drc::{
     DrcGridBuilder, DrcKind, DrcRules, DrcStep, LayerRule, PassStats, TileInput, TileJob, TileKey, Violation,
 };
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, PlacementKey, Shape};
-pub use flatten::{flatten_hop, flatten_placement, placement_counts, FLATTEN_LIMIT};
+pub use flatten::{flatten_hop, flatten_needs, flatten_placement, placement_counts, FLATTEN_LIMIT};
 pub use gds_write::write_gds;
 pub use oasis_write::write_oasis;
 pub use index::ShapeIndex;
-pub use pick::{pick_composite, pick_hierarchy, pick_in_cell, point_in_polygon, CompositeHit, PickHit, PickTarget};
+pub use pick::{
+    pick_composite, pick_composite_needs, pick_hierarchy, pick_in_cell, point_in_polygon, ChunkNeed, CompositeHit, PickHit,
+    PickTarget,
+};
 pub use serialize::{
     deserialize, deserialize_from, serialize, skeleton_meta, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse,
 };

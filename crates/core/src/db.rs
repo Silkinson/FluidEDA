@@ -104,7 +104,20 @@ pub struct Cell {
     /// neutral proxy). Set by the renderer's owner from `chunk_looks`, the
     /// palette and the visible layers; the cull hands it to the renderer.
     pub chunk_rgba: Vec<u32>,
+    /// A streamed design's cell whose shapes are fetched by chunk (Phase
+    /// 7.4): `shapes` stays empty and the chunks that are in memory live
+    /// here. Read shapes through [`Cell::shape_points`] /
+    /// [`Cell::chunk_store`], which serve both kinds of cell. `None` in-core.
+    pub remote_shapes: Option<RemoteShapes>,
     index: OnceCell<ShapeIndex>,
+}
+
+/// The resident shape chunks of a streamed cell (Phase 7.4): chunk `i`'s
+/// shapes as their own store — shape `chunks[i].start + j` of the cell is
+/// shape `j` there.
+#[derive(Default)]
+pub struct RemoteShapes {
+    pub chunks: Vec<Option<ShapeStore>>,
 }
 
 /// The resident placement chunks of a remote cell. Chunk `i` holds the
@@ -125,6 +138,7 @@ impl Cell {
             remote: None,
             chunk_looks: Vec::new(),
             chunk_rgba: Vec::new(),
+            remote_shapes: None,
             index: OnceCell::new(),
         }
     }
@@ -133,6 +147,81 @@ impl Cell {
     /// (a streamed design's cell table, Phase 7.3 SLICE B).
     pub fn make_remote(&mut self) {
         self.remote = Some(RemotePlacements { chunks: (0..self.inst_chunks.len()).map(|_| None).collect() });
+    }
+
+    /// Mark this cell's shapes as fetched by chunk, none resident yet (a
+    /// streamed design, Phase 7.4).
+    pub fn make_remote_shapes(&mut self) {
+        self.remote_shapes = Some(RemoteShapes { chunks: (0..self.chunks.len()).map(|_| None).collect() });
+    }
+
+    /// How many shapes the cell has, in memory or not.
+    pub fn shape_count(&self) -> usize {
+        match &self.remote_shapes {
+            None => self.shapes.len(),
+            Some(_) => self.chunks.last().map_or(0, |c| c.end as usize),
+        }
+    }
+
+    /// The store holding shape chunk `ci`, if it is in memory, and the cell
+    /// index of that store's shape 0 (in-core: the cell's own store, 0).
+    pub fn chunk_store(&self, ci: usize) -> Option<(&ShapeStore, u32)> {
+        match &self.remote_shapes {
+            None => (ci < self.chunks.len()).then_some((&self.shapes, 0)),
+            Some(r) => r.chunks.get(ci)?.as_ref().map(|s| (s, self.chunks[ci].start)),
+        }
+    }
+
+    /// Shape `i`'s ring, if it is in memory (always, in-core).
+    pub fn shape_points(&self, i: usize) -> Option<&[Point]> {
+        match &self.remote_shapes {
+            None => (i < self.shapes.len()).then(|| self.shapes.points(i)),
+            Some(_) => {
+                let ci = self.chunk_of(i as u32)? as usize;
+                let (store, base) = self.chunk_store(ci)?;
+                Some(store.points(i - base as usize))
+            }
+        }
+    }
+
+    /// Shape `i`'s layer, if it is in memory.
+    pub fn shape_layer(&self, i: usize) -> Option<Layer> {
+        match &self.remote_shapes {
+            None => (i < self.shapes.len()).then(|| self.shapes.layer(i)),
+            Some(_) => {
+                let ci = self.chunk_of(i as u32)? as usize;
+                let (store, base) = self.chunk_store(ci)?;
+                Some(store.layer(i - base as usize))
+            }
+        }
+    }
+
+    /// How many placements the cell has, in memory or not.
+    pub fn placement_count(&self) -> usize {
+        match &self.remote {
+            None => self.instances.len(),
+            Some(_) => self.inst_chunks.last().map_or(0, |c| c.end as usize),
+        }
+    }
+
+    /// Is shape chunk `ci` in memory?
+    pub fn chunk_resident(&self, ci: usize) -> bool {
+        self.chunk_store(ci).is_some()
+    }
+
+    /// The placements the cell has in memory, with their numbers: all of
+    /// them in-core, the resident placement chunks' of a remote cell.
+    pub fn resident_instances(&self) -> Box<dyn Iterator<Item = (u32, Instance)> + '_> {
+        match &self.remote {
+            None => Box::new(self.instances.iter().copied().enumerate().map(|(i, x)| (i as u32, x))),
+            Some(r) => Box::new(
+                self.inst_chunks
+                    .iter()
+                    .zip(&r.chunks)
+                    .filter_map(|(ch, c)| c.as_ref().map(move |v| (ch.start, v)))
+                    .flat_map(|(start, v)| v.iter().copied().enumerate().map(move |(k, x)| (start + k as u32, x))),
+            ),
+        }
     }
 
     /// Replace the cell's shape store (Phase 5c progressive load: a skeleton
@@ -245,7 +334,7 @@ impl Cell {
         chunks: Vec<Chunk>,
         inst_chunks: Vec<Chunk>,
     ) -> Self {
-        Self { name, shapes, instances, chunks, inst_chunks, remote: None, chunk_looks: Vec::new(), chunk_rgba: Vec::new(), index: OnceCell::new() }
+        Self { name, shapes, instances, chunks, inst_chunks, remote: None, chunk_looks: Vec::new(), chunk_rgba: Vec::new(), remote_shapes: None, index: OnceCell::new() }
     }
 }
 

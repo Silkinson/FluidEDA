@@ -1151,31 +1151,7 @@ pub fn fetch_placements(url: String, start: u64, end: u64, cell: usize, chunk: u
     wasm_bindgen_futures::spawn_local(async move {
         let t0 = js_sys::Date::now();
         let result = async {
-            let win = web_sys::window().ok_or("no window")?;
-            let init = web_sys::RequestInit::new();
-            let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
-            headers.set("Range", &format!("bytes={start}-{}", end - 1)).map_err(|e| format!("{e:?}"))?;
-            init.set_headers(&headers);
-            let req = web_sys::Request::new_with_str_and_init(&url, &init).map_err(|e| format!("{e:?}"))?;
-            let resp: web_sys::Response = {
-                use wasm_bindgen::JsCast;
-                wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&req))
-                    .await
-                    .map_err(|e| format!("GET {url}: {e:?}"))?
-                    .dyn_into()
-                    .map_err(|_| "not a Response".to_string())?
-            };
-            if resp.status() != 206 && resp.status() != 200 {
-                return Err(format!("GET {url}: HTTP {}", resp.status()));
-            }
-            let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?)
-                .await
-                .map_err(|e| format!("GET {url}: {e:?}"))?;
-            let mut bytes = js_sys::Uint8Array::new(&buf).to_vec();
-            if resp.status() == 200 {
-                // The server ignored Range: cut the record out.
-                bytes = bytes.get(start as usize..end as usize).ok_or("short placements blob")?.to_vec();
-            }
+            let bytes = fetch_range(&url, start, end).await?;
             let insts = fluideda_core::serialize::decode_instances(&bytes, cell_count).map_err(|e| e.to_string())?;
             Ok::<_, String>((insts, bytes.len()))
         }
@@ -1187,6 +1163,91 @@ pub fn fetch_placements(url: String, start: u64, end: u64, cell: usize, chunk: u
         };
         slot.borrow_mut().push(PlacementReply { cell, chunk, gen, result, bytes, ms });
     });
+}
+
+/// A shape chunk of a streamed design, arrived on the main thread for
+/// picking and editing (Phase 7.4).
+pub struct ShapeReply {
+    pub cell: usize,
+    pub chunk: u32,
+    pub gen: u32,
+    pub result: Result<fluideda_core::ShapeStore, String>,
+    pub bytes: usize,
+}
+
+pub type ShapeSlot = Rc<RefCell<Vec<ShapeReply>>>;
+
+/// Fetch shape chunk `(cell, chunk)` — bytes `start..end` of the pack's
+/// geometry blob — and decode it into a store of its own (shape `j` of the
+/// store is shape `chunk.start + j` of the cell). The tessellation worker
+/// fetches the same range for drawing; this copy is what picking and editing
+/// read, so it is only asked for when they need it.
+#[cfg(target_arch = "wasm32")]
+pub fn fetch_shape_chunk(url: String, start: u64, end: u64, cell: usize, chunk: u32, gen: u32, slot: ShapeSlot) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            let bytes = fetch_range(&url, start, end).await?;
+            let store = fluideda_core::pack::decode_store(&bytes).map_err(|e| e.to_string())?;
+            Ok::<_, String>((store, bytes.len()))
+        }
+        .await;
+        let (result, bytes) = match result {
+            Ok((store, n)) => (Ok(store), n),
+            Err(e) => (Err(e), 0),
+        };
+        slot.borrow_mut().push(ShapeReply { cell, chunk, gen, result, bytes });
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_shape_chunk(_url: String, _start: u64, _end: u64, _cell: usize, _chunk: u32, _gen: u32, _slot: ShapeSlot) {}
+
+/// Bytes `start..end` of `url` by HTTP range (a server ignoring Range is
+/// handled by cutting the range out of the whole body).
+///
+/// Chrome's HTTP cache can hand back a short body when the page and a worker
+/// read the same range at once (Phase 7.4: a few reads in 600, when a pick
+/// and the drawing fetch one chunk together): a short read is read again
+/// past the cache.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_range(url: &str, start: u64, end: u64) -> Result<Vec<u8>, String> {
+    let bytes = fetch_range_once(url, start, end, web_sys::RequestCache::Default).await?;
+    if bytes.len() as u64 == end - start {
+        return Ok(bytes);
+    }
+    let bytes = fetch_range_once(url, start, end, web_sys::RequestCache::NoStore).await?;
+    if bytes.len() as u64 != end - start {
+        return Err(format!("GET {url}: {} bytes for a {}-byte range", bytes.len(), end - start));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn fetch_range_once(url: &str, start: u64, end: u64, cache: web_sys::RequestCache) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+    let win = web_sys::window().ok_or("no window")?;
+    let init = web_sys::RequestInit::new();
+    init.set_cache(cache);
+    let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+    headers.set("Range", &format!("bytes={start}-{}", end - 1)).map_err(|e| format!("{e:?}"))?;
+    init.set_headers(&headers);
+    let req = web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{e:?}"))?;
+    let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&req))
+        .await
+        .map_err(|e| format!("GET {url}: {e:?}"))?
+        .dyn_into()
+        .map_err(|_| "not a Response".to_string())?;
+    if resp.status() != 206 && resp.status() != 200 {
+        return Err(format!("GET {url}: HTTP {}", resp.status()));
+    }
+    let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?)
+        .await
+        .map_err(|e| format!("GET {url}: {e:?}"))?;
+    let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+    if resp.status() == 200 {
+        return bytes.get(start as usize..end as usize).map(<[u8]>::to_vec).ok_or_else(|| "short blob".to_string());
+    }
+    Ok(bytes)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

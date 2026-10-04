@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-10-03 · current branch: `phase7` (off `phase6-backend-oasis`)_
+_Last updated: 2026-10-04 · current branch: `phase7` (off `phase6-backend-oasis`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -40,6 +40,20 @@ front.
   composite through the palette), not neutral slate. flat_11M at fit: pixels
   visibly off a full load 71% → 18%, mean difference 22.6 → 13.0. The plan's
   "dominant layer" was measured worse (30.2) and dropped. **7.3 is done.**
+* **7.4 SLICE A — pick and edit streamed designs.** Cells read shapes
+  through per-chunk stores fetched on demand. A pick fetches the shape and
+  placement chunks under the point, then answers: 128 of 128 picks over
+  eight caravel views match in-core (median 46 ms). Delete, vertex move and
+  nudge on caravel_core are pixel-identical to in-core and undo cleanly.
+  Under a 1 MB budget, 2,127 chunks are evicted but the 4 the edits need
+  stay pinned. Found on the way:
+  - Chrome's HTTP cache can return short bodies for concurrent range reads
+    (now re-read past the cache).
+  - Edits made at one view vanished after a zoom (a pre-existing overlay
+    bug, fixed in-core too).
+
+  Next: rooms and "edit this placement only" (SLICE B), then server-side
+  export (SLICE C).
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -91,7 +105,7 @@ front.
     worker panics) opens streamed: first frame 45 ms, 8 MB main heap.
   - caravel streamed: first frame 79 ms (in-core 873 ms), pixel-identical to
     in-core wherever chunks are fetched.
-  - Streamed designs are view-only.
+  - Streamed designs were view-only (picking and editing: 7.4).
 
 **Phase 5d shipped: the editing follow-ons** on `phase5d-editing` — every
 deferred editing item named in code since Phase 3.

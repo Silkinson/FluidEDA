@@ -41,13 +41,22 @@ function recordColumns(buf) {
   };
 }
 
-async function fetchRecord(msg) {
-  const t0 = performance.now();
-  const r = await fetch(msg.url, { headers: { Range: `bytes=${msg.start}-${msg.end - 1}` } });
-  if (r.status !== 206 && r.status !== 200) throw new Error(`fetch ${msg.url}: HTTP ${r.status}`);
+async function fetchRange(url, start, end, cache) {
+  const r = await fetch(url, { cache, headers: { Range: `bytes=${start}-${end - 1}` } });
+  if (r.status !== 206 && r.status !== 200) throw new Error(`fetch ${url}: HTTP ${r.status}`);
   let buf = await r.arrayBuffer();
   // A server that ignores Range sends the whole blob: cut the record out.
-  if (r.status === 200) buf = buf.slice(msg.start, msg.end);
+  if (r.status === 200) buf = buf.slice(start, end);
+  return buf;
+}
+
+async function fetchRecord(msg) {
+  const t0 = performance.now();
+  let buf = await fetchRange(msg.url, msg.start, msg.end, 'default');
+  // Chrome's HTTP cache can hand back a short body when the page and this
+  // worker read the same range at once (Phase 7.4: a few in 600). Read it
+  // again past the cache.
+  if (buf.byteLength !== msg.end - msg.start) buf = await fetchRange(msg.url, msg.start, msg.end, 'no-store');
   return { buf, fetch_ms: performance.now() - t0 };
 }
 

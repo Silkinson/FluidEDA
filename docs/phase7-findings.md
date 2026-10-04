@@ -3,7 +3,8 @@
 **Status: in progress on `phase7`.** The owner moved 7.3 (stream the
 hierarchy) to the front. **7.3 is done** in three slices: **A** placement
 chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
-proxies (pack v4).
+proxies (pack v4). **7.4** (edit streamed designs) is under way: **A**
+picking and editing.
 
 ## 7.3 SLICE A — placement chunks
 
@@ -179,3 +180,80 @@ golden images too. Core tests cover coverage (a lattice reads ≈5% per
 layer) and the look's round trip through the cell table; render tests cover
 the composite (a full single layer is that layer, a hidden layer adds
 nothing, sparse coverage is translucent).
+
+## 7.4 SLICE A — picking and editing a streamed design
+
+**Problem.** A streamed design keeps no shapes in main memory: the
+tessellation worker fetches a chunk's record, draws it and drops it. Picking,
+selection, moves, vertex edits and redrawing an edited chunk all read base
+geometry, so streamed designs were view-only.
+
+**Design.**
+- **Shapes by chunk.** Every cell of a streamed design reads its shapes
+  through per-chunk stores (`Cell::remote_shapes`). The accessors
+  (`shape_points`, `shape_layer`, `chunk_store`, `resident_instances`) serve
+  in-core and streamed cells alike, and say when something is not in memory.
+- **Picks fetch what they need.** `pick_composite_needs` also returns the
+  shape and placement chunks whose footprints hold the point but are not in
+  memory. The app fetches them on the main thread by byte range (≤ 8 shape
+  and 16 placement fetches in flight) and picks again each frame until
+  nothing is missing: a placement chunk can reveal deeper cells' chunks. A
+  pick waiting for chunks pauses eviction (see below).
+- **Edits wait for their base.** A move or vertex edit whose chunk is not in
+  memory (a peer's edit, say) is left out of the overlay until that chunk
+  arrives, then reconciled. Chunks holding edited shapes or the selection are
+  pinned; the rest are evicted least-recently-needed over 128 MB
+  (`?shape_budget=`).
+- **Edited chunks redraw in place.** In-core, a big edited chunk is split
+  into finer chunks. A streamed design cannot do that, because the pack's
+  byte offsets are per chunk. Instead the drawn chunk is re-tessellated from
+  its copy in memory, minus its suppressed shapes, and swapped in (no proxy
+  flash). This happens only when the chunk's suppressed set changes, so a
+  drag re-tessellates once. A chunk the worker draws whole while it has
+  suppressed shapes is redrawn filtered. (The plan had suppression lists sent
+  to the worker. The chunk has to be in memory anyway, for the moved copy
+  and the overlay, so the main thread does it.)
+- **No double downloads.** A chunk a pick or edit brought into memory is
+  drawn from that copy (posted to the worker), not fetched again.
+- Still view-only: "edit this placement only" (needs every cell's placement
+  count: SLICE B), rooms (SLICE B), DRC, and export (server-side: SLICE C).
+
+**Found by the browser test.**
+- **Chrome returns short bodies for concurrent range reads.** When the page
+  and a worker read the same byte range of one blob at once, Chrome's HTTP
+  cache sometimes returns a short body. A probe hit 2 and 6 short reads in
+  599. With `cache: 'no-store'` there were 0. Node against the server and
+  against the trunk proxy also gave 0 in 4,800. A short read is now detected
+  and read again past the cache, in the worker and on the main thread.
+- **Picks livelocked under a tight budget.** A pick's first chunk was evicted
+  while its second was in flight, so the pick only ended at its 15 s timeout.
+  Eviction now pauses while a pick is waiting.
+- **Pre-existing (Phase 3): edits vanished after a view change.** The
+  overlay (moved copies, drawn shapes) is culled to the view, but it was
+  re-uploaded only on an edit. An edit made at one view did not show after
+  zooming elsewhere, until the next edit. This happened in-core too. The
+  overlay is now re-uploaded whenever the visible part differs.
+
+**Correctness.**
+- Core test: on a design with a remote 20 k-placement cell and a
+  multi-chunk flat cell, a streamed pick that fetches exactly what it
+  reports missing (repeatedly, as placements reveal cells) picks what
+  in-core picks, with only part of the flat cell fetched.
+- `stream_edit_test` (caravel, WebGPU) compares a streamed page against an
+  in-core page throughout. The 8-view `stream_test` (0 px) and the two-peer
+  `edit_sync_test` still pass.
+
+**Measured** (`stream_edit_test.mjs`, caravel, WebGPU, headless):
+
+| check | result |
+|---|---|
+| 128 picks over the 8 stream_test views | **128 of 128** pick the same shape (cell, index, vertex count) in-core and streamed |
+| streamed pick latency | median **46 ms**, max 139 ms (fetching 143 shape chunks, 73.9 MB, and 7 placement chunks in all) |
+| delete + vertex move + nudge on caravel_core | streamed = in-core, **0 of 688,000 pixels**; the edits changed 11,507 |
+| undo ×3 | both back to the original, 0 px |
+| 1 MB shape budget, 128 picks after the edits | 2,127 chunks evicted, 4 kept (5.2 MB, the edited ones); edited view still 0 px off |
+| main heap | streamed 128 MB with 74 MB of shapes held; 79 MB under the 1 MB budget; in-core 361 MB |
+
+The heap is a high-water mark: wasm memory never shrinks, and a pick
+waiting for chunks holds everything fetched for it.
+

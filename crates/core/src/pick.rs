@@ -25,6 +25,15 @@ use crate::db::{Cell, CellDb, CellId};
 use crate::transform::Transform;
 use crate::types::{Bbox, Point};
 
+/// A chunk a streamed design must have in memory before a pick at some point
+/// can be trusted (Phase 7.4): shape chunk or placement chunk `(cell, i)`
+/// whose footprint holds the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ChunkNeed {
+    Shapes(CellId, u32),
+    Placements(CellId, u32),
+}
+
 /// A hierarchy hit: the base shape (cell master + index) plus the world transform
 /// of the placement that was clicked (for the selection highlight and for mapping
 /// a world-space drag into the cell's local frame).
@@ -42,21 +51,33 @@ pub struct PickHit {
 /// Chunk-bbox prefilter + linear scan of the containing chunk(s) — no R-tree
 /// build (see the module note).
 pub fn pick_in_cell(cell: &Cell, p: Point) -> Option<u32> {
-    pick_in_cell_except(cell, p, None)
+    pick_in_cell_except(cell, 0, p, None, &mut Vec::new())
 }
 
 /// [`pick_in_cell`] skipping base shapes in `skip` (tombstoned / moved away).
-fn pick_in_cell_except(cell: &Cell, p: Point, skip: Option<&std::collections::HashSet<u32>>) -> Option<u32> {
+/// A streamed cell's chunks that hold the point but are not in memory are
+/// skipped and reported in `needs` (Phase 7.4).
+fn pick_in_cell_except(
+    cell: &Cell,
+    id: CellId,
+    p: Point,
+    skip: Option<&std::collections::HashSet<u32>>,
+    needs: &mut Vec<ChunkNeed>,
+) -> Option<u32> {
     let mut best: Option<(u32, i64)> = None;
-    for chunk in &cell.chunks {
+    for (ci, chunk) in cell.chunks.iter().enumerate() {
         if !bbox_contains(&chunk.bbox, p) {
             continue; // point outside this chunk's (loose) bbox
         }
+        let Some((store, base)) = cell.chunk_store(ci) else {
+            needs.push(ChunkNeed::Shapes(id, ci as u32));
+            continue;
+        };
         for i in chunk.start..chunk.end {
             if skip.is_some_and(|s| s.contains(&i)) {
                 continue;
             }
-            let pts = cell.shapes.points(i as usize);
+            let pts = store.points((i - base) as usize);
             // Cheap per-shape bbox reject before the full point-in-polygon test.
             if !shape_bbox_contains(pts, p) {
                 continue;
@@ -105,14 +126,14 @@ fn walk_pick(
     if let Some(idx) = pick_in_cell(cell, local) {
         // Compare hits by WORLD area so a small leaf feature beats the big cell
         // it sits inside, regardless of each cell's local scale.
-        let area = bbox_area(cell.shapes.points(idx as usize)) as f64 * world_tf.det().abs();
+        let area = bbox_area(cell.shape_points(idx as usize).unwrap_or(&[])) as f64 * world_tf.det().abs();
         if best.as_ref().map_or(true, |&(_, a)| area < a) {
             *best = Some((PickHit { id: (id, idx), world_tf }, area));
         }
     }
 
     // Descend into child instances whose world footprint contains the point.
-    for inst in &cell.instances {
+    for (_, inst) in cell.resident_instances() {
         match inst.kind {
             crate::db::InstanceKind::Single => {
                 walk_pick(db, inst.child, world_tf.then(&inst.transform), world, best);
@@ -171,6 +192,19 @@ pub struct CompositeHit {
 /// overlay geometry, so a shape drawn just past a cell's original extent is
 /// still hit (an ancestor's precomputed bbox is not grown — a documented edge).
 pub fn pick_composite(db: &CellDb, overlay: &crate::edit::EditOverlay, world: Point) -> Option<CompositeHit> {
+    pick_composite_needs(db, overlay, world).0
+}
+
+/// [`pick_composite`] for a design that may be streamed (Phase 7.4): also the
+/// chunks under the point that are not in memory. The hit is only final when
+/// that list is empty — a missing chunk may hold a better candidate, or the
+/// placements to descend through — so a streamed design fetches them and
+/// picks again. In-core designs never report any.
+pub fn pick_composite_needs(
+    db: &CellDb,
+    overlay: &crate::edit::EditOverlay,
+    world: Point,
+) -> (Option<CompositeHit>, Vec<ChunkNeed>) {
     let mut grown: std::collections::HashMap<CellId, Bbox> = std::collections::HashMap::new();
     let mut grow = |cell: CellId, pts: &[Point]| {
         let b = grown.entry(cell).or_insert_with(|| db.local_bbox(cell));
@@ -186,8 +220,11 @@ pub fn pick_composite(db: &CellDb, overlay: &crate::edit::EditOverlay, world: Po
     }
     let mut best: Option<(CompositeHit, f64)> = None;
     let mut path = Vec::new();
-    walk_composite(db, overlay, &grown, db.top, Transform::IDENTITY, world, &mut path, &mut best);
-    best.map(|(h, _)| h)
+    let mut needs = Vec::new();
+    walk_composite(db, overlay, &grown, db.top, Transform::IDENTITY, world, &mut path, &mut best, &mut needs);
+    needs.sort_unstable();
+    needs.dedup();
+    (best.map(|(h, _)| h), needs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -200,6 +237,7 @@ fn walk_composite(
     world: Point,
     path: &mut Vec<crate::edit::PlacementKey>,
     best: &mut Option<(CompositeHit, f64)>,
+    needs: &mut Vec<ChunkNeed>,
 ) {
     let local_bb = grown.get(&id).copied().unwrap_or_else(|| db.local_bbox(id));
     if local_bb.min.x > local_bb.max.x {
@@ -219,8 +257,8 @@ fn walk_composite(
             *best = Some((CompositeHit { target, world_tf, path: path.clone() }, area));
         }
     };
-    if let Some(idx) = pick_in_cell_except(cell, local, overlay.suppressed_in(id)) {
-        offer(PickTarget::Base((id, idx)), cell.shapes.points(idx as usize), false);
+    if let Some(idx) = pick_in_cell_except(cell, id, local, overlay.suppressed_in(id), needs) {
+        offer(PickTarget::Base((id, idx)), cell.shape_points(idx as usize).unwrap_or(&[]), false);
     }
     if overlay.edits_cell(id) {
         for (&(c, i), s) in &overlay.edited {
@@ -234,15 +272,23 @@ fn walk_composite(
             }
         }
     }
-    for (ii, inst) in cell.instances.iter().enumerate() {
-        let ii = ii as u32;
+    // A streamed cell's placement chunks under the point that are not in
+    // memory hide whatever they place there.
+    if let Some(remote) = &cell.remote {
+        for (ci, ch) in cell.inst_chunks.iter().enumerate() {
+            if remote.chunks[ci].is_none() && bbox_contains(&ch.bbox, local) {
+                needs.push(ChunkNeed::Placements(id, ci as u32));
+            }
+        }
+    }
+    for (ii, inst) in cell.resident_instances() {
         match inst.kind {
             crate::db::InstanceKind::Single => {
                 if overlay.is_hidden((id, ii, 0, 0)) {
                     continue;
                 }
                 path.push((id, ii, 0, 0));
-                walk_composite(db, overlay, grown, inst.child, world_tf.then(&inst.transform), world, path, best);
+                walk_composite(db, overlay, grown, inst.child, world_tf.then(&inst.transform), world, path, best, needs);
                 path.pop();
             }
             crate::db::InstanceKind::Array { cols, rows, col_step, row_step } => {
@@ -262,7 +308,7 @@ fn walk_composite(
                         }
                         let t = world_tf.then(&crate::cull::placement(&inst.transform, col_step, row_step, c, r));
                         path.push((id, ii, c, r));
-                        walk_composite(db, overlay, grown, inst.child, t, world, path, best);
+                        walk_composite(db, overlay, grown, inst.child, t, world, path, best, needs);
                         path.pop();
                     }
                 }
