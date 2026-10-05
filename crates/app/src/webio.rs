@@ -11,6 +11,48 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+// --- Phase 7.1a: waking an idle UI ----------------------------------------------
+
+thread_local! {
+    /// The UI to wake when an async result lands. The app repaints only while
+    /// work is pending, so a reply arriving while it idles must ask for a frame.
+    static WAKER: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
+}
+
+/// Remember the UI context [`wake`] repaints.
+pub fn set_waker(ctx: &egui::Context) {
+    WAKER.with(|w| *w.borrow_mut() = Some(ctx.clone()));
+}
+
+/// Ask for a frame: an async result (a worker reply, a fetch) just landed.
+pub fn wake() {
+    WAKER.with(|w| {
+        if let Some(ctx) = w.borrow().as_ref() {
+            ctx.request_repaint();
+        }
+    });
+}
+
+/// The test harness drives the app by writing `window.__fluideda_cmd`; make
+/// that write wake the UI too, or an idle app would take each command up to
+/// a heartbeat later. (A property with a setter: the harness is unchanged.)
+#[cfg(target_arch = "wasm32")]
+pub fn wake_on_test_commands() {
+    use wasm_bindgen::JsCast;
+    let wake_fn = wasm_bindgen::closure::Closure::<dyn Fn()>::new(wake);
+    let define = js_sys::Function::new_with_args(
+        "wake",
+        "let v = window.__fluideda_cmd || ''; \
+         Object.defineProperty(window, '__fluideda_cmd', { configurable: true, \
+           get() { return v; }, set(x) { v = x; if (x) wake(); } });",
+    );
+    let _ = define.call1(&wasm_bindgen::JsValue::NULL, wake_fn.as_ref().unchecked_ref());
+    wake_fn.forget();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn wake_on_test_commands() {}
+
 /// Async loads (fetch / picker) drop their (name, bytes) here for the app to
 /// parse synchronously on the next frame (fallback path).
 pub type LoadSlot = Rc<RefCell<Option<(String, Vec<u8>)>>>;
@@ -129,7 +171,10 @@ pub fn read_dropped(name: String, file: egui::DroppedFileHandle, slot: LoadSlot,
     }
     wasm_bindgen_futures::spawn_local(async move {
         match file.bytes_async().await {
-            Ok(bytes) => *slot.borrow_mut() = Some((name, bytes)),
+            Ok(bytes) => {
+                *slot.borrow_mut() = Some((name, bytes));
+                wake();
+            }
             Err(e) => log::error!("read dropped {name} failed: {e}"),
         }
     });
@@ -177,6 +222,7 @@ pub fn spawn_fetch(url: String, slot: LoadSlot) {
         let bytes = js_sys::Uint8Array::new(&buf).to_vec();
         log::info!("fetched {} ({} bytes)", name, bytes.len());
         *slot.borrow_mut() = Some((name, bytes));
+        wake();
     });
 }
 
@@ -209,6 +255,7 @@ pub fn spawn_picker(slot: LoadSlot, sources: SourceSlot) {
         let name = file.name();
         if worker_supported() {
             *sources.borrow_mut() = Some((name, crate::design::DesignSource::File(file)));
+            wake();
             return;
         }
         let slot = slot.clone();
@@ -218,6 +265,7 @@ pub fn spawn_picker(slot: LoadSlot, sources: SourceSlot) {
                     let bytes = js_sys::Uint8Array::new(&buf).to_vec();
                     log::info!("picked {} ({} bytes)", name, bytes.len());
                     *slot.borrow_mut() = Some((name, bytes));
+                    wake();
                 }
                 Err(e) => log::error!("read picked file failed: {e:?}"),
             }
@@ -395,6 +443,7 @@ fn run_worker(
         if kind == "hash" {
             *hash_slot.borrow_mut() = Some((get_str(&data, "hash").unwrap_or_default(), get_f64(&data, "hash_ms")));
             worker_for_msg.terminate();
+            wake();
             return;
         }
         // type == "done": rebuild the Design from the transferred columns. The
@@ -432,6 +481,7 @@ fn run_worker(
                 worker_for_msg.terminate();
             }
         }
+        wake();
     });
     worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
     onmessage.forget(); // keep alive for the worker's two messages (done, hash)
@@ -504,6 +554,7 @@ impl fluideda_core::ColumnSource for JsColumns {
 fn fail(slot: &DesignSlot, msg: String) {
     log::error!("{msg}");
     *slot.borrow_mut() = Some(Err(msg));
+    wake();
 }
 
 // --- message field extraction (all wasm-only) -------------------------------
@@ -615,6 +666,7 @@ impl TessWorker {
                     }
                     _ => {}
                 }
+                wake();
             });
         worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
         Ok(Self { worker, _onmessage: onmessage })
@@ -818,6 +870,7 @@ impl DrcPool {
                     violations,
                     error,
                 });
+                wake();
             });
             w.set_onmessage(Some(h.as_ref().unchecked_ref()));
             workers.push(w);
@@ -966,6 +1019,7 @@ pub fn export_on_server(design: String, oasis: bool, state: Vec<u8>, name: Strin
         }
         .await;
         *slot.borrow_mut() = result.unwrap_or_else(ExportState::Failed);
+        wake();
     });
 }
 
@@ -1063,6 +1117,7 @@ pub fn fetch_room(room: String, slot: RoomSlot) {
         }
         .await;
         *slot.borrow_mut() = Some(result);
+        wake();
     });
 }
 
@@ -1111,6 +1166,7 @@ pub fn ensure_blob(hash: String, source: crate::design::DesignSource, embedded: 
         }
         .await;
         *slot.borrow_mut() = result.unwrap_or_else(UploadState::Failed);
+        wake();
     });
 }
 
@@ -1204,6 +1260,7 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
         }
         .await;
         *slot.borrow_mut() = Some(result);
+        wake();
     });
 }
 
@@ -1243,6 +1300,7 @@ pub fn fetch_placements(url: String, start: u64, end: u64, cell: usize, chunk: u
             Err(e) => (Err(e), 0),
         };
         slot.borrow_mut().push(PlacementReply { cell, chunk, gen, result, bytes, ms });
+        wake();
     });
 }
 
@@ -1277,6 +1335,7 @@ pub fn fetch_shape_chunk(url: String, start: u64, end: u64, cell: usize, chunk: 
             Err(e) => (Err(e), 0),
         };
         slot.borrow_mut().push(ShapeReply { cell, chunk, gen, result, bytes });
+        wake();
     });
 }
 

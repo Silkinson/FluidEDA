@@ -53,6 +53,13 @@ const STREAM_PLACEMENTS_IN_FLIGHT: usize = 16;
 /// Streaming: resident placements kept before the least recently walked
 /// placement chunks are evicted. `?placement_budget=<MB>` overrides it.
 const STREAM_PLACEMENT_BUDGET: usize = 64 << 20;
+/// Phase 7.1a: an idle app draws this often — a safety net for anything that
+/// changes without waking it (a retry timer, a reconnect backoff).
+const IDLE_HEARTBEAT_MS: u64 = 250;
+/// Phase 7.1a: after anything happens (input, a command, a result), every
+/// frame is drawn for this long (s), so follow-up work runs at full rate.
+const ACTIVE_LINGER_S: f64 = 0.5;
+
 /// Streaming (Phase 7.4): shape chunks held in main memory for picking and
 /// editing before the least recently needed unpinned ones are evicted.
 /// `?shape_budget=<MB>` overrides it.
@@ -212,6 +219,11 @@ impl Stream {
         (self.info.offsets[k], self.info.offsets[k + 1])
     }
 
+    /// Fetches or redraws still under way (Phase 7.1a).
+    fn busy(&self) -> bool {
+        !self.p_inflight.is_empty() || !self.s_inflight.is_empty() || !self.wants.is_empty() || !self.retess.is_empty()
+    }
+
     /// Fetch placement chunk `key` on the main thread (by byte range).
     fn fetch_placements(&mut self, key: (CellId, u32), cells: usize) {
         let k = (self.inst_base[key.0] + key.1) as usize;
@@ -252,7 +264,9 @@ enum PickMode {
     Replace,
     /// Toggle the shape in the selection (a shift-click).
     Toggle,
-    /// Replace the selection, then "edit this placement only" there.
+    /// Replace the selection, then "edit this placement only" there (the
+    /// web harness's `flatten_at`).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     Flatten,
 }
 
@@ -572,6 +586,12 @@ pub struct FluidApp {
     last_frame: f64,
     fps: f32,
     dragging: bool,
+    /// `?continuous`: draw every frame, idle or not (the fps benchmarks).
+    continuous: bool,
+    /// Draw every frame until this app time (s) — something just happened.
+    active_until: f64,
+    /// Visible chunks left for a later frame by the per-frame limits.
+    backlog: usize,
 }
 
 impl FluidApp {
@@ -588,6 +608,9 @@ impl FluidApp {
         if let Some(state) = cc.wgpu_render_state.as_ref() {
             init_renderer(state);
         }
+        // Phase 7.1a: async results and harness commands wake an idle UI.
+        webio::set_waker(&cc.egui_ctx);
+        webio::wake_on_test_commands();
 
         let mut camera = Camera::new(Vec2::new(1280.0, 800.0));
         camera.fit(design.bbox_min, design.bbox_max);
@@ -724,6 +747,9 @@ impl FluidApp {
             last_frame: 0.0,
             fps: 0.0,
             dragging: false,
+            continuous: webio::query_flag("continuous"),
+            active_until: 0.0,
+            backlog: 0,
         };
         app.metrics.hash = HIER_SHA256.to_string();
         app.layer_visible = vec![true; app.layers.len()];
@@ -977,6 +1003,7 @@ impl FluidApp {
     /// Pick at `world`, then "edit this placement only" there (the
     /// `flatten_at` driver) — on a streamed design, once the pick has its
     /// chunks.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn pick_and_flatten(&mut self, world: Vec2) {
         match self.pick(world) {
             Ok(hit) => self.apply_pick_flatten(world, hit),
@@ -1795,6 +1822,7 @@ impl FluidApp {
     ///   * a small pristine chunk tessellates inline — a round-trip isn't worth it.
     /// Dispatches and uploads are rate-limited so no single frame stalls.
     fn ensure_uploaded(&mut self, frame: &mut eframe::Frame) {
+        self.backlog = 0;
         let Some(rs) = frame.wgpu_render_state() else { return };
         let device = rs.device.clone();
         let mut guard = rs.renderer.write();
@@ -1921,6 +1949,7 @@ impl FluidApp {
             // offload mode — tessellates inline. See the fn note for the rationale.
             if offload && !d.dirty && chunk.len() >= TESS_WORKER_MIN_SHAPES {
                 if dispatched >= TESS_JOBS_PER_FRAME {
+                    self.backlog += 1;
                     continue; // dispatch budget spent; the proxy holds, retry next frame
                 }
                 if self.tess.is_none() {
@@ -1993,6 +2022,7 @@ impl FluidApp {
 
     /// Ask for base shape `id`'s chunk to be in memory (a streamed design's
     /// selection, Phase 7.4). In-core it always is.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fn want_shape_of(&mut self, id: BaseShapeId) {
         let Some(ci) = self.db.cell(id.0).chunk_of(id.1) else { return };
         if let Some(st) = &mut self.stream {
@@ -2309,6 +2339,7 @@ impl FluidApp {
                 }
             }
             if self.tess_pending.len() >= STREAM_MAX_IN_FLIGHT || dispatched >= TESS_JOBS_PER_FRAME {
+                self.backlog += 1;
                 continue; // stays a proxy this frame
             }
             if self.tess.is_none() {
@@ -2470,6 +2501,32 @@ impl FluidApp {
         }
     }
 
+    /// Is work in progress that advances frame by frame (Phase 7.1a)?
+    /// Results that arrive asynchronously wake the UI themselves.
+    fn busy(&self) -> bool {
+        self.busy_reason().is_some()
+    }
+
+    /// What keeps the app drawing every frame, if anything (published for
+    /// the harness).
+    fn busy_reason(&self) -> Option<&'static str> {
+        let reasons = [
+            (self.load_in_flight, "load"),
+            (self.loading.is_some(), "loading"),
+            (self.pending_hash.is_some(), "hash"),
+            (self.awaiting_first_frame, "first_frame"),
+            (self.backlog > 0, "backlog"),
+            (!self.tess_pending.is_empty(), "tess"),
+            (!self.tess_results.borrow().is_empty(), "tess_results"),
+            (!self.dirty_keys.is_empty() || self.overlay_dirty, "edit"),
+            (self.pending_pick.is_some() || self.pending_flatten.is_some(), "pick"),
+            (self.stream.as_ref().is_some_and(Stream::busy), "stream"),
+            (self.drc_enabled && self.drc.is_busy(), "drc"),
+            (self.session.is_connecting(), "connecting"),
+        ];
+        reasons.iter().find(|(b, _)| *b).map(|&(_, r)| r)
+    }
+
     /// Is `cell`'s geometry in place? (Always, except while an installed
     /// progressive design is still filling in.)
     fn cell_loaded(&self, cell: CellId) -> bool {
@@ -2545,7 +2602,7 @@ impl FluidApp {
              \"p_evicted\":{},\"p_in_flight\":{},\"p_wanted\":{},\"p_failures\":{},\"dense_inst\":{},\"proxies\":{},\
              \"s_fetched\":{},\"s_fetched_bytes\":{},\"s_resident\":{},\"s_resident_bytes\":{},\"s_evicted\":{},\
              \"s_in_flight\":{},\"s_failures\":{},\"wants\":{},\"pick_pending\":{},\"pick_us\":{:.0},\
-             \"retess\":{},\"flatten_pending\":{}}}",
+             \"retess\":{},\"flatten_pending\":{},\"busy\":\"{}\"}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -2613,6 +2670,7 @@ impl FluidApp {
             self.last_pick_us,
             self.stream.as_ref().map_or(0, |s| s.retess.len()),
             self.pending_flatten.is_some(),
+            self.busy_reason().unwrap_or(""),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -2740,6 +2798,7 @@ impl FluidApp {
             return;
         }
         self.session.local.name = self.name.clone();
+        self.session.set_wakeup(std::sync::Arc::new(webio::wake));
         match self.session.join(&url) {
             Ok(()) => log::info!("joining {url}"),
             Err(e) => log::error!("join failed: {e}"),
@@ -3034,7 +3093,18 @@ impl eframe::App for FluidApp {
         self.ensure_uploaded(frame);
         self.run_drc_budget();
 
-        ctx.request_repaint();
+        // Phase 7.1a: draw every frame only while work is in progress or
+        // something just happened; an idle app drops to a 4 fps heartbeat.
+        // (Async results wake it: `webio::wake`, the socket's wake-up.)
+        let input = ctx.input(|i| !i.raw.events.is_empty() || i.pointer.any_down() || !i.raw.hovered_files.is_empty());
+        if input || self.busy() {
+            self.active_until = now + ACTIVE_LINGER_S;
+        }
+        if self.continuous || now < self.active_until {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(IDLE_HEARTBEAT_MS));
+        }
 
         // Record the longest main-thread frame since load, and publish the perf
         // snapshot for the browser harness (STEP 2 measurement).
@@ -3058,6 +3128,7 @@ impl FluidApp {
         if let Ok(v) = js_sys::Reflect::get(&w, &"__fluideda_cmd".into()) {
             if let Some(cmd) = v.as_string() {
                 if !cmd.is_empty() {
+                    self.active_until = self.last_frame + ACTIVE_LINGER_S;
                     self.run_test_command(&cmd);
                     let _ = js_sys::Reflect::set(&w, &"__fluideda_cmd".into(), &"".into());
                 }

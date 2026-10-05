@@ -4,7 +4,8 @@
 hierarchy) to the front. **7.3 is done** in three slices: **A** placement
 chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
 proxies (pack v4). **7.4 is done** (edit streamed designs): **A** picking and editing, **B**
-rooms and "edit this placement only", **C** server-side export.
+rooms and "edit this placement only", **C** server-side export. The owner
+then asked to finish all of Phase 7: **7.1a** (idle repaint) is done.
 
 ## 7.3 SLICE A — placement chunks
 
@@ -386,3 +387,46 @@ orders and gets identical GDS and OASIS.
   - An edited chunk of a streamed cell cannot be split finer. A shape in a
     100 k-shape single-chunk cell re-tessellates that whole chunk once per
     suppression change (in-core splits it to 3 k).
+
+## 7.1a — stop repainting when idle
+
+**Problem.** The app asked for a repaint at the end of every frame, so an
+untouched tab drew at the display rate and kept the main thread busy.
+Measured in headless Chromium at 120 Hz: the embedded sample drew 120
+frames/s (22% main thread), caravel in-core 30 frames/s with the main thread
+at 100% (each frame redoes the 17.5 ms fit-view cull).
+
+**Design.**
+- Draw every frame only while work is in progress or for 0.5 s after
+  anything happened. Work in progress means a load, tessellation or chunk
+  fetches in flight, chunks left by the per-frame limits, a pick or flatten
+  waiting, an edit's redraw, DRC, or a socket connecting. Anything that
+  happened means input, a harness command, or a result arriving. Otherwise a
+  250 ms heartbeat (4 frames/s) covers retry timers and reconnect backoff.
+- Async results wake the UI themselves: `webio::wake()` runs at every
+  completion (worker replies, fetches, uploads, exports, room lookups). The
+  socket uses ewebsock's `connect_with_wakeup`.
+- The harness is unchanged. `window.__fluideda_cmd` became a property whose
+  setter wakes the app, so a test command never waits for a heartbeat.
+- `?continuous` restores drawing every frame (the fps benchmarks need it). It
+  is also the same-build A/B switch. The perf JSON now names what keeps the
+  app busy (`busy`).
+
+**Measured** (`idle_bench.mjs`, WebGPU, headless, same build: `?continuous` →
+default):
+
+| | `?continuous` | default |
+|---|--:|--:|
+| idle, embedded sample | 120 frames/s, main thread 22% | **4.2 frames/s, 2.4%** |
+| idle, caravel in-core (fit) | 29.6 frames/s, 100% | **3.8 frames/s, 17%** |
+| idle, caravel streamed | 120 frames/s, 44.5% | **4.2 frames/s, 5.1%** |
+| frames/s while panning (sample · in-core · streamed) | 120.8 · 31.6 · 120.2 | 120.5 · 31.6 · 120.2 |
+| caravel first frame, in-core · streamed (median of 3) | 1,626 · 75 ms | 1,630 · 75 ms |
+| a peer's edit showing in an idle page (median of 5) | 19 ms | 20 ms |
+
+caravel in-core still spends 17% while idle: each heartbeat frame redoes the
+fit-view cull. The fit-view slice (7.6) cuts that cost. Every browser suite
+passes in the default mode: the stream test, the streamed edit test, the sync
+test (in-core and STREAMED), and the persistence test. In the persistence
+test, a dropped peer reconnects on its own 490 ms after a server restart,
+driven by the heartbeat.

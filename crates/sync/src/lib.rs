@@ -150,6 +150,9 @@ pub struct Session {
     pub local: Presence,
     pub remote: HashMap<u64, Presence>,
     client_id: u64,
+    /// Called when the socket has news (Phase 7.1a: an idle UI draws only
+    /// when woken).
+    wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Per-client counter minting [`AddId`]s for shapes drawn in this session.
     /// `(client_id, seq)` is unique across peers (distinct client ids) and across
     /// this session's own adds (monotonic seq) — the id survives concurrent adds.
@@ -199,8 +202,16 @@ impl Session {
             local,
             remote: HashMap::new(),
             client_id,
+            wakeup: None,
             next_add_seq: 0,
         }
+    }
+
+    /// Call `f` whenever the socket has news (a message, open, close), so a
+    /// UI that idles can wake to [`poll`](Self::poll). Applies from the next
+    /// [`join`](Self::join).
+    pub fn set_wakeup(&mut self, f: Arc<dyn Fn() + Send + Sync>) {
+        self.wakeup = Some(f);
     }
 
     /// An offline session holding a document state — a v1 update, as a room
@@ -282,8 +293,12 @@ impl Session {
     /// whole doc state, so the room merges edits made before joining; the
     /// server's first message is the whole room state.
     pub fn join(&mut self, url: &str) -> Result<()> {
-        let (tx, rx) = ewebsock::connect(url, ewebsock::Options::default())
-            .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
+        let opts = ewebsock::Options::default();
+        let (tx, rx) = match self.wakeup.clone() {
+            Some(w) => ewebsock::connect_with_wakeup(url, opts, move || w()),
+            None => ewebsock::connect(url, opts),
+        }
+        .map_err(|e| anyhow::anyhow!("ws connect: {e}"))?;
         self.socket = Some(Socket { tx, rx });
         self.opened = false;
         self.synced = false;

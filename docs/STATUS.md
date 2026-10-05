@@ -73,6 +73,13 @@ front, then 7.4, edit streamed designs. **Both are done.**
 
   **7.4 is done**: the two-peer scenario with one streamed peer passes all
   34 checks, pixel-identical and saving the same file.
+* **7.1a — idle repaint.** The app draws every frame only while work is in
+  progress or just after something happened. Otherwise it drops to a 4
+  frames/s heartbeat. Async results, socket messages and harness commands
+  wake it. Idle: 120 → 4.2 frames/s, main thread 22% → 2.4% (sample) and
+  44% → 5% (streamed caravel). In-core caravel: 30 → 3.8 frames/s, 100% →
+  17%. Panning frame rates, load times and peer-edit latency (19 → 20 ms)
+  are unchanged. `?continuous` restores the old behaviour.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
