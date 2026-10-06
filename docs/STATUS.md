@@ -109,6 +109,19 @@ front, then 7.4, edit streamed designs. **Both are done.**
   - 0.01% of pixels visibly differ. Mid, leaf and the goldens are
     unchanged.
   - The 50 M-placement design now opens in-core (it used to panic).
+* **7.9 — no permanent peaks.** wasm memory never shrinks, so building a
+  whole file in it left the page that much bigger for good. Files now stream
+  in both directions:
+  - Saving writes straight into the download, a part at a time. In-core
+    caravel's heap after "Save GDS" stays at 122 MB (it grew to 689 MB).
+    The 50 M-placement design now saves (6.6 s); before, no file came.
+  - The parse worker reads the file out of its JS buffer through a 1 MiB
+    window. Worker peak: caravel 548 → 364 MB, place_50M 3,986 → 2,687 MB.
+    Loads got faster too (caravel first frame 976 → 909 ms).
+  - The server exports and builds packs the same way. Export peak: caravel
+    799 → 249 MB, place_50M 4,148 → 2,816 MB.
+  - GDS output is byte-identical. OASIS now splits big cells into
+    1 MiB CBLOCKs (+0.05%); KLayout reads caravel's back identically.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -298,7 +311,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
-| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1a, 7.7, 7.8, 7.6 done | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). Next: 7.9, 7.1c, finer streamed picks, 7.1b, 7.2, 7.5 |
+| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1a, 7.7, 7.8, 7.6, 7.9 done | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). 7.9: files stream in and out (in-core save no longer grows the heap: caravel stays 122 MB, was 689; worker peak 548 → 364 MB; place_50M saves). Next: 7.1c, finer streamed picks, 7.1b, 7.2, 7.5 |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -308,7 +321,7 @@ still byte-identical).
 | leaf GPU geometry | 1.1 MB | was 141 MB |
 | main-thread parse freeze | **~0** (pannable) | was 1.2 s; parse runs in a Web Worker (STEP 2), which now also *fetches* the file (Phase 5c). The design arrives progressively: skeleton parsed in slices, installed as proxies, geometry filled in visible-first — ≤ 6 ms/frame, ~8 frames. Longest load frame at leaf **50 ms** (was 76–176 ms, same session, headless; what remains is the leaf view's inline tessellation) |
 | parse wall | 1.0–1.2 s | now off the main thread (in the worker) |
-| combined peak heap (worker+main) | **~1.28 GB** | was 1.46 GB: single-copy reconstruction drops the concatenated wasm-side columns (main heap 434 → 254 MB). Worker memory reclaimed on terminate |
+| combined peak heap (worker+main) | **≤ 0.49 GB** (worker peak 364 MB + main 122 MB, an upper bound) | Phase 7.9: the worker reads the file out of its JS buffer, not wasm memory (worker 548 → 364 MB); 7.7/7.8 shrank both sides. Was ~1.28 GB (Phase 5c: single-copy reconstruction, main heap 434 → 254 MB). Worker memory reclaimed on terminate |
 | fit fps | **120** (display rate) · uncapped WebGPU **742**, WebGL **227** | Phase 7.6: the density rule in-core — dense chunks draw as coloured proxies (same-session A/B against 7.8: 76 / 66 capped, 73 / 76 uncapped). Earlier: 47–78, browser WebGL2 / native Metal |
 | fit fps, **real WebGPU** (Metal) | sky130 **60** / caravel 44 | Phase 5c (wgpu 30): first real WebGPU numbers — WebGL2-on-Metal for the same views is 22 / 51 (3 runs each, headless, 120 Hz cap). sky130's fit (5,144 draws/frame, CPU-bound) is 2.7× faster: WebGPU's per-draw cost is lower than ANGLE's. caravel's fit (1,822 draws over millions of triangles, GPU-bound) is 14% slower on Dawn-Metal than ANGLE-Metal. mid/leaf identical (93–94 fps). caravel's fit since Phase 7.6: the row above |
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |

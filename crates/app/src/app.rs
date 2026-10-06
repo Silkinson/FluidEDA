@@ -1603,13 +1603,19 @@ impl FluidApp {
             self.status = format!("exporting {name} on the server…");
             return;
         }
-        let (bytes, name) = if oasis {
-            (fluideda_core::write_oasis(&self.db, &self.overlay), out_name(&self.metrics.name).replace(".gds", ".oas"))
-        } else {
-            (fluideda_core::write_gds(&self.db, &self.overlay), out_name(&self.metrics.name))
-        };
-        match webio::save_bytes(&name, &bytes) {
-            Ok(()) => self.status = format!("saved {name} ({} KB)", bytes.len() / 1024),
+        // Phase 7.9: written straight into the download, a part at a time.
+        let gds = out_name(&self.metrics.name);
+        let name = if oasis { gds.replace(".gds", ".oas") } else { gds };
+        let (db, overlay) = (&self.db, &self.overlay);
+        let saved = webio::save_with(&name, |out| {
+            if oasis {
+                fluideda_core::write_oasis_to(db, overlay, out)
+            } else {
+                fluideda_core::write_gds_to(db, overlay, out)
+            }
+        });
+        match saved {
+            Ok(bytes) => self.status = format!("saved {name} ({} KB)", bytes / 1024),
             Err(e) => self.status = format!("save failed: {e}"),
         }
     }

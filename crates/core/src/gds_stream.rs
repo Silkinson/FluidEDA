@@ -83,39 +83,143 @@ struct Record<'a> {
     payload: &'a [u8],
 }
 
-/// Cursor over the raw bytes, yielding one [`Record`] at a time.
-struct Records<'a> {
-    data: &'a [u8],
+/// Where the reader gets a file's bytes (Phase 7.9): a slice, or anything
+/// that can copy a range out — the parse worker's JS `ArrayBuffer`, or a
+/// file on the server — so the file never has to sit whole in memory.
+pub trait ByteSource {
+    fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Copy `buf.len()` bytes starting at `off` (the range is in bounds).
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()>;
+}
+
+impl ByteSource for &[u8] {
+    fn len(&self) -> u64 {
+        <[u8]>::len(self) as u64
+    }
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        let o = off as usize;
+        buf.copy_from_slice(&self[o..o + buf.len()]);
+        Ok(())
+    }
+}
+
+/// How much of a [`ByteSource`] the reader holds at once.
+const WINDOW: usize = 1 << 20;
+
+/// What [`Records`] reads (Phase 7.9): a whole file in place, or a window
+/// onto a [`ByteSource`]. The reader is generic over it, so reading a slice
+/// costs what it did before windows existed.
+trait Window {
+    /// The bytes in the window.
+    fn bytes(&self) -> &[u8];
+    /// File offset of the window's first byte.
+    fn base(&self) -> u64;
+    /// Make at least `n` bytes from `pos` available, or all that remain;
+    /// returns where `pos` now is in the window.
+    fn refill(&mut self, pos: usize, n: usize) -> Result<usize>;
+}
+
+impl Window for &[u8] {
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+    fn base(&self) -> u64 {
+        0
+    }
+    fn refill(&mut self, pos: usize, _: usize) -> Result<usize> {
+        Ok(pos) // the whole file is here already
+    }
+}
+
+/// A window of about `size` bytes onto a [`ByteSource`] (a record is at most
+/// 64 KiB; the window grows to fit one).
+struct SourceWindow<'s> {
+    src: &'s mut dyn ByteSource,
+    len: u64,
+    size: usize,
+    /// File offset of `buf[0]`.
+    base: u64,
+    buf: Vec<u8>,
+}
+
+impl<'s> SourceWindow<'s> {
+    fn new(src: &'s mut dyn ByteSource, size: usize) -> Self {
+        let len = src.len();
+        Self { src, len, size, base: 0, buf: Vec::new() }
+    }
+}
+
+impl Window for SourceWindow<'_> {
+    fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
+    fn base(&self) -> u64 {
+        self.base
+    }
+    #[cold]
+    fn refill(&mut self, pos: usize, n: usize) -> Result<usize> {
+        self.buf.drain(..pos);
+        self.base += pos as u64;
+        let have = self.buf.len();
+        let left = self.len - (self.base + have as u64);
+        let more = (self.size.max(n).saturating_sub(have) as u64).min(left) as usize;
+        if more > 0 {
+            self.buf.resize(have + more, 0);
+            self.src.read_at(self.base + have as u64, &mut self.buf[have..])?;
+        }
+        Ok(0)
+    }
+}
+
+/// Cursor over a file's bytes, yielding one [`Record`] at a time.
+struct Records<W> {
+    win: W,
+    /// Read position in the window.
     pos: usize,
 }
 
-impl<'a> Records<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+impl<W: Window> Records<W> {
+    fn new(win: W) -> Self {
+        Self { win, pos: 0 }
+    }
+
+    /// Have at least `n` bytes from `pos` in the window, or all that remain.
+    #[inline]
+    fn want(&mut self, n: usize) -> Result<()> {
+        if self.pos + n > self.win.bytes().len() {
+            self.pos = self.win.refill(self.pos, n)?;
+        }
+        Ok(())
     }
 
     /// Next record, or `Ok(None)` at a clean end (ENDLIB or exhausted bytes).
     /// GDS files are commonly zero-padded to a 2048-byte block after ENDLIB, so
     /// the caller stops on ENDLIB and never sees that padding.
-    fn next(&mut self) -> Result<Option<Record<'a>>> {
-        if self.pos + 4 > self.data.len() {
+    #[inline(always)]
+    fn next(&mut self) -> Result<Option<Record<'_>>> {
+        self.want(4)?;
+        let (pos, data) = (self.pos, self.win.bytes());
+        if pos + 4 > data.len() {
             return Ok(None); // no room for another header — treat as end
         }
-        let len = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]) as usize;
+        let len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         if len < 4 {
-            bail!("GDS record at byte {} has invalid length {len}", self.pos);
+            bail!("GDS record at byte {} has invalid length {len}", self.win.base() + pos as u64);
         }
-        if self.pos + len > self.data.len() {
+        self.want(len)?;
+        let (start, data) = (self.pos, self.win.bytes());
+        if start + len > data.len() {
             bail!(
                 "GDS record at byte {} claims length {len} but only {} bytes remain",
-                self.pos,
-                self.data.len() - self.pos
+                self.win.base() + start as u64,
+                data.len() - start
             );
         }
-        let rtype = self.data[self.pos + 2];
-        let payload = &self.data[self.pos + 4..self.pos + len];
-        self.pos += len;
-        Ok(Some(Record { rtype, payload }))
+        self.pos = start + len;
+        Ok(Some(Record { rtype: data[start + 2], payload: &data[start + 4..start + len] }))
     }
 }
 
@@ -124,15 +228,28 @@ impl<'a> Records<'a> {
 /// [`CellDbBuilder::build`], run after the reader returns.
 pub fn stream_gds_db(bytes: &[u8]) -> Result<CellDb> {
     let mut b = CellDbBuilder::new();
-    intern_struct_names(bytes, &mut b)?; // pass 1: file-order ids, matching gds21
-    fill(bytes, &mut b)?; // pass 2: shapes + instances
+    intern_struct_names(Records::new(bytes), &mut b)?; // pass 1: file-order ids, matching gds21
+    fill(Records::new(bytes), &mut b)?; // pass 2: shapes + instances
+    b.build()
+}
+
+/// [`stream_gds_db`] from any [`ByteSource`], read through a window (Phase
+/// 7.9): the parse worker reads the file out of its JS buffer twice (one
+/// pass for names, one to fill) instead of copying it into wasm memory.
+pub fn stream_gds_db_from(src: &mut dyn ByteSource) -> Result<CellDb> {
+    stream_gds_db_windowed(src, WINDOW)
+}
+
+fn stream_gds_db_windowed(src: &mut dyn ByteSource, window: usize) -> Result<CellDb> {
+    let mut b = CellDbBuilder::new();
+    intern_struct_names(Records::new(SourceWindow::new(&mut *src, window)), &mut b)?;
+    fill(Records::new(SourceWindow::new(src, window)), &mut b)?;
     b.build()
 }
 
 /// Pass 1: intern every struct name in file order. Reads only STRNAME payloads;
 /// every other record is skipped by length, so this is a cheap linear scan.
-fn intern_struct_names(bytes: &[u8], b: &mut CellDbBuilder) -> Result<()> {
-    let mut recs = Records::new(bytes);
+fn intern_struct_names<W: Window>(mut recs: Records<W>, b: &mut CellDbBuilder) -> Result<()> {
     while let Some(r) = recs.next()? {
         match r.rtype {
             STRNAME => {
@@ -147,8 +264,7 @@ fn intern_struct_names(bytes: &[u8], b: &mut CellDbBuilder) -> Result<()> {
 
 /// Pass 2: walk the records, accumulating each element and committing it into
 /// its cell on ENDEL.
-fn fill(bytes: &[u8], b: &mut CellDbBuilder) -> Result<()> {
-    let mut recs = Records::new(bytes);
+fn fill<W: Window>(mut recs: Records<W>, b: &mut CellDbBuilder) -> Result<()> {
     let mut current: Option<usize> = None; // current struct's cell id
     let mut acc = ElemAcc::default();
 
@@ -426,7 +542,24 @@ mod tests {
     fn truncated_record_errors_not_panics() {
         // length says 12 but only 6 bytes present.
         let bytes = [0x00, 0x0C, 0x08, 0x00, 0xAA, 0xBB];
-        let mut recs = Records::new(&bytes);
-        assert!(recs.next().is_err());
+        assert!(Records::new(&bytes[..]).next().is_err());
+        let mut src: &[u8] = &bytes;
+        assert!(Records::new(SourceWindow::new(&mut src, 4)).next().is_err());
+    }
+
+    /// Phase 7.9: reading through a window — here 64 bytes, so it refills
+    /// every few records and grows for the longer ones — builds exactly what
+    /// reading the slice in place does.
+    #[test]
+    fn windowed_read_matches_in_place() {
+        let bytes = include_bytes!("../../../assets/hier.gds");
+        let whole = crate::serialize(&stream_gds_db(bytes).unwrap());
+        let mut src: &[u8] = bytes;
+        let windowed = crate::serialize(&stream_gds_db_windowed(&mut src, 64).unwrap());
+        assert_eq!(whole.coords, windowed.coords);
+        assert_eq!(whole.starts, windowed.starts);
+        assert_eq!(whole.layers, windowed.layers);
+        assert_eq!(whole.kinds, windowed.kinds);
+        assert_eq!(whole.meta, windowed.meta);
     }
 }

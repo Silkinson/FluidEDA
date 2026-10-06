@@ -33,6 +33,7 @@ use crate::db::{CellDb, InstanceKind};
 use crate::edit::EditOverlay;
 use crate::transform::Transform;
 use crate::types::{Layer, Point};
+use std::io::{self, Write};
 
 // GDS record tags: the 16-bit value packs (record-type << 8 | data-type), written
 // big-endian right after the u16 length. Matches assets/gen_hier.py.
@@ -62,7 +63,16 @@ const DATES: [i16; 12] = [2024, 1, 1, 0, 0, 0, 2024, 1, 1, 0, 0, 0];
 
 /// Serialize `db` composited with `overlay` to GDSII bytes.
 pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
-    let mut w = Writer::new();
+    let mut out = Vec::new();
+    write_gds_to(db, overlay, &mut out).expect("writing into a Vec does not fail");
+    out
+}
+
+/// [`write_gds`] into any sink, about a megabyte at a time (Phase 7.9): a
+/// browser save hands the file over in parts instead of building all of it
+/// in wasm memory — whose high-water mark never comes back down.
+pub fn write_gds_to(db: &CellDb, overlay: &EditOverlay, out: &mut dyn Write) -> io::Result<()> {
+    let mut w = Writer::new(out);
 
     w.record(HEADER, &i16_bytes(&[600]));
     w.record(BGNLIB, &i16_bytes(&DATES));
@@ -150,7 +160,7 @@ pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
     }
 
     w.record(ENDLIB, &[]);
-    w.into_vec()
+    w.finish()
 }
 
 /// Recover `(angle_deg, reflected, mag)` from a `from_strans`-built
@@ -163,10 +173,32 @@ fn round(v: f64) -> i32 {
     v.round() as i32
 }
 
-struct Writer(Vec<u8>);
-impl Writer {
-    fn new() -> Self {
-        Writer(Vec::new())
+/// Buffered record writer: records collect in `buf`, flushed to `out` every
+/// [`FLUSH_BYTES`] (the first write error is kept and returned at the end).
+struct Writer<'a> {
+    buf: Vec<u8>,
+    out: &'a mut dyn Write,
+    err: io::Result<()>,
+}
+
+/// How much the writer buffers before handing bytes to its sink.
+const FLUSH_BYTES: usize = 1 << 20;
+
+impl<'a> Writer<'a> {
+    fn new(out: &'a mut dyn Write) -> Self {
+        Writer { buf: Vec::with_capacity(FLUSH_BYTES + 4096), out, err: Ok(()) }
+    }
+
+    fn flush(&mut self) {
+        if self.err.is_ok() && !self.buf.is_empty() {
+            self.err = self.out.write_all(&self.buf);
+        }
+        self.buf.clear();
+    }
+
+    fn finish(mut self) -> io::Result<()> {
+        self.flush();
+        std::mem::replace(&mut self.err, Ok(()))
     }
 
     /// One SREF of `child` at `(x, y)` with `strans` = (angle°, reflected, mag).
@@ -213,11 +245,14 @@ impl Writer {
     fn record(&mut self, tag: u16, payload: &[u8]) {
         let padded = payload.len() + (payload.len() & 1);
         let len = (padded + 4) as u16;
-        self.0.extend_from_slice(&len.to_be_bytes());
-        self.0.extend_from_slice(&tag.to_be_bytes());
-        self.0.extend_from_slice(payload);
+        self.buf.extend_from_slice(&len.to_be_bytes());
+        self.buf.extend_from_slice(&tag.to_be_bytes());
+        self.buf.extend_from_slice(payload);
         if payload.len() & 1 == 1 {
-            self.0.push(0);
+            self.buf.push(0);
+        }
+        if self.buf.len() >= FLUSH_BYTES {
+            self.flush();
         }
     }
 
@@ -252,10 +287,6 @@ impl Writer {
         if angle != 0.0 {
             self.record(ANGLE, &gds_real(angle));
         }
-    }
-
-    fn into_vec(self) -> Vec<u8> {
-        self.0
     }
 }
 

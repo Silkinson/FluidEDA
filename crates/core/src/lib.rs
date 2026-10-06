@@ -53,8 +53,9 @@ pub use drc::{
 };
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, PlacementKey, Shape};
 pub use flatten::{flatten_hop, flatten_needs, flatten_placement, placement_counts, subtree_shapes, FLATTEN_LIMIT};
-pub use gds_write::write_gds;
-pub use oasis_write::write_oasis;
+pub use gds_stream::ByteSource;
+pub use gds_write::{write_gds, write_gds_to};
+pub use oasis_write::{write_oasis, write_oasis_to};
 pub use index::ShapeIndex;
 pub use pick::{
     pick_composite, pick_composite_needs, pick_hierarchy, pick_in_cell, point_in_polygon, ChunkNeed, CompositeHit, PickHit,
@@ -86,6 +87,21 @@ pub fn load_layout_db(bytes: &[u8]) -> anyhow::Result<CellDb> {
         oasis::load_oasis_db(bytes)
     } else {
         gds::load_gds_db(bytes)
+    }
+}
+
+/// [`load_layout_db`] from a [`ByteSource`] (Phase 7.9). GDSII is read
+/// through a window, so the file never sits whole in this module's memory;
+/// OASIS (compressed blocks, references by offset) is read in full first.
+pub fn load_layout_db_from(src: &mut dyn ByteSource) -> anyhow::Result<CellDb> {
+    let mut head = vec![0u8; (src.len() as usize).min(16)];
+    src.read_at(0, &mut head)?;
+    if oasis::is_oasis(&head) {
+        let mut all = vec![0u8; src.len() as usize];
+        src.read_at(0, &mut all)?;
+        oasis::load_oasis_db(&all)
+    } else {
+        gds_stream::stream_gds_db_from(src)
     }
 }
 

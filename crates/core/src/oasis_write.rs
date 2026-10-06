@@ -19,9 +19,18 @@ use crate::edit::EditOverlay;
 use crate::oasis::MAGIC;
 use crate::transform::Transform;
 use crate::types::{Layer, Point};
+use std::io::{self, Write};
 
 /// Export the composite design as OASIS bytes.
 pub fn write_oasis(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_oasis_to(db, overlay, &mut out).expect("writing into a Vec does not fail");
+    out
+}
+
+/// [`write_oasis`] into any sink, a CBLOCK at a time (Phase 7.9: a browser
+/// save holds about a megabyte of records, not the whole file).
+pub fn write_oasis_to(db: &CellDb, overlay: &EditOverlay, sink: &mut dyn Write) -> io::Result<()> {
     let mut out = MAGIC.to_vec();
     // START: version "1.0", unit 1000 (real type 0 = whole number), offset
     // flag 0 with six zero table entries ("tables may be anywhere").
@@ -46,10 +55,12 @@ pub fn write_oasis(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
         for i in 0..cell.shapes.len() {
             if !overlay.deleted.contains(&(id, i as u32)) {
                 shape(cell.shapes.layer(i), &cell.shapes.points(i), &mut modal, &mut body);
+                spill(&mut body, &mut out, sink)?;
             }
         }
         for s in overlay.live_shapes_in(id) {
             shape(s.layer, &s.points, &mut modal, &mut body);
+            spill(&mut body, &mut out, sink)?;
         }
         for (ii, inst) in cell.instances.iter().enumerate() {
             match inst.kind() {
@@ -65,8 +76,11 @@ pub fn write_oasis(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
                     }
                 }
             }
+            spill(&mut body, &mut out, sink)?;
         }
         cblock(&body, &mut out);
+        sink.write_all(&out)?;
+        out.clear();
     }
     // END: exactly 256 bytes — record id, padding string, validation scheme 0.
     out.push(2);
@@ -74,7 +88,7 @@ pub fn write_oasis(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
     uint(pad as u64, &mut out);
     out.extend(std::iter::repeat(0u8).take(pad));
     uint(0, &mut out);
-    out
+    sink.write_all(&out)
 }
 
 /// The visible elements of an array as `(first col, first row, cols, rows)`
@@ -236,6 +250,25 @@ fn placement(child: usize, t: &Transform, array: Option<(i32, i32, [f64; 2], [f6
 }
 
 /// Wrap `body` (a cell's records) in a deflate CBLOCK.
+/// A cell's records go to the sink as CBLOCKs of about this many bytes
+/// before compression (Phase 7.9). With one CBLOCK per cell, a cell's
+/// records were all in memory at once: saving caravel grew the page by
+/// 126 MB. Modal state carries across CBLOCKs (their contents read as if
+/// written in place).
+const CBLOCK_BYTES: usize = 1 << 20;
+
+/// Once a cell's pending records reach [`CBLOCK_BYTES`], compress them into a
+/// CBLOCK of their own and hand everything so far to the sink.
+fn spill(body: &mut Vec<u8>, out: &mut Vec<u8>, sink: &mut dyn Write) -> io::Result<()> {
+    if body.len() >= CBLOCK_BYTES {
+        cblock(body, out);
+        sink.write_all(out)?;
+        out.clear();
+        body.clear();
+    }
+    Ok(())
+}
+
 fn cblock(body: &[u8], out: &mut Vec<u8>) {
     if body.is_empty() {
         return;
@@ -362,6 +395,37 @@ mod tests {
             assert_eq!(canon(&back), canon(&db), "{label}: OASIS round trip changed the design");
             assert!(oas.len() < bytes.len(), "{label}: {} B OASIS vs {} B GDS", oas.len(), bytes.len());
         }
+    }
+
+    /// Phase 7.9: a cell with more records than one CBLOCK takes is written
+    /// as several, and reads back the same — the layer changes across block
+    /// boundaries (the modal layer carries over), and so do placements.
+    #[test]
+    fn a_big_cell_spans_several_cblocks_and_reads_back() {
+        let mut b = crate::db::CellDbBuilder::new();
+        let top = b.intern("TOP");
+        let leaf = b.intern("LEAF");
+        let sq = |x: i32, y: i32, s: i32| [Point::new(x, y), Point::new(x + s, y), Point::new(x + s, y + s), Point::new(x, y + s)];
+        b.cell_mut(leaf).shapes.push(Layer::new(1, 0), sq(0, 0, 50));
+        for i in 0..300_000 {
+            // Irregular outlines (not rectangles) and a layer change every
+            // 1,000 shapes, so blocks hold several layers' runs.
+            let (x, y) = ((i % 600) * 120, (i / 600) * 120);
+            let tri = [Point::new(x, y), Point::new(x + 90, y + 7 * (i % 5)), Point::new(x + 13, y + 80)];
+            b.cell_mut(top).shapes.push(Layer::new(10 + (i / 1000) as u16 % 7, 0), tri);
+        }
+        for i in 0..20_000 {
+            // Built as the readers build placements (`from_strans`'s exact bits).
+            let (x, y) = ((i % 200) * 400, (i / 200) * 400 + 1_000_000);
+            b.cell_mut(top).instances.push(crate::db::Instance::from_manhattan(leaf, x, y, (i % 8) as u8, InstanceKind::Single));
+        }
+        let db = b.build().unwrap();
+        let mut out = Vec::new();
+        write_oasis_to(&db, &EditOverlay::new(), &mut out).unwrap();
+        let blocks = out.windows(2).filter(|w| w == &[34u8, 0u8]).count();
+        assert!(blocks >= 3, "expected several CBLOCKs, saw markers for {blocks}");
+        let back = crate::oasis::load_oasis_db(&out).unwrap();
+        assert_eq!(canon(&back), canon(&db));
     }
 
     #[test]

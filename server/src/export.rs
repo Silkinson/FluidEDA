@@ -60,16 +60,23 @@ pub fn export(store: &Store, design: &str, state: &[u8], oasis: bool) -> Result<
         return Err(ExportError::NoDesign);
     }
     let session = fluideda_sync::Session::from_state(state).map_err(|e| ExportError::BadState(e.to_string()))?;
-    let bytes = store.read_blob(design)?;
-    let db = fluideda_core::load_layout_db(&bytes).map_err(|e| ExportError::BadDesign(e.to_string()))?;
-    drop(bytes);
+    // Phase 7.9: neither file is ever whole in memory. The design is read
+    // through a window and the export written straight to the store, hashed
+    // on the way (caravel: 291 MB in, 276 MB out).
+    let mut src = store.open_blob(design)?;
+    let db = fluideda_core::load_layout_db_from(&mut src).map_err(|e| ExportError::BadDesign(e.to_string()))?;
     // In-core here, so nothing waits for a chunk.
     let (overlay, _) = session.overlay(&db);
-    let out = if oasis { fluideda_core::write_oasis(&db, &overlay) } else { fluideda_core::write_gds(&db, &overlay) };
-    let hash = store.put_blob(&out)?;
+    let (blob, ()) = crate::packs::write_streamed(store, |out| {
+        if oasis {
+            fluideda_core::write_oasis_to(&db, &overlay, out)
+        } else {
+            fluideda_core::write_gds_to(&db, &overlay, out)
+        }
+    })?;
     let e = Exported {
-        hash,
-        bytes: out.len() as u64,
+        hash: blob.hash,
+        bytes: blob.bytes,
         format: if oasis { "oas" } else { "gds" }.to_string(),
         edited: overlay.deleted.len(),
         added: overlay.added.len(),

@@ -279,21 +279,25 @@ pub fn spawn_picker(slot: LoadSlot, sources: SourceSlot) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_picker(_slot: LoadSlot, _sources: SourceSlot) {}
 
-/// Save `bytes` as a download named `name` (Phase 3 SLICE 1 — export edits).
-/// Wraps the bytes in a Blob and clicks a transient `<a download>`.
+/// Save a download named `name`, its bytes written by `write` (Phase 3
+/// SLICE 1 — export edits). Phase 7.9: the writer's output goes straight
+/// into the Blob's parts, about a megabyte at a time, so the file never sits
+/// whole in wasm memory. That memory never shrinks: saving caravel used to
+/// leave the page about 500 MB bigger for good. Returns the bytes written.
 #[cfg(target_arch = "wasm32")]
-pub fn save_bytes(name: &str, bytes: &[u8]) -> Result<(), String> {
+pub fn save_with(
+    name: &str,
+    write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> Result<u64, String> {
     use wasm_bindgen::{JsCast, JsValue};
     let win = web_sys::window().ok_or("no window")?;
     let doc = win.document().ok_or("no document")?;
 
-    // Blob from the bytes (one Uint8Array copy into a JS-owned buffer).
-    let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-    arr.copy_from(bytes);
-    let parts = js_sys::Array::of1(&arr.buffer());
+    let mut sink = BlobParts { parts: js_sys::Array::new(), bytes: 0 };
+    write(&mut sink).map_err(|e| format!("write: {e}"))?;
     let opts = web_sys::BlobPropertyBag::new();
     opts.set_type("application/octet-stream");
-    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&sink.parts, &opts)
         .map_err(|e| format!("blob: {e:?}"))?;
 
     let url = web_sys::Url::create_object_url_with_blob(&blob).map_err(|e| format!("url: {e:?}"))?;
@@ -310,16 +314,44 @@ pub fn save_bytes(name: &str, bytes: &[u8]) -> Result<(), String> {
     let _ = doc.body().unwrap().remove_child(&a);
     let _ = web_sys::Url::revoke_object_url(&url);
     let _ = JsValue::NULL;
-    Ok(())
+    Ok(sink.bytes)
 }
 
-/// Native: write `bytes` to `name` in the current directory. (The GUI has no file
-/// dialog wired; a headless exporter would take an explicit --out path.)
+/// A Blob's parts as an `io::Write` (Phase 7.9): each write is copied out of
+/// wasm memory into a JS buffer of its own.
+#[cfg(target_arch = "wasm32")]
+struct BlobParts {
+    parts: js_sys::Array,
+    bytes: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::io::Write for BlobParts {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let arr = js_sys::Uint8Array::new_with_length(buf.len() as u32);
+        arr.copy_from(buf);
+        self.parts.push(&arr);
+        self.bytes += buf.len() as u64;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Native: write the file to `name` in the current directory. (The GUI has no
+/// file dialog wired; a headless exporter would take an explicit --out path.)
 #[cfg(not(target_arch = "wasm32"))]
-pub fn save_bytes(name: &str, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(name, bytes).map_err(|e| e.to_string())?;
-    log::info!("wrote {} ({} bytes)", name, bytes.len());
-    Ok(())
+pub fn save_with(
+    name: &str,
+    write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+) -> Result<u64, String> {
+    use std::io::Write as _;
+    let mut out = std::io::BufWriter::new(std::fs::File::create(name).map_err(|e| e.to_string())?);
+    write(&mut out).and_then(|()| out.flush()).map_err(|e| e.to_string())?;
+    let bytes = std::fs::metadata(name).map_err(|e| e.to_string())?.len();
+    log::info!("wrote {name} ({bytes} bytes)");
+    Ok(bytes)
 }
 
 /// Minimal percent-decode for the query value (enough for file paths/URLs).

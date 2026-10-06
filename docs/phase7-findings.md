@@ -632,3 +632,93 @@ Correctness:
   semantics), 5 render tests with the goldens unchanged, 17 server tests.
 - The browser suites pass on this build: the stream test (11 checks), the
   streamed edit test (11), and the sync test, in-core (33) and STREAMED (34).
+
+## 7.9 — no permanent peaks
+
+**Problem.** wasm memory only grows, so whatever a page allocates at its peak
+stays allocated for the life of the page. Two operations put whole files in
+wasm memory:
+- **Saving in-core.** The writer built the file in a `Vec`, which was then
+  copied into a Blob. Saving caravel as GDS grew the page's heap from 122
+  to 689 MB for good. place_50M could not be saved at all: no file arrived
+  in 15 minutes, and its 1.3 GB file does not fit beside a 1.26 GB heap.
+- **Parsing in the worker.** The file was copied into wasm memory before
+  parsing, so the worker's peak carried it: 278 MB for caravel and 1.3 GB
+  for place_50M. place_50M's worker peaked at 3,986 MB, just under wasm32's
+  4 GB.
+
+The server had the same pattern on a smaller scale. An export read the whole
+design and built the whole output before storing it, and a pack build read
+the whole design.
+
+**Design.**
+- **Writers stream.** `write_gds_to` and `write_oasis_to` write into any
+  `io::Write`; `write_gds` and `write_oasis` wrap them.
+  - GDS goes out in 1 MiB pieces.
+  - OASIS writes a cell's records as CBLOCKs of about 1 MiB each, so a big
+    cell spans several. Modal state carries across CBLOCKs, since their
+    contents read as if written in place. Our reader and KLayout both read
+    such files.
+- **The page saves straight into the download.** `webio::save_with` hands
+  the writer a `BlobParts` sink: every write becomes a JS buffer of its own,
+  and the Blob is assembled from those parts. Nothing of the file stays in
+  wasm memory.
+- **The GDS reader reads through a `ByteSource`.** A slice is read in place,
+  as before. Anything else is read through a 1 MiB window copied out a range
+  at a time.
+  - The parse worker passes its JS `Uint8Array` (`JsBytes`), so the file
+    never enters wasm memory. OASIS (compressed and small) is still read
+    whole.
+  - The server reads stored blobs from disk the same way (`BlobFile`), for
+    exports and pack builds. An export is written to a temp file and hashed
+    on the way.
+- **The reader is generic over its window.** Reading a slice therefore
+  compiles to the same code as before. The first version went through a
+  `dyn` source and parsed caravel 25% slower natively (316 → 396 ms).
+  Making it generic and forcing `next()` inline brought it to 300 ms.
+
+**Measured.** Same-session A/B: the 7.6 commit served from a worktree on
+:8081 against this build (`save_ab.mjs`, `load_ab.mjs`, WebGPU). The server
+rows come from `export_peak` under `/usr/bin/time -l`.
+
+| | before (7.6) | streamed (7.9) |
+|---|--:|--:|
+| caravel in-core: heap after load → after "Save GDS" | 122 → 689 MB | **122 → 122 MB** |
+| caravel in-core: heap after "Save OASIS" too | 689 MB | **122 MB** (126 MB more with one CBLOCK per cell) |
+| caravel load: parse worker peak (wasm) | 548 MB | **364 MB** |
+| caravel load: parse · first frame · all geometry | 723 · 976 · 1,000 ms | **662 · 909 · 932 ms** |
+| place_50M load: parse worker peak (wasm) | 3,986 MB | **2,687 MB** |
+| place_50M load: parse · first frame | 7.5 · 10.6 s | **6.7 · 9.2 s** |
+| place_50M in-core "Save GDS" (heap 1,258 MB) | no file in 15 min | **6.6 s, heap unchanged** |
+| server export, caravel GDS: peak RSS · time | 799 MB · 1.87 s | **249 MB · 1.74 s** |
+| server export, caravel OASIS: peak RSS · time | 592 MB · 1.61 s | **251 MB · 1.54 s** |
+| server export, place_50M GDS: peak RSS · time | 4,148 MB · 11.2 s | **2,816 MB · 10.2 s** |
+| native caravel parse (`bench`) | 317 ms | **300 ms** |
+
+The worker peak counts wasm memory. The file itself still sits in a JS
+buffer until the worker exits, but outside the 4 GB wasm limit.
+
+The written files:
+- GDS is byte for byte what 7.6 wrote (caravel `be1b67f3…`, place_50M
+  `88bb0a08…`), from the page and from the server alike.
+- OASIS changes, because big cells now span several CBLOCKs: caravel
+  16,506,858 → 16,515,607 bytes (+0.05%). KLayout reads it exactly like the
+  GDS: 1,014 cells, 3,925,013 polygons and 462,523 placements identical
+  (`scripts/oracle`). The in-core page's OASIS save is the same file as
+  the server's export (`c9ef35b0…`).
+
+Correctness:
+- 111 core tests. New: reading through a 64-byte window builds exactly what
+  reading in place does, and a cell over several CBLOCKs (300,000 shapes on
+  changing layers, 20,000 placements in all 8 orientations) reads back the
+  same.
+- 17 server tests (export and packs now read blobs through a window).
+- The browser suites pass: stream 11, streamed edit 11 (including the
+  check that the in-core save equals the server's export byte for byte),
+  sync 33, sync STREAMED 34.
+
+The machine went into system sleep about every 16 minutes during these
+runs, despite keep-awake: about 15 minutes asleep, then a short wake. Three
+measurements that crossed a sleep are left out of the table: one load's
+wall time (1,051 s), one OASIS save (962 s), and one streamed edit run, which
+timed out waiting for a frame and passed when re-run.

@@ -135,6 +135,17 @@ impl Store {
         fs::read(self.blob_path(hash))
     }
 
+    /// Blob `hash` to read in ranges (Phase 7.9): a design is parsed through
+    /// a window instead of read whole (caravel 291 MB, place_50M 1.3 GB).
+    pub fn open_blob(&self, hash: &str) -> io::Result<BlobFile> {
+        if !is_hash(hash) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a blob hash"));
+        }
+        let file = File::open(self.blob_path(hash))?;
+        let len = file.metadata()?.len();
+        Ok(BlobFile { file, len })
+    }
+
     fn room_dir(&self, room: &str) -> PathBuf {
         assert!(is_room_name(room), "not a room name: {room:?}");
         self.root.join("rooms").join(room)
@@ -234,6 +245,23 @@ pub fn wal_append(wal: &mut File, update: &[u8]) -> io::Result<u64> {
     rec.extend_from_slice(update);
     wal.write_all(&rec)?;
     Ok(rec.len() as u64)
+}
+
+/// A stored blob read a range at a time ([`Store::open_blob`]).
+pub struct BlobFile {
+    file: File,
+    len: u64,
+}
+
+impl fluideda_core::ByteSource for BlobFile {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&mut self, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        self.file.seek(SeekFrom::Start(off))?;
+        self.file.read_exact(buf)
+    }
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {

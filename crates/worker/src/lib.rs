@@ -6,7 +6,8 @@
 //! is small and never touches the GPU or canvas (neither exists in a worker).
 //!
 //! Protocol: the main thread `postMessage`s the raw GDS bytes (transferred in);
-//! [`parse`] runs the streaming parser + chunking, serializes the finished
+//! [`parse`] runs the streaming parser + chunking (reading the bytes out of
+//! their JS buffer, Phase 7.9), serializes the finished
 //! `CellDb` to plain columns (see `fluideda_core::serialize`), and returns them as
 //! typed arrays. The worker JS (`assets/worker/parse_worker.js`) transfers those
 //! arrays' `ArrayBuffer`s back to the main thread (zero-copy), then the worker is
@@ -105,16 +106,33 @@ mod wasm {
         fluideda_core::set_compact_rects(on);
     }
 
+    /// The file as the worker received it: a JS buffer the GDS reader copies
+    /// a window at a time (Phase 7.9). It used to be copied whole into wasm
+    /// memory first, and wasm memory never shrinks, so the worker's peak
+    /// carried the file (278 MB on caravel, 1.3 GB on place_50M) on top of
+    /// the database it built.
+    struct JsBytes(Uint8Array);
+
+    impl fluideda_core::ByteSource for JsBytes {
+        fn len(&self) -> u64 {
+            self.0.length() as u64
+        }
+        fn read_at(&mut self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
+            self.0.subarray(off as u32, (off + buf.len() as u64) as u32).copy_to(buf);
+            Ok(())
+        }
+    }
+
     /// Parse GDS bytes into a serialized `CellDb`. Runs entirely in the worker.
     #[wasm_bindgen]
-    pub fn parse(bytes: Vec<u8>) -> Result<ParseResult, JsValue> {
+    pub fn parse(bytes: Uint8Array) -> Result<ParseResult, JsValue> {
         console_error_panic_hook::set_once();
 
         let t0 = now_ms();
-        // GDSII or OASIS, sniffed by magic (Phase 6).
-        let mut db = fluideda_core::load_layout_db(&bytes)
+        // GDSII or OASIS, sniffed by magic (Phase 6). GDS streams out of the
+        // JS buffer; OASIS is read whole (it is small: caravel 17 MB).
+        let mut db = fluideda_core::load_layout_db_from(&mut JsBytes(bytes))
             .map_err(|e| JsValue::from_str(&format!("parse failed: {e}")))?;
-        drop(bytes); // free the raw file (278 MB on caravel) before serializing
         // Phase 7.6: dense chunks draw as proxies in-core too, coloured by
         // their look.
         fluideda_core::pack::annotate_chunk_looks(&mut db);

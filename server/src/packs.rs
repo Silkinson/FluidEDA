@@ -93,9 +93,10 @@ pub fn ensure(store: &Store, design: &str) -> io::Result<Option<Manifest>> {
 
 fn build(store: &Store, design: &str) -> io::Result<Manifest> {
     let t0 = Instant::now();
-    let bytes = store.read_blob(design)?;
-    let mut db = fluideda_core::load_layout_db(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    drop(bytes);
+    // Read through a window (Phase 7.9), not whole.
+    let mut src = store.open_blob(design)?;
+    let mut db =
+        fluideda_core::load_layout_db_from(&mut src).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let parse_ms = t0.elapsed().as_secs_f64() * 1e3;
     // Each shape chunk's look (its layers' coverage): what a chunk too dense
     // to fetch is drawn as (v4).
@@ -150,7 +151,10 @@ fn build(store: &Store, design: &str) -> io::Result<Manifest> {
 
 /// Write a blob through `write` to a temp file while hashing it — never
 /// whole in memory — and store it. Returns the blob and what `write` returned.
-fn write_streamed<T>(store: &Store, write: impl FnOnce(&mut HashingWriter<BufWriter<File>>) -> io::Result<T>) -> io::Result<(BlobRef, T)> {
+pub(crate) fn write_streamed<T>(
+    store: &Store,
+    write: impl FnOnce(&mut HashingWriter<BufWriter<File>>) -> io::Result<T>,
+) -> io::Result<(BlobRef, T)> {
     let tmp = store.tmp_path();
     let mut w = HashingWriter { out: BufWriter::with_capacity(1 << 20, File::create(&tmp)?), hash: Sha256::new(), n: 0 };
     let value = write(&mut w)?;
@@ -162,7 +166,7 @@ fn write_streamed<T>(store: &Store, write: impl FnOnce(&mut HashingWriter<BufWri
 }
 
 /// Writes through to `out` while hashing and counting.
-struct HashingWriter<W: Write> {
+pub(crate) struct HashingWriter<W: Write> {
     out: W,
     hash: Sha256,
     n: u64,
