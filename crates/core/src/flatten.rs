@@ -114,7 +114,7 @@ pub fn flatten_placement(db: &CellDb, overlay: &EditOverlay, key: PlacementKey, 
     let Some(inst) = db.cell(parent).resident_instances().find(|&(i, _)| i == ii).map(|(_, inst)| inst) else {
         return Ok(Vec::new());
     };
-    let in_range = match inst.kind {
+    let in_range = match inst.kind() {
         InstanceKind::Single => c == 0 && r == 0,
         InstanceKind::Array { cols, rows, .. } => (0..cols).contains(&c) && (0..rows).contains(&r),
     };
@@ -217,7 +217,7 @@ fn collect(
         push(out, Shape { layer: s.layer, points: map(&s.points) })?;
     }
     for (ii, inst) in cell.resident_instances() {
-        let (cols, rows) = match inst.kind {
+        let (cols, rows) = match inst.kind() {
             InstanceKind::Single => (1, 1),
             InstanceKind::Array { cols, rows, .. } => (cols.max(0), rows.max(0)),
         };
@@ -255,17 +255,9 @@ mod tests {
         b.cell_mut(leaf).shapes.push(Layer::new(1, 0), rect(0, 0, 100, 100));
         b.cell_mut(leaf).shapes.push(Layer::new(2, 0), rect(20, 20, 40, 40));
         b.cell_mut(mid).shapes.push(Layer::new(3, 0), rect(0, 200, 300, 50));
-        b.cell_mut(mid).instances.push(Instance {
-            child: leaf,
-            transform: Transform::translate(150.0, 0.0),
-            kind: InstanceKind::Single,
-        });
+        b.cell_mut(mid).instances.push(Instance::new(leaf, Transform::translate(150.0, 0.0), InstanceKind::Single));
         b.cell_mut(top).shapes.push(Layer::new(1, 0), rect(-500, -500, 100, 100));
-        b.cell_mut(top).instances.push(Instance {
-            child: mid,
-            transform: Transform::translate(0.0, 0.0),
-            kind: InstanceKind::Array { cols: 3, rows: 2, col_step: [1000.0, 0.0], row_step: [0.0, 1000.0] },
-        });
+        b.cell_mut(top).instances.push(Instance::new(mid, Transform::translate(0.0, 0.0), InstanceKind::Array { cols: 3, rows: 2, col_step: [1000.0, 0.0], row_step: [0.0, 1000.0] }));
         b.build().unwrap()
     }
 

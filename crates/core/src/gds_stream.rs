@@ -291,11 +291,7 @@ impl ElemAcc {
                 }
                 let (x, y) = (self.xy[0] as f64, self.xy[1] as f64);
                 let transform = Transform::from_strans(x, y, self.angle, self.reflect, self.mag);
-                b.cell_mut(cell).instances.push(Instance {
-                    child,
-                    transform,
-                    kind: InstanceKind::Single,
-                });
+                b.cell_mut(cell).instances.push(Instance::new(child, transform, InstanceKind::Single));
             }
             Kind::Aref => {
                 let child = self.child.ok_or_else(|| anyhow!("AREF without SNAME"))?;
@@ -321,11 +317,11 @@ impl ElemAcc {
                 ];
                 let transform =
                     Transform::from_strans(p0x as f64, p0y as f64, self.angle, self.reflect, self.mag);
-                b.cell_mut(cell).instances.push(Instance {
+                b.cell_mut(cell).instances.push(Instance::new(
                     child,
                     transform,
-                    kind: InstanceKind::Array { cols, rows, col_step, row_step },
-                });
+                    InstanceKind::Array { cols, rows, col_step, row_step },
+                ));
             }
             Kind::Path => {
                 let center: Vec<Point> = self.points().collect();

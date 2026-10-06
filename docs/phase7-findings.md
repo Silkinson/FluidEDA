@@ -5,8 +5,8 @@ hierarchy) to the front. **7.3 is done** in three slices: **A** placement
 chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
 proxies (pack v4). **7.4 is done** (edit streamed designs): **A** picking and editing, **B**
 rooms and "edit this placement only", **C** server-side export. The owner
-then asked to finish all of Phase 7: **7.1a** (idle repaint) and **7.7**
-(compact rectangles) are done.
+then asked to finish all of Phase 7: **7.1a** (idle repaint), **7.7**
+(compact rectangles) and **7.8** (compact placements) are done.
 
 ## 7.3 SLICE A — placement chunks
 
@@ -486,3 +486,63 @@ native rows come from `rect_bench`. Correctness:
 - `stream_edit_test`: 128/128 picks, edits, flatten, and the in-core save =
   the server export.
 - `edit_sync_test`: 33 checks in-core and 34 streamed.
+
+## 7.8 — compact placements
+
+**Problem.** All 462,523 of caravel's placements are plain 90° rotations at
+scale 1 with integer origins. Each still carried a full `f64` transform and
+the array fields: about 104 bytes in memory (48 MB for caravel; 5.2 GB for
+the 50 M-placement design, which could never load in-core), and 53 bytes
+encoded (+40 for an array) in the worker transfer and in pack records.
+
+**Design.**
+- `Instance` stores a placement whose transform is exactly what
+  `Transform::from_strans` builds for an integer origin, a multiple of 90°
+  and unit magnification as `x, y` and one of 8 orientations. It re-expands
+  through a table built by that same function, so `transform()` gives back
+  the very bits the reader produced (checked bit for bit; a transform that
+  differs even in a `-0.0` stays general). Other transforms and array
+  lattices are boxed. 20 bytes on wasm32 (a compile-time check), 32 on
+  64-bit hosts.
+- The fields became accessors (`transform()`, `kind()`; `Instance::new`).
+  Placements are no longer `Copy`, so the cull borrows them, and the
+  in-place sort became swap-based.
+- Encoding (serialize v6, PACK_VERSION 7): `[child varint][flags]`, then a
+  plain placement's origin as zigzag-varint deltas from the previous plain
+  placement of the list. Lists are spatially sorted, so the deltas are
+  short. Other transforms are written in full (6 f64), an array adds its
+  lattice.
+
+**Measured.**
+
+| | before (7.7) | compact (7.8) |
+|---|--:|--:|
+| caravel placements in memory (wasm32) | 48.1 MB | **9.3 MB** (all 462,523 compact) |
+| place_50M placements in memory (wasm32) | 5,200 MB | **1,000 MB** |
+| caravel placements encoded | 24.5 MB | **3.1 MB** (6.8 B each) |
+| place_50M placements encoded | 2,650 MB | **251 MB** (5.0 B each) |
+| caravel pack: placements · cell table | 24.2 MB · 467 KB | **3.1 MB · 195 KB** |
+| place_50M pack: placements · build | 2.65 GB · 39 s | **251 MB · 6.1 s** |
+| in-core caravel main heap (browser, median of 5) | 305 MB | **266 MB** |
+| in-core caravel parse worker peak | 597 MB | **548 MB** |
+| parse · first frame · all geometry in | 634 · 919 · 926 ms | 624 · 906 · 913 ms |
+
+- The memory and encoding rows come from `place_bench` (native, exact;
+  every transform round-trips bit for bit).
+- The browser rows are a same-session A/B between the two builds
+  (`load_ab.mjs`): the 7.7 commit is served from a worktree on :8081, and
+  loads alternate between the two.
+- place_50M in-core still fails in both builds, with different errors. 7.7
+  hits a wasm trap; 7.8 panics with "capacity overflow" instead. That error
+  fits the in-core cull, which builds one proxy per sub-pixel placement at
+  fit: 50 M boxes overflow wasm32's 2 GB array limit. 7.6 adds the in-core
+  density rule that removes this; whether place_50M then loads is checked
+  there.
+
+Correctness:
+- 109 core tests. New: every orientation is compact and exact, the general
+  fallbacks hold, and mixed lists encode and decode bit for bit.
+- 17 server tests and the goldens are unchanged.
+- The browser suites pass: the stream test (its placement-eviction check now
+  uses a 0.25 MB budget; 1 MB no longer forces evictions), the streamed edit
+  test, and the sync test, in-core and STREAMED.

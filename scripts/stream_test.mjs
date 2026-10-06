@@ -169,7 +169,7 @@ async function main() {
     // The remote placement lists under a 1 MB placement budget: cycling the
     // four remote-placement views twice must evict placement chunks, and a
     // view revisited after its placements were evicted must render the same.
-    const tight = await open(browser, `${BASE}/?stream=${H}&placement_budget=1`,
+    const tight = await open(browser, `${BASE}/?stream=${H}&placement_budget=0.25`,
       () => JSON.parse(window.__fluideda_perf || '{}').streaming);
     const remoteViews = VIEWS.slice(4);
     const firstRemote = await shoot(tight, remoteViews[0]);
@@ -179,7 +179,7 @@ async function main() {
     const again = await shoot(tight, remoteViews[0]);
     const dr = await diff(tight, firstRemote.png, again.png);
     check(again.perf.p_evicted > 0 && dr.px === 0,
-      `placement chunks under a 1 MB budget: ${again.perf.p_evicted} evicted, ${again.perf.p_fetched} fetched; ` +
+      `placement chunks under a 0.25 MB budget: ${again.perf.p_evicted} evicted, ${again.perf.p_fetched} fetched; ` +
       `the first view re-fetched its placements and matches (${dr.px} px differ)`);
     await tight.context().close();
   } catch (e) {

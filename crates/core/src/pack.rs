@@ -50,8 +50,9 @@ use std::io::{self, Write};
 /// cell table carries each shape chunk's look — its layers' coverage
 /// (SLICE C). 5: the manifest carries each cell's placement count and
 /// flattened subtree size (Phase 7.4: "edit this placement only"). 6:
-/// records carry a kind column, rectangles stored as two corners (7.7).
-pub const PACK_VERSION: u32 = 6;
+/// records carry a kind column, rectangles stored as two corners (7.7). 7:
+/// placements encoded compactly (7.8).
+pub const PACK_VERSION: u32 = 7;
 
 /// At most this many layers describe a chunk's look (the densest ones).
 pub const LOOK_LAYERS: usize = 8;
@@ -299,18 +300,10 @@ mod tests {
         b.cell_mut(leaf).shapes.push(Layer::new(1, 0), [Point::new(0, 0), Point::new(400, 0), Point::new(400, 900), Point::new(0, 900)]);
         b.cell_mut(top).shapes.push(Layer::new(2, 0), [Point::new(0, 0), Point::new(9, 0), Point::new(9, 9), Point::new(0, 9)]);
         for i in 0..20_000i32 {
-            b.cell_mut(core).instances.push(Instance {
-                child: leaf,
-                transform: Transform::translate(((i % 200) * 500) as f64, ((i / 200) * 1_000) as f64),
-                kind: InstanceKind::Single,
-            });
+            b.cell_mut(core).instances.push(Instance::new(leaf, Transform::translate(((i % 200) * 500) as f64, ((i / 200) * 1_000) as f64), InstanceKind::Single));
         }
         for k in 0..3 {
-            b.cell_mut(top).instances.push(Instance {
-                child: core,
-                transform: Transform::translate((k * 120_000) as f64, 0.0),
-                kind: InstanceKind::Single,
-            });
+            b.cell_mut(top).instances.push(Instance::new(core, Transform::translate((k * 120_000) as f64, 0.0), InstanceKind::Single));
         }
         let db = b.build().unwrap();
         assert!(db.cell(core).inst_chunks.len() > 1);
@@ -408,14 +401,10 @@ mod tests {
             b.cell_mut(mesh).shapes.push(Layer::new(3, 0), rect((i % 400) * 300, (i / 400) * 300, 200, 200));
         }
         for i in 0..20_000i32 {
-            b.cell_mut(core).instances.push(Instance {
-                child: leaf,
-                transform: Transform::translate(((i % 200) * 500) as f64, ((i / 200) * 1_000) as f64),
-                kind: InstanceKind::Single,
-            });
+            b.cell_mut(core).instances.push(Instance::new(leaf, Transform::translate(((i % 200) * 500) as f64, ((i / 200) * 1_000) as f64), InstanceKind::Single));
         }
         for (child, x) in [(core, 0.0), (mesh, 200_000.0)] {
-            b.cell_mut(top).instances.push(Instance { child, transform: Transform::translate(x, 0.0), kind: InstanceKind::Single });
+            b.cell_mut(top).instances.push(Instance::new(child, Transform::translate(x, 0.0), InstanceKind::Single));
         }
         let db = b.build().unwrap();
         assert!(db.cell(mesh).chunks.len() > 1, "MESH must have several shape chunks");
@@ -513,20 +502,55 @@ mod tests {
         use crate::db::{Instance, InstanceKind};
         use crate::transform::Transform;
         let insts = vec![
-            Instance { child: 2, transform: Transform::translate(5.0, -7.0), kind: InstanceKind::Single },
-            Instance {
-                child: 0,
-                transform: Transform::translate(1.0, 2.0),
-                kind: InstanceKind::Array { cols: 3, rows: 4, col_step: [10.0, 0.0], row_step: [0.0, 20.0] },
-            },
+            Instance::new(2, Transform::translate(5.0, -7.0), InstanceKind::Single),
+            Instance::new(0, Transform::translate(1.0, 2.0), InstanceKind::Array { cols: 3, rows: 4, col_step: [10.0, 0.0], row_step: [0.0, 20.0] }),
         ];
         let rec = crate::serialize::encode_instances(&insts);
         let back = crate::serialize::decode_instances(&rec, 3).unwrap();
         assert_eq!(back.len(), 2);
-        assert_eq!((back[0].child, back[0].transform), (2, insts[0].transform));
-        assert!(matches!(back[1].kind, InstanceKind::Array { cols: 3, rows: 4, .. }));
+        assert_eq!((back[0].child, back[0].transform()), (2, insts[0].transform()));
+        assert!(matches!(back[1].kind(), InstanceKind::Array { cols: 3, rows: 4, .. }));
         assert!(crate::serialize::decode_instances(&rec, 2).is_err(), "child out of range");
         assert!(crate::serialize::decode_instances(&rec[..rec.len() - 1], 3).is_err(), "truncated");
+    }
+
+    /// Phase 7.8: plain placements encode as a few bytes (varint origin
+    /// deltas), others in full, and all come back bit for bit.
+    #[test]
+    fn placements_encode_compactly_and_exactly() {
+        use crate::db::{Instance, InstanceKind};
+        use crate::transform::Transform;
+        let mut insts: Vec<Instance> = (0..1000i32)
+            .map(|i| {
+                let o = (i % 8) as u8;
+                let t = Transform::from_strans(
+                    (i % 100 * 460) as f64 - 1e6,
+                    (i / 100 * 2720) as f64,
+                    90.0 * (o & 3) as f64,
+                    o & 4 != 0,
+                    1.0,
+                );
+                Instance::new(i as usize % 5, t, InstanceKind::Single)
+            })
+            .collect();
+        let max = Transform::from_strans(i32::MAX as f64, i32::MIN as f64, 0.0, false, 1.0);
+        insts.push(Instance::new(4, max, InstanceKind::Single));
+        let odd = Transform::from_strans(5.0, 6.0, 30.0, true, 2.5);
+        let lattice = InstanceKind::Array { cols: 7, rows: 1, col_step: [1.5, 0.0], row_step: [0.0, 0.0] };
+        insts.push(Instance::new(1, odd, lattice));
+        let rot = Transform::from_strans(-40.0, 80.0, 270.0, false, 1.0);
+        let grid = InstanceKind::Array { cols: 2, rows: 3, col_step: [100.0, 0.0], row_step: [0.0, -50.0] };
+        insts.push(Instance::new(2, rot, grid));
+
+        let rec = crate::serialize::encode_instances(&insts);
+        let back = crate::serialize::decode_instances(&rec, 5).unwrap();
+        assert_eq!(back, insts);
+        let bits = |t: Transform| [t.a, t.b, t.c, t.d, t.tx, t.ty].map(f64::to_bits);
+        for (a, b) in back.iter().zip(&insts) {
+            assert_eq!(bits(a.transform()), bits(b.transform()));
+        }
+        // ~5 bytes per plain placement (child, flags, two short deltas).
+        assert!(rec.len() < 1000 * 6 + 200, "{} bytes", rec.len());
     }
 
     #[test]

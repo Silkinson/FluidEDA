@@ -362,7 +362,7 @@ impl CullCtx<'_> {
                 continue;
             }
             for ii in ch.start as usize..ch.end as usize {
-                self.descend(id, ii, cell.instances[ii], world_tf, hides);
+                self.descend(id, ii, &cell.instances[ii], world_tf, hides);
             }
         }
     }
@@ -391,7 +391,7 @@ impl CullCtx<'_> {
             match remote.chunks.get(ci) {
                 Some(Some(insts)) => {
                     self.set.placements_used.push((id, ci as u32));
-                    for (k, &inst) in insts.iter().enumerate() {
+                    for (k, inst) in insts.iter().enumerate() {
                         self.descend(id, ch.start as usize + k, inst, world_tf, hides);
                     }
                 }
@@ -405,17 +405,17 @@ impl CullCtx<'_> {
 
     /// Walk placement `inst` (number `ii`) of cell `id` (`world_tf` = the
     /// cell's own world transform).
-    fn descend(&mut self, id: CellId, ii: usize, inst: Instance, world_tf: Transform, hides: bool) {
-        match inst.kind {
+    fn descend(&mut self, id: CellId, ii: usize, inst: &Instance, world_tf: Transform, hides: bool) {
+        match inst.kind() {
             InstanceKind::Single => {
                 if hides && self.overlay.is_some_and(|o| o.is_hidden((id, ii as u32, 0, 0))) {
                     return;
                 }
-                self.walk(inst.child, world_tf.then(&inst.transform));
+                self.walk(inst.child, world_tf.then(&inst.transform()));
             }
             InstanceKind::Array { cols, rows, col_step, row_step } => {
                 let hidden_in = hides.then_some((id, ii as u32));
-                self.walk_array(inst.child, world_tf, inst.transform, cols, rows, col_step, row_step, hidden_in);
+                self.walk_array(inst.child, world_tf, inst.transform(), cols, rows, col_step, row_step, hidden_in);
             }
         }
     }
@@ -604,11 +604,7 @@ mod tests {
             Point::new(0, 10_000),
         ]);
         for x in [1_000.0, 6_000.0] {
-            b.cell_mut(top).instances.push(Instance {
-                child: empty,
-                transform: Transform::translate(x, 1_000.0),
-                kind: InstanceKind::Single,
-            });
+            b.cell_mut(top).instances.push(Instance::new(empty, Transform::translate(x, 1_000.0), InstanceKind::Single));
         }
         let db = b.build().unwrap();
         let mut o = EditOverlay::new();
@@ -638,18 +634,10 @@ mod tests {
             // 6,000 scattered single placements (enough to chunk) …
             for i in 0..6_000i32 {
                 let (x, y) = ((i * 7_919) % 100_000, (i * 104_729) % 80_000);
-                b.cell_mut(top).instances.push(Instance {
-                    child: leaf,
-                    transform: Transform::translate(x as f64, y as f64),
-                    kind: InstanceKind::Single,
-                });
+                b.cell_mut(top).instances.push(Instance::new(leaf, Transform::translate(x as f64, y as f64), InstanceKind::Single));
             }
             // … and an array, which is one placement record covering many.
-            b.cell_mut(top).instances.push(Instance {
-                child: tall,
-                transform: Transform::translate(-5_000.0, 0.0),
-                kind: InstanceKind::Array { cols: 3, rows: 40, col_step: [1_000.0, 0.0], row_step: [0.0, 2_000.0] },
-            });
+            b.cell_mut(top).instances.push(Instance::new(tall, Transform::translate(-5_000.0, 0.0), InstanceKind::Array { cols: 3, rows: 40, col_step: [1_000.0, 0.0], row_step: [0.0, 2_000.0] }));
             b.build().unwrap()
         }
         fn sq(x: i32, y: i32, s: i32) -> Vec<Point> {

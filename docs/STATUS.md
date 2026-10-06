@@ -89,6 +89,14 @@ front, then 7.4, edit streamed designs. **Both are done.**
   - In-core caravel: parse worker 1,080 → 597 MB, all geometry in 2.38 →
     1.79 s.
   - Pack geometry (v6) 189 → 99 MB, so streamed picks fetch half as much.
+* **7.8 — compact placements.** Every caravel placement is a plain 90°
+  rotation. Placements are now stored as `x, y` plus one of 8 orientations,
+  re-expanding to the exact transform bits (20 instead of ~104 B on wasm32),
+  and encoded as varint deltas (~5–7 B instead of 53 B).
+  - caravel placements in memory: 48 → 9 MB. In-core main heap 305 → 266 MB
+    and parse worker 597 → 548 MB (same-session A/B against the 7.7 build).
+  - Pack placements: caravel 24.2 → 3.1 MB, place_50M 2.65 GB → 251 MB.
+    place_50M's pack builds in 6.1 s, down from 39 s.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).

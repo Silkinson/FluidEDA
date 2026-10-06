@@ -42,8 +42,9 @@ const MAGIC: u32 = u32::from_le_bytes(*b"FEDB");
 /// fetched by placement chunk (a streamed design, Phase 7.3 SLICE B).
 /// 4: each cell's shape chunks' looks — layer coverage — when computed
 /// (SLICE C). 5: a fourth column, one kind byte per shape — rectangles are
-/// stored as two corners (Phase 7.7).
-const VERSION: u32 = 5;
+/// stored as two corners (Phase 7.7). 6: placements encoded compactly
+/// (varints, origin deltas; Phase 7.8).
+const VERSION: u32 = 6;
 
 /// A serialized `CellDb`: three Pod columns (transferred as typed arrays) plus a
 /// metadata blob. Field order mirrors what the worker hands to `postMessage`.
@@ -104,8 +105,9 @@ pub fn cell_table_meta(db: &CellDb, inline_max: usize) -> Vec<u8> {
 pub fn encode_instances(insts: &[Instance]) -> Vec<u8> {
     let mut w = Writer::new();
     w.u32(insts.len() as u32);
+    let mut prev = (0, 0);
     for inst in insts {
-        write_instance(&mut w, inst);
+        write_instance(&mut w, inst, &mut prev);
     }
     w.into_vec()
 }
@@ -115,9 +117,10 @@ pub fn encode_instances(insts: &[Instance]) -> Vec<u8> {
 pub fn decode_instances(bytes: &[u8], cell_count: usize) -> Result<Vec<Instance>> {
     let mut r = Reader::new(bytes);
     let n = r.u32()? as usize;
-    let mut out = Vec::with_capacity(n.min(bytes.len() / 57 + 1));
+    let mut out = Vec::with_capacity(n.min(bytes.len() / MIN_INSTANCE_BYTES + 1));
+    let mut prev = (0, 0);
     for _ in 0..n {
-        out.push(read_instance(&mut r, cell_count)?);
+        out.push(read_instance(&mut r, cell_count, &mut prev)?);
     }
     if r.pos != bytes.len() {
         bail!("placement record: {} trailing bytes", bytes.len() - r.pos);
@@ -125,40 +128,76 @@ pub fn decode_instances(bytes: &[u8], cell_count: usize) -> Result<Vec<Instance>
     Ok(out)
 }
 
-fn write_instance(w: &mut Writer, inst: &Instance) {
-    w.u32(inst.child as u32);
-    w.transform(&inst.transform);
-    match inst.kind {
-        InstanceKind::Single => w.u8(0),
-        InstanceKind::Array { cols, rows, col_step, row_step } => {
-            w.u8(1);
-            w.i32(cols);
-            w.i32(rows);
-            w.f64(col_step[0]);
-            w.f64(col_step[1]);
-            w.f64(row_step[0]);
-            w.f64(row_step[1]);
+// Placement encoding (Phase 7.8; was 57+ bytes each). Per placement,
+// `[child varint][flags u8]`, then:
+// * a plain placement (bits 0-2 = its orientation, see `Instance`): the
+//   origin as zigzag-varint deltas from the previous plain placement of the
+//   same list — lists are spatially sorted, so the deltas are small;
+// * otherwise (`INST_GENERAL`): the transform's 6 f64;
+// * an array (`INST_ARRAY`), after either: cols and rows (zigzag varints),
+//   then the two steps (4 f64).
+const INST_GENERAL: u8 = 8;
+const INST_ARRAY: u8 = 16;
+/// The smallest a placement can encode to: child, flags, dx, dy.
+const MIN_INSTANCE_BYTES: usize = 4;
+
+fn write_instance(w: &mut Writer, inst: &Instance, prev: &mut (i32, i32)) {
+    w.varint(inst.child as u64);
+    let kind = inst.kind();
+    let array = if matches!(kind, InstanceKind::Array { .. }) { INST_ARRAY } else { 0 };
+    match inst.manhattan_place() {
+        Some((x, y, o)) => {
+            w.u8(o | array);
+            w.zigzag(x as i64 - prev.0 as i64);
+            w.zigzag(y as i64 - prev.1 as i64);
+            *prev = (x, y);
+        }
+        None => {
+            w.u8(INST_GENERAL | array);
+            w.transform(&inst.transform());
+        }
+    }
+    if let InstanceKind::Array { cols, rows, col_step, row_step } = kind {
+        w.zigzag(cols as i64);
+        w.zigzag(rows as i64);
+        for v in [col_step[0], col_step[1], row_step[0], row_step[1]] {
+            w.f64(v);
         }
     }
 }
 
-fn read_instance(r: &mut Reader, cell_count: usize) -> Result<Instance> {
-    let child = r.u32()? as CellId;
-    let transform = r.transform()?;
-    let kind = match r.u8()? {
-        0 => InstanceKind::Single,
-        1 => InstanceKind::Array {
-            cols: r.i32()?,
-            rows: r.i32()?,
-            col_step: [r.f64()?, r.f64()?],
-            row_step: [r.f64()?, r.f64()?],
-        },
-        t => bail!("bad instance kind tag {t}"),
-    };
-    if child >= cell_count {
+fn read_instance(r: &mut Reader, cell_count: usize, prev: &mut (i32, i32)) -> Result<Instance> {
+    let child = r.varint()?;
+    if child >= cell_count as u64 {
         bail!("CellDb blob: instance of unknown cell {child}");
     }
-    Ok(Instance { child, transform, kind })
+    let child = child as CellId;
+    let flags = r.u8()?;
+    if flags & !(7 | INST_GENERAL | INST_ARRAY) != 0 {
+        bail!("bad instance flags {flags:#x}");
+    }
+    let i32_of = |v: i64| -> Result<i32> {
+        i32::try_from(v).map_err(|_| anyhow::anyhow!("CellDb blob: placement value {v} out of range"))
+    };
+    let place = if flags & INST_GENERAL != 0 {
+        Err(r.transform()?)
+    } else {
+        let x = i32_of(prev.0 as i64 + r.zigzag()?)?;
+        let y = i32_of(prev.1 as i64 + r.zigzag()?)?;
+        *prev = (x, y);
+        Ok((x, y, flags & 7))
+    };
+    let kind = if flags & INST_ARRAY != 0 {
+        let cols = i32_of(r.zigzag()?)?;
+        let rows = i32_of(r.zigzag()?)?;
+        InstanceKind::Array { cols, rows, col_step: [r.f64()?, r.f64()?], row_step: [r.f64()?, r.f64()?] }
+    } else {
+        InstanceKind::Single
+    };
+    Ok(match place {
+        Ok((x, y, o)) => Instance::from_manhattan(child, x, y, o, kind),
+        Err(t) => Instance::new(child, t, kind),
+    })
 }
 
 /// The metadata blob, calling `columns` on each cell in order (where
@@ -187,8 +226,9 @@ fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell), inline: impl Fn(&Cell
         meta.u32(cell.instances.len() as u32);
         if inline(cell) {
             meta.u8(0);
+            let mut prev = (0, 0);
             for inst in &cell.instances {
-                write_instance(&mut meta, inst);
+                write_instance(&mut meta, inst, &mut prev);
             }
         } else {
             meta.u8(1);
@@ -383,10 +423,12 @@ impl SkeletonParse {
                 1 => true,
                 t => bail!("bad instance list tag {t}"),
             };
-            let mut instances = Vec::with_capacity(if remote { 0 } else { n_inst.min(self.meta.len() / 57 + 1) });
+            let mut instances =
+                Vec::with_capacity(if remote { 0 } else { n_inst.min(self.meta.len() / MIN_INSTANCE_BYTES + 1) });
             if !remote {
+                let mut prev = (0, 0);
                 for _ in 0..n_inst {
-                    instances.push(read_instance(&mut r, self.cell_count)?);
+                    instances.push(read_instance(&mut r, self.cell_count, &mut prev)?);
                 }
             }
             let chunks = read_chunks(&mut r, n_shapes)?;
@@ -592,6 +634,17 @@ impl Writer {
     fn bytes(&mut self, b: &[u8]) {
         self.0.extend_from_slice(b);
     }
+    /// LEB128.
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.0.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        self.0.push(v as u8);
+    }
+    fn zigzag(&mut self, v: i64) {
+        self.varint(((v << 1) ^ (v >> 63)) as u64);
+    }
     fn transform(&mut self, t: &Transform) {
         for v in [t.a, t.b, t.c, t.d, t.tx, t.ty] {
             self.f64(v);
@@ -637,6 +690,21 @@ impl<'a> Reader<'a> {
     }
     fn f64(&mut self) -> Result<f64> {
         Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn varint(&mut self) -> Result<u64> {
+        let mut v = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = self.u8()?;
+            v |= ((b & 0x7f) as u64) << shift;
+            if b < 0x80 {
+                return Ok(v);
+            }
+        }
+        bail!("CellDb blob: varint too long")
+    }
+    fn zigzag(&mut self) -> Result<i64> {
+        let v = self.varint()?;
+        Ok((v >> 1) as i64 ^ -((v & 1) as i64))
     }
     fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         self.take(n)
@@ -728,8 +796,8 @@ mod tests {
             assert_eq!(a.instances.len(), b.instances.len(), "{label}: '{}' inst count", a.name);
             for (j, (x, y)) in a.instances.iter().zip(&b.instances).enumerate() {
                 assert_eq!(x.child, y.child, "{label}: '{}' inst {j} child", a.name);
-                assert_eq!(x.transform, y.transform, "{label}: '{}' inst {j} transform", a.name);
-                match (x.kind, y.kind) {
+                assert_eq!(x.transform(), y.transform(), "{label}: '{}' inst {j} transform", a.name);
+                match (x.kind(), y.kind()) {
                     (InstanceKind::Single, InstanceKind::Single) => {}
                     (
                         InstanceKind::Array { cols: c1, rows: r1, col_step: cs1, row_step: rs1 },

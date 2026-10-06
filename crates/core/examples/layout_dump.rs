@@ -37,8 +37,8 @@ fn main() {
             if k > 0 {
                 s.push(',');
             }
-            let (rot, mirror, mag) = strans(&inst.transform);
-            let (na, nb, a, b) = match inst.kind {
+            let (rot, mirror, mag) = strans(&inst.transform());
+            let (na, nb, a, b) = match inst.kind() {
                 InstanceKind::Single => (1, 1, [0.0, 0.0], [0.0, 0.0]),
                 InstanceKind::Array { cols, rows, col_step, row_step } => (cols, rows, col_step, row_step),
             };
@@ -46,8 +46,8 @@ fn main() {
                 s,
                 "[{:?},{},{},{},{},{},{},{},{},{},{},{}]",
                 db.cell(inst.child).name,
-                inst.transform.tx.round() as i64,
-                inst.transform.ty.round() as i64,
+                inst.transform().tx.round() as i64,
+                inst.transform().ty.round() as i64,
                 rot,
                 mirror,
                 mag,

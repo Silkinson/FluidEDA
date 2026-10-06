@@ -97,11 +97,7 @@ fn collect(lib: &GdsLibrary) -> Result<CellDbBuilder> {
                         refl,
                         mag,
                     );
-                    b.cell_mut(id).instances.push(Instance {
-                        child,
-                        transform,
-                        kind: InstanceKind::Single,
-                    });
+                    b.cell_mut(id).instances.push(Instance::new(child, transform, InstanceKind::Single));
                 }
                 GdsElement::GdsArrayRef(aref) => {
                     let child = b.intern(&aref.name);
@@ -126,16 +122,11 @@ fn collect(lib: &GdsLibrary) -> Result<CellDbBuilder> {
                     ];
                     let transform =
                         Transform::from_strans(p0.x as f64, p0.y as f64, angle, refl, mag);
-                    b.cell_mut(id).instances.push(Instance {
+                    b.cell_mut(id).instances.push(Instance::new(
                         child,
                         transform,
-                        kind: InstanceKind::Array {
-                            cols,
-                            rows,
-                            col_step,
-                            row_step,
-                        },
-                    });
+                        InstanceKind::Array { cols, rows, col_step, row_step },
+                    ));
                 }
                 // Phase 6: paths become their outline polygons (same helper as
                 // the streaming reader, so the two stay cell-for-cell equal).
@@ -204,8 +195,8 @@ mod oracle {
             assert_eq!(cs.instances.len(), co.instances.len(), "{label}: cell '{}' instance count", cs.name);
             for (j, (a, b)) in cs.instances.iter().zip(&co.instances).enumerate() {
                 assert_eq!(a.child, b.child, "{label}: '{}' inst {j} child", cs.name);
-                assert_eq!(a.transform, b.transform, "{label}: '{}' inst {j} transform", cs.name);
-                match (a.kind, b.kind) {
+                assert_eq!(a.transform(), b.transform(), "{label}: '{}' inst {j} transform", cs.name);
+                match (a.kind(), b.kind()) {
                     (InstanceKind::Single, InstanceKind::Single) => {}
                     (
                         InstanceKind::Array { cols: c1, rows: r1, col_step: cs1, row_step: rs1 },

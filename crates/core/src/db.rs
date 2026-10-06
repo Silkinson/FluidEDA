@@ -40,21 +40,138 @@ pub enum InstanceKind {
 }
 
 /// A placement of `child` into a parent cell.
-#[derive(Debug, Clone, Copy)]
+///
+/// **Compact (Phase 7.8).** Every one of caravel's 462,523 placements is a
+/// plain 90° rotation at scale 1, yet each carried a full `f64` transform and
+/// the array fields: about 104 bytes. A placement whose transform is exactly
+/// what [`Transform::from_strans`] builds for an integer origin, a multiple
+/// of 90° and unit magnification is now stored as `x, y` and one of 8
+/// orientations; anything else keeps its transform, boxed, as does an
+/// array's lattice. [`transform`](Self::transform) re-expands to the very
+/// bits the reader produced, so nothing downstream can tell. ~20 bytes on
+/// wasm32.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Instance {
     pub child: CellId,
-    /// Child-local → parent-local transform for the *base* placement (the STRANS
-    /// applied at the reference origin; for an AREF this is instance `[0,0]`).
-    pub transform: Transform,
-    pub kind: InstanceKind,
+    place: Place,
+    /// An AREF's lattice; `None` for a single placement.
+    array: Option<Box<ArrayParams>>,
+}
+
+// Phase 7.8: the compact placement is 20 bytes on wasm32 (4 + 12 + 4).
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(std::mem::size_of::<Instance>() == 20);
+
+/// An AREF's lattice (see [`InstanceKind::Array`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ArrayParams {
+    cols: i32,
+    rows: i32,
+    col_step: [f64; 2],
+    row_step: [f64; 2],
+}
+
+impl ArrayParams {
+    fn of(kind: InstanceKind) -> Option<Box<ArrayParams>> {
+        match kind {
+            InstanceKind::Single => None,
+            InstanceKind::Array { cols, rows, col_step, row_step } => {
+                Some(Box::new(ArrayParams { cols, rows, col_step, row_step }))
+            }
+        }
+    }
+}
+
+/// How a placement's transform is stored (Phase 7.8).
+#[derive(Debug, Clone, PartialEq)]
+enum Place {
+    /// Exactly `Transform::from_strans(x, y, 90° × (o & 3), o & 4 != 0, 1)`.
+    Manhattan { x: i32, y: i32, o: u8 },
+    /// Anything else.
+    General(Box<Transform>),
+}
+
+/// The linear part `[a, b, c, d]` [`Transform::from_strans`] builds for
+/// orientation `o` (rotation `90° × (o & 3)`, mirrored if `o & 4`) at unit
+/// magnification — computed once with that very function, so a compact
+/// placement re-expands bit for bit.
+fn manhattan_linear(o: u8) -> [f64; 4] {
+    static TABLE: std::sync::OnceLock<[[f64; 4]; 8]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::array::from_fn(|o| {
+            let t = Transform::from_strans(0.0, 0.0, 90.0 * (o & 3) as f64, o & 4 != 0, 1.0);
+            [t.a, t.b, t.c, t.d]
+        })
+    })[o as usize & 7]
+}
+
+impl Place {
+    fn of(t: &Transform) -> Place {
+        let (x, y) = (t.tx as i32, t.ty as i32);
+        if (x as f64).to_bits() == t.tx.to_bits() && (y as f64).to_bits() == t.ty.to_bits() {
+            let lin = [t.a.to_bits(), t.b.to_bits(), t.c.to_bits(), t.d.to_bits()];
+            for o in 0..8u8 {
+                if manhattan_linear(o).map(f64::to_bits) == lin {
+                    return Place::Manhattan { x, y, o };
+                }
+            }
+        }
+        Place::General(Box::new(*t))
+    }
+
+    fn transform(&self) -> Transform {
+        match self {
+            Place::Manhattan { x, y, o } => {
+                let [a, b, c, d] = manhattan_linear(*o);
+                Transform { a, b, c, d, tx: *x as f64, ty: *y as f64 }
+            }
+            Place::General(t) => **t,
+        }
+    }
 }
 
 impl Instance {
+    /// A placement of `child` by `transform` (stored compactly when it is a
+    /// plain one).
+    pub fn new(child: CellId, transform: Transform, kind: InstanceKind) -> Self {
+        Instance { child, place: Place::of(&transform), array: ArrayParams::of(kind) }
+    }
+
+    /// Child-local → parent-local transform for the *base* placement (the
+    /// STRANS applied at the reference origin; for an AREF this is instance
+    /// `[0,0]`).
+    pub fn transform(&self) -> Transform {
+        self.place.transform()
+    }
+
+    /// A single placement or an array.
+    pub fn kind(&self) -> InstanceKind {
+        match &self.array {
+            None => InstanceKind::Single,
+            Some(a) => InstanceKind::Array { cols: a.cols, rows: a.rows, col_step: a.col_step, row_step: a.row_step },
+        }
+    }
+
+    /// The compact form of the transform, if it has one: `(x, y,
+    /// orientation)` (see [`Instance`]).
+    pub fn manhattan_place(&self) -> Option<(i32, i32, u8)> {
+        match &self.place {
+            Place::Manhattan { x, y, o } => Some((*x, *y, *o)),
+            Place::General(_) => None,
+        }
+    }
+
+    /// A placement whose transform is the compact `(x, y, orientation)`
+    /// form — what [`manhattan_place`](Self::manhattan_place) gives back.
+    pub fn from_manhattan(child: CellId, x: i32, y: i32, o: u8, kind: InstanceKind) -> Self {
+        Instance { child, place: Place::Manhattan { x, y, o: o & 7 }, array: ArrayParams::of(kind) }
+    }
+
     /// Number of concrete placements this instance expands to.
     pub fn count(&self) -> u64 {
-        match self.kind {
-            InstanceKind::Single => 1,
-            InstanceKind::Array { cols, rows, .. } => (cols.max(0) as u64) * (rows.max(0) as u64),
+        match &self.array {
+            None => 1,
+            Some(a) => (a.cols.max(0) as u64) * (a.rows.max(0) as u64),
         }
     }
 
@@ -63,17 +180,12 @@ impl Instance {
     /// shifts the base transform's translation — the linear (rotation/mag) part
     /// is shared by every element.
     pub fn placement(&self, col: i32, row: i32) -> Transform {
-        match self.kind {
-            InstanceKind::Single => self.transform,
-            InstanceKind::Array {
-                col_step, row_step, ..
-            } => {
-                let mut t = self.transform;
-                t.tx += col as f64 * col_step[0] + row as f64 * row_step[0];
-                t.ty += col as f64 * col_step[1] + row as f64 * row_step[1];
-                t
-            }
+        let mut t = self.transform();
+        if let Some(a) = &self.array {
+            t.tx += col as f64 * a.col_step[0] + row as f64 * a.row_step[0];
+            t.ty += col as f64 * a.col_step[1] + row as f64 * a.row_step[1];
         }
+        t
     }
 }
 
@@ -219,13 +331,13 @@ impl Cell {
     /// them in-core, the resident placement chunks' of a remote cell.
     pub fn resident_instances(&self) -> Box<dyn Iterator<Item = (u32, Instance)> + '_> {
         match &self.remote {
-            None => Box::new(self.instances.iter().copied().enumerate().map(|(i, x)| (i as u32, x))),
+            None => Box::new(self.instances.iter().cloned().enumerate().map(|(i, x)| (i as u32, x))),
             Some(r) => Box::new(
                 self.inst_chunks
                     .iter()
                     .zip(&r.chunks)
                     .filter_map(|(ch, c)| c.as_ref().map(move |v| (ch.start, v)))
-                    .flat_map(|(start, v)| v.iter().copied().enumerate().map(move |(k, x)| (start + k as u32, x))),
+                    .flat_map(|(start, v)| v.iter().cloned().enumerate().map(move |(k, x)| (start + k as u32, x))),
             ),
         }
     }
@@ -428,9 +540,9 @@ impl CellDb {
             });
         }
         for inst in &cell.instances {
-            match inst.kind {
+            match inst.kind() {
                 InstanceKind::Single => {
-                    self.flatten_rec(inst.child, t.then(&inst.transform), out);
+                    self.flatten_rec(inst.child, t.then(&inst.transform()), out);
                 }
                 InstanceKind::Array { cols, rows, .. } => {
                     for r in 0..rows {
@@ -618,24 +730,24 @@ fn compute_local_bboxes(cells: &[Cell]) -> Vec<Bbox> {
 /// cycle of the permutation, with a bitset instead of a second copy of `v`
 /// (a 50 M-placement cell is 5 GB of instances — copying it would double the
 /// parse peak).
-fn permute_in_place<T: Copy>(v: &mut [T], order: &[u32]) {
+fn permute_in_place<T>(v: &mut [T], order: &[u32]) {
     debug_assert_eq!(v.len(), order.len());
     let mut done = vec![0u64; v.len().div_ceil(64)];
     for start in 0..v.len() {
         if done[start / 64] >> (start % 64) & 1 == 1 {
             continue;
         }
-        // Rotate the cycle start → order[start] → order[order[start]] → … .
-        let first = v[start];
+        // Rotate the cycle start → order[start] → order[order[start]] → … by
+        // swaps: after swapping i with order[i], position i holds its final
+        // element and the cycle's first element moves on to order[i].
         let mut i = start;
         loop {
             done[i / 64] |= 1 << (i % 64);
             let src = order[i] as usize;
             if src == start {
-                v[i] = first;
                 break;
             }
-            v[i] = v[src];
+            v.swap(i, src);
             i = src;
         }
     }
@@ -649,8 +761,8 @@ pub fn placement_bbox(inst: &Instance, child_b: &Bbox) -> Bbox {
     if child_b.min.x > child_b.max.x {
         return b;
     }
-    match inst.kind {
-        InstanceKind::Single => expand_by_transform(&mut b, child_b, inst.transform),
+    match inst.kind() {
+        InstanceKind::Single => expand_by_transform(&mut b, child_b, inst.transform()),
         InstanceKind::Array { cols, rows, .. } => {
             for &(c, r) in &[(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1)] {
                 expand_by_transform(&mut b, child_b, inst.placement(c.max(0), r.max(0)));
@@ -671,6 +783,38 @@ fn expand_by_transform(b: &mut Bbox, child_b: &Bbox, t: Transform) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 7.8: every plain orientation is stored compactly and
+    /// re-expands bit for bit; anything else keeps its transform.
+    #[test]
+    fn plain_placements_are_compact_and_exact() {
+        let bits = |t: Transform| [t.a, t.b, t.c, t.d, t.tx, t.ty].map(f64::to_bits);
+        for o in 0..8u8 {
+            let t = Transform::from_strans(1234.0, -5678.0, 90.0 * (o & 3) as f64, o & 4 != 0, 1.0);
+            let inst = Instance::new(3, t, InstanceKind::Single);
+            assert_eq!(inst.manhattan_place(), Some((1234, -5678, o)), "orientation {o}");
+            assert_eq!(bits(inst.transform()), bits(t), "orientation {o}");
+        }
+        for t in [
+            Transform::from_strans(0.0, 0.0, 45.0, false, 1.0),
+            Transform::from_strans(0.0, 0.0, 90.0, false, 2.0),
+            Transform::from_strans(0.5, 0.0, 0.0, false, 1.0),
+            Transform::from_strans(3e9, 0.0, 0.0, false, 1.0),
+            Transform::translate(5.0, 6.0), // +0.0 where from_strans has -0.0
+        ] {
+            let inst = Instance::new(0, t, InstanceKind::Single);
+            assert_eq!(inst.manhattan_place(), None, "{t:?}");
+            assert_eq!(bits(inst.transform()), bits(t));
+        }
+        let t = Transform::from_strans(10.0, 20.0, 180.0, true, 1.0);
+        let kind = InstanceKind::Array { cols: 3, rows: 2, col_step: [7.5, 0.0], row_step: [0.0, 9.0] };
+        let arr = Instance::new(1, t, kind);
+        assert_eq!(arr.manhattan_place(), Some((10, 20, 6)));
+        assert_eq!(arr.count(), 6);
+        assert_eq!(arr.placement(2, 1).tx, 25.0);
+        assert!(matches!(arr.kind(), InstanceKind::Array { cols: 3, rows: 2, .. }));
+        assert!(std::mem::size_of::<Instance>() <= 32, "{} B", std::mem::size_of::<Instance>());
+    }
 
     #[test]
     fn permuting_in_place_matches_a_gather() {

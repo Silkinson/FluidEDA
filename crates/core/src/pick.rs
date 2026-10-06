@@ -134,9 +134,9 @@ fn walk_pick(
 
     // Descend into child instances whose world footprint contains the point.
     for (_, inst) in cell.resident_instances() {
-        match inst.kind {
+        match inst.kind() {
             crate::db::InstanceKind::Single => {
-                walk_pick(db, inst.child, world_tf.then(&inst.transform), world, best);
+                walk_pick(db, inst.child, world_tf.then(&inst.transform()), world, best);
             }
             crate::db::InstanceKind::Array { cols, rows, col_step, row_step } => {
                 if cols <= 0 || rows <= 0 {
@@ -150,11 +150,11 @@ fn walk_pick(
                 let dot = crate::transform::Bboxf::new(wp - 1.0, hp - 1.0, wp + 1.0, hp + 1.0);
                 let child_bb = db.local_bbox(inst.child);
                 let (c0, c1, r0, r1) = crate::cull::visible_range(
-                    &dot, world_tf, inst.transform, &child_bb, col_step, row_step, cols, rows,
+                    &dot, world_tf, inst.transform(), &child_bb, col_step, row_step, cols, rows,
                 );
                 for r in r0..=r1 {
                     for c in c0..=c1 {
-                        let t = world_tf.then(&crate::cull::placement(&inst.transform, col_step, row_step, c, r));
+                        let t = world_tf.then(&crate::cull::placement(&inst.transform(), col_step, row_step, c, r));
                         walk_pick(db, inst.child, t, world, best);
                     }
                 }
@@ -283,13 +283,13 @@ fn walk_composite(
         }
     }
     for (ii, inst) in cell.resident_instances() {
-        match inst.kind {
+        match inst.kind() {
             crate::db::InstanceKind::Single => {
                 if overlay.is_hidden((id, ii, 0, 0)) {
                     continue;
                 }
                 path.push((id, ii, 0, 0));
-                walk_composite(db, overlay, grown, inst.child, world_tf.then(&inst.transform), world, path, best, needs);
+                walk_composite(db, overlay, grown, inst.child, world_tf.then(&inst.transform()), world, path, best, needs);
                 path.pop();
             }
             crate::db::InstanceKind::Array { cols, rows, col_step, row_step } => {
@@ -300,14 +300,14 @@ fn walk_composite(
                 let dot = crate::transform::Bboxf::new(wp - 1.0, hp - 1.0, wp + 1.0, hp + 1.0);
                 let child_bb = grown.get(&inst.child).copied().unwrap_or_else(|| db.local_bbox(inst.child));
                 let (c0, c1, r0, r1) = crate::cull::visible_range(
-                    &dot, world_tf, inst.transform, &child_bb, col_step, row_step, cols, rows,
+                    &dot, world_tf, inst.transform(), &child_bb, col_step, row_step, cols, rows,
                 );
                 for r in r0..=r1 {
                     for c in c0..=c1 {
                         if overlay.is_hidden((id, ii, c, r)) {
                             continue;
                         }
-                        let t = world_tf.then(&crate::cull::placement(&inst.transform, col_step, row_step, c, r));
+                        let t = world_tf.then(&crate::cull::placement(&inst.transform(), col_step, row_step, c, r));
                         path.push((id, ii, c, r));
                         walk_composite(db, overlay, grown, inst.child, t, world, path, best, needs);
                         path.pop();

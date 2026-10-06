@@ -97,19 +97,19 @@ pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
         // sub-arrays covering exactly the visible ones.
         for (ii, inst) in cell.instances.iter().enumerate() {
             let child = &db.cells[inst.child].name;
-            let strans = invert_strans(&inst.transform);
-            match inst.kind {
+            let strans = invert_strans(&inst.transform());
+            match inst.kind() {
                 InstanceKind::Single => {
                     if overlay.is_hidden((id, ii as u32, 0, 0)) {
                         continue;
                     }
-                    w.sref(child, strans, inst.transform.tx, inst.transform.ty);
+                    w.sref(child, strans, inst.transform().tx, inst.transform().ty);
                 }
                 InstanceKind::Array { cols, rows, col_step, row_step } => {
                     let hidden = |c: i32, r: i32| overlay.is_hidden((id, ii as u32, c, r));
                     let any_hidden = overlay.hides_in(id) && (0..rows).any(|r| (0..cols).any(|c| hidden(c, r)));
                     if !any_hidden {
-                        w.aref(child, strans, (inst.transform.tx, inst.transform.ty), cols, rows, col_step, row_step);
+                        w.aref(child, strans, (inst.transform().tx, inst.transform().ty), cols, rows, col_step, row_step);
                         continue;
                     }
                     let origin = |c: i32, r: i32| {
@@ -393,7 +393,7 @@ mod tests {
             );
             for (a, b) in re.cells[id].instances.iter().zip(&db.cells[id].instances) {
                 assert_eq!(a.child, b.child, "{label}: inst child");
-                let (ta, tb) = (a.transform, b.transform);
+                let (ta, tb) = (a.transform(), b.transform());
                 for (x, y) in [(ta.a, tb.a), (ta.b, tb.b), (ta.c, tb.c), (ta.d, tb.d), (ta.tx, tb.tx), (ta.ty, tb.ty)] {
                     assert!((x - y).abs() < 1e-6, "{label}: inst transform {x} vs {y}");
                 }
@@ -438,16 +438,8 @@ mod tests {
         let leaf = b.intern("LEAF");
         b.cell_mut(leaf).shapes.push(Layer::new(1, 0), rect(0, 0, 100, 100));
         b.cell_mut(top).shapes.push(Layer::new(2, 0), rect(-400, -400, 50, 50));
-        b.cell_mut(top).instances.push(Instance {
-            child: leaf,
-            transform: Transform::translate(0.0, 0.0),
-            kind: InstanceKind::Array { cols: 4, rows: 3, col_step: [500.0, 0.0], row_step: [0.0, 700.0] },
-        });
-        b.cell_mut(top).instances.push(Instance {
-            child: leaf,
-            transform: Transform::translate(-2000.0, 0.0),
-            kind: InstanceKind::Single,
-        });
+        b.cell_mut(top).instances.push(Instance::new(leaf, Transform::translate(0.0, 0.0), InstanceKind::Array { cols: 4, rows: 3, col_step: [500.0, 0.0], row_step: [0.0, 700.0] }));
+        b.cell_mut(top).instances.push(Instance::new(leaf, Transform::translate(-2000.0, 0.0), InstanceKind::Single));
         let db = b.build().unwrap();
         // Flatten two elements of the array (one mid-row, one corner) and the SREF.
         let mut o = EditOverlay::new();

@@ -52,10 +52,10 @@ pub fn write_oasis(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
             shape(s.layer, &s.points, &mut modal, &mut body);
         }
         for (ii, inst) in cell.instances.iter().enumerate() {
-            match inst.kind {
+            match inst.kind() {
                 InstanceKind::Single => {
                     if !overlay.is_hidden((id, ii as u32, 0, 0)) {
-                        placement(inst.child, &inst.transform, None, &mut body);
+                        placement(inst.child, &inst.transform(), None, &mut body);
                     }
                 }
                 InstanceKind::Array { cols, rows, col_step, row_step } => {
@@ -330,7 +330,7 @@ mod tests {
                     .instances
                     .iter()
                     .map(|i| {
-                        let kind = match i.kind {
+                        let kind = match i.kind() {
                             InstanceKind::Single => String::from("single"),
                             InstanceKind::Array { cols, rows, col_step, row_step } => {
                                 let dim = |n: i32, s: [f64; 2]| if n > 1 { (n, [s[0] as i64, s[1] as i64]) } else { (1, [0, 0]) };
@@ -339,7 +339,7 @@ mod tests {
                                 format!("{d:?}")
                             }
                         };
-                        format!("{} {:?} {kind}", db.cell(i.child).name, i.transform)
+                        format!("{} {:?} {kind}", db.cell(i.child).name, i.transform())
                     })
                     .collect();
                 insts.sort();

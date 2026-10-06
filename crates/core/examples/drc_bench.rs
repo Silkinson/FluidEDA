@@ -159,7 +159,7 @@ fn main() {
 fn covered_by_child(db: &CellDb, cell: CellId, v: &Violation) -> bool {
     let (cx, cy) = ((v.bbox.min.x as f64 + v.bbox.max.x as f64) / 2.0, (v.bbox.min.y as f64 + v.bbox.max.y as f64) / 2.0);
     for inst in &db.cell(cell).instances {
-        let (cols, rows) = match inst.kind {
+        let (cols, rows) = match inst.kind() {
             InstanceKind::Array { cols, rows, .. } => (cols, rows),
             InstanceKind::Single => (1, 1),
         };

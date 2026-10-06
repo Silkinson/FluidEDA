@@ -74,6 +74,15 @@ const STREAM_PICK_TIMEOUT_S: f64 = 15.0;
 /// vertex is reproducible across peers and sessions. Coordinates stay i32 nm.
 const SNAP_NM: i32 = 5;
 
+/// A memory budget from `?<name>=<MB>` (fractions allowed: compact
+/// placements made 1 MB too roomy to test eviction), else `default` bytes.
+fn budget_param(name: &str, default: usize) -> usize {
+    webio::query_param(name)
+        .and_then(|mb| mb.parse::<f64>().ok())
+        .filter(|mb| *mb >= 0.0)
+        .map_or(default, |mb| (mb * 1048576.0) as usize)
+}
+
 /// Snap a world coordinate (nm, f32 out of the camera) onto the drawing grid.
 fn snap_nm(v: f32) -> i32 {
     ((v / SNAP_NM as f32).round() as i64 * SNAP_NM as i64) as i32
@@ -170,9 +179,7 @@ impl Stream {
             failures: 0,
             dense: 0,
             stale: 0,
-            budget: webio::query_param("stream_budget")
-                .and_then(|mb| mb.parse::<usize>().ok())
-                .map_or(STREAM_BUDGET_BYTES, |mb| mb << 20),
+            budget: budget_param("stream_budget", STREAM_BUDGET_BYTES),
             inst_base: fluideda_core::pack::inst_chunk_base(db),
             placements: Rc::new(RefCell::new(Vec::new())),
             gen: {
@@ -184,9 +191,7 @@ impl Stream {
             p_last_used: HashMap::new(),
             p_bytes: HashMap::new(),
             p_resident_bytes: 0,
-            p_budget: webio::query_param("placement_budget")
-                .and_then(|mb| mb.parse::<usize>().ok())
-                .map_or(STREAM_PLACEMENT_BUDGET, |mb| mb << 20),
+            p_budget: budget_param("placement_budget", STREAM_PLACEMENT_BUDGET),
             p_fetched: 0,
             p_fetched_bytes: 0,
             p_fetch_ms: 0.0,
@@ -200,9 +205,7 @@ impl Stream {
             s_last_used: HashMap::new(),
             s_bytes: HashMap::new(),
             s_resident_bytes: 0,
-            s_budget: webio::query_param("shape_budget")
-                .and_then(|mb| mb.parse::<usize>().ok())
-                .map_or(STREAM_SHAPE_BUDGET, |mb| mb << 20),
+            s_budget: budget_param("shape_budget", STREAM_SHAPE_BUDGET),
             s_fetched: 0,
             s_fetched_bytes: 0,
             s_evicted: 0,

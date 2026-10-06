@@ -926,7 +926,7 @@ impl Reader {
                 }
             }
             for (child, transform, kind) in oc.instances {
-                cell.instances.push(Instance { child: ids[child], transform, kind });
+                cell.instances.push(Instance::new(ids[child], transform, kind));
             }
         }
         b.build()
@@ -1049,7 +1049,7 @@ mod tests {
         assert_eq!(db.top, top);
         assert_eq!(db.cell(leaf).shapes.len(), 3, "the repetition expands");
         assert_eq!(db.cell(leaf).shapes.bbox_of(2).min, Point::new(400, 0));
-        match db.cell(top).instances[0].kind {
+        match db.cell(top).instances[0].kind() {
             InstanceKind::Array { cols, rows, col_step, .. } => {
                 assert_eq!((cols, rows), (2, 1));
                 assert_eq!(col_step, [5000.0, 0.0]);
