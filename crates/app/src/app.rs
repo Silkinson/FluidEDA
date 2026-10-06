@@ -35,11 +35,6 @@ const REJOIN_MAX_S: f64 = 8.0;
 /// A cell projecting smaller than this many pixels becomes an LOD proxy.
 const MIN_PIXEL: f64 = 4.0;
 
-/// Streaming (Phase 6 SLICE 3): a chunk's geometry is fetched only once its
-/// screen footprint gives each of its shapes at least this many pixels;
-/// denser chunks draw as proxies. Resident geometry is then bounded by the
-/// screen — about one shape per pixel — whatever the design's size.
-const STREAM_PX_PER_SHAPE: f64 = 1.0;
 /// Streaming: chunk fetches in flight at once.
 const STREAM_MAX_IN_FLIGHT: usize = 32;
 /// Streaming: GPU geometry kept before the least recently drawn chunks are
@@ -1931,6 +1926,7 @@ impl FluidApp {
             .iter()
             .filter(|d| {
                 !d.dirty
+                    && !d.dense
                     && self.cell_loaded(d.cell)
                     && !self.uploaded.contains(&(d.cell, d.chunk))
                     && self.db.cells[d.cell].chunks[d.chunk as usize].len() >= TESS_WORKER_MIN_SHAPES
@@ -1944,6 +1940,9 @@ impl FluidApp {
             let key = (d.cell, d.chunk);
             if self.uploaded.contains(&key) || self.tess_pending.contains(&key) {
                 continue; // already on the GPU, or a worker job is in flight (proxy shows)
+            }
+            if d.dense {
+                continue; // Phase 7.6: drawn as its proxy — nothing to tessellate
             }
             if !self.cell_loaded(d.cell) {
                 continue; // progressive load: geometry not here yet — the renderer proxies it
@@ -2266,7 +2265,6 @@ impl FluidApp {
     ) -> usize {
         let Some(st) = self.stream.as_mut() else { return 0 };
         st.dense = 0;
-        let scale = self.camera.scale as f64; // px per nm
         let now = self.last_frame;
         let mut dispatched = 0usize;
         let mut rebuilt = 0usize;
@@ -2315,11 +2313,9 @@ impl FluidApp {
             if self.tess_pending.contains(&key) || st.retry_at.get(&key).is_some_and(|&t| now < t) {
                 continue;
             }
-            // Density: fetch only once every shape gets a pixel or more.
-            let chunk = &self.db.cells[d.cell].chunks[d.chunk as usize];
-            let (w, h) = chunk.bbox.size();
-            let px = (w * scale).max(1.0) * (h * scale).max(1.0);
-            if px < chunk.len() as f64 * STREAM_PX_PER_SHAPE {
+            // Density (the cull's call since 7.6): fetch only once every
+            // shape gets a pixel or more.
+            if d.dense {
                 st.dense += 1;
                 continue;
             }
@@ -2609,7 +2605,7 @@ impl FluidApp {
              \"p_evicted\":{},\"p_in_flight\":{},\"p_wanted\":{},\"p_failures\":{},\"dense_inst\":{},\"proxies\":{},\
              \"s_fetched\":{},\"s_fetched_bytes\":{},\"s_resident\":{},\"s_resident_bytes\":{},\"s_evicted\":{},\
              \"s_in_flight\":{},\"s_failures\":{},\"wants\":{},\"pick_pending\":{},\"pick_us\":{:.0},\
-             \"retess\":{},\"flatten_pending\":{},\"busy\":\"{}\"}}",
+             \"retess\":{},\"flatten_pending\":{},\"busy\":\"{}\",\"dense_chunks\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -2678,6 +2674,7 @@ impl FluidApp {
             self.stream.as_ref().map_or(0, |s| s.retess.len()),
             self.pending_flatten.is_some(),
             self.busy_reason().unwrap_or(""),
+            self.cull_stats.dense_chunks,
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }

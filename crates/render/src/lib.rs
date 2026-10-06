@@ -407,7 +407,9 @@ impl HierRenderer {
         let mut pending_proxies: Vec<(u32, Bboxf)> = Vec::new();
         for d in &visible.draws {
             let key = (d.cell, d.chunk);
-            if !self.cells.contains_key(&key) {
+            // Phase 7.6: a dense chunk is its proxy even when its mesh is
+            // loaded (it was drawn at a closer zoom).
+            if d.dense || !self.cells.contains_key(&key) {
                 // Not tessellated yet: proxy the chunk's world footprint at each
                 // placement (a loose AABB of the local bbox under the transform).
                 for t in &d.transforms {

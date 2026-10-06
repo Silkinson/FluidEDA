@@ -338,11 +338,14 @@ mod tests {
         };
         assert_eq!(key(&after), key(&local), "resident ⇒ same selection as in-core");
 
-        // Zoomed out, the big list draws as one proxy per chunk, unfetched.
+        // Zoomed out, the big list draws as one proxy per chunk, unfetched —
+        // and since Phase 7.6 an in-core load draws it the same way.
         let fit = Bboxf { min_x: -1e5, min_y: -1e5, max_x: 5e5, max_y: 3e5 };
         let far = crate::cull(&streamed, &fit, 0.0005, 4.0);
         assert!(far.stats.dense_inst_chunks > 0 && far.placements_wanted.is_empty());
-        assert!(far.stats.nodes_visited < crate::cull(&db, &fit, 0.0005, 4.0).stats.nodes_visited / 10);
+        let local_far = crate::cull(&db, &fit, 0.0005, 4.0);
+        assert_eq!(key(&far), key(&local_far), "zoomed out, streamed and in-core draw the same");
+        assert_eq!(far.stats.nodes_visited, local_far.stats.nodes_visited);
     }
 
     #[test]

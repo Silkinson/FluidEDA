@@ -1,8 +1,10 @@
 //! Cull cost with and without placement chunks (Phase 7.3), same binary, same
 //! session: the design as built (big cells' placements in spatial chunks),
 //! then the same design with every cell's placements collapsed into one chunk
-//! (the pre-7.3 walk). Both must select identical draws and proxies; the
-//! difference is the work — nodes visited and wall time.
+//! (the pre-7.3 walk). Both must select identical draws and proxies wherever
+//! no placement chunk is too dense for its size on screen (Phase 7.6: such a
+//! chunk is one proxy instead of its placements); the difference is the work
+//! — nodes visited and wall time.
 //!
 //! Views: the fit view, then a scan of the die in 50 µm windows (leaf-ish
 //! zoom) and in 400 µm windows (mid zoom).
@@ -31,22 +33,25 @@ fn views(db: &CellDb, span: f64) -> Vec<Bboxf> {
     out
 }
 
-/// Total wall ms, nodes visited, draws + proxies, over `views` (3 rounds, best).
-fn run(db: &CellDb, views: &[Bboxf]) -> (f64, u64, usize) {
+/// Total wall ms, nodes visited, draws + proxies, and placement chunks drawn
+/// as one proxy for density, over `views` (3 rounds, best).
+fn run(db: &CellDb, views: &[Bboxf]) -> (f64, u64, usize, u64) {
     let mut best = f64::MAX;
-    let (mut nodes, mut emitted) = (0, 0);
+    let (mut nodes, mut emitted, mut dense) = (0, 0, 0);
     for _ in 0..3 {
         let t = Instant::now();
         nodes = 0;
         emitted = 0;
+        dense = 0;
         for v in views {
             let vs = cull(db, v, VIEWPORT_PX / (v.max_x - v.min_x), 4.0);
             nodes += vs.stats.nodes_visited;
             emitted += vs.draws.len() + vs.proxies.len();
+            dense += vs.stats.dense_inst_chunks;
         }
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
     }
-    (best, nodes, emitted)
+    (best, nodes, emitted, dense)
 }
 
 fn main() {
@@ -73,11 +78,13 @@ fn main() {
             db.cells[id].inst_chunks = vec![Chunk { start: 0, end: n, bbox }];
         }
     }
-    for ((name, v), (ms, nodes, emitted)) in cases.iter().zip(chunked) {
-        let (ms0, nodes0, emitted0) = run(&db, v);
-        assert_eq!(emitted, emitted0, "{name}: chunked and walked culls must select the same");
+    for ((name, v), (ms, nodes, emitted, dense)) in cases.iter().zip(chunked) {
+        let (ms0, nodes0, emitted0, _) = run(&db, v);
+        if dense == 0 {
+            assert_eq!(emitted, emitted0, "{name}: chunked and walked culls must select the same");
+        }
         println!(
-            "{name:>12} ({:>4} views): walk-all {ms0:>8.1} ms, {nodes0:>10} nodes | chunked {ms:>8.1} ms, {nodes:>10} nodes | {:.1}× less time",
+            "{name:>12} ({:>4} views): walk-all {ms0:>8.1} ms, {nodes0:>10} nodes, {emitted0:>7} drawn | chunked {ms:>8.1} ms, {nodes:>10} nodes, {emitted:>7} drawn ({dense} dense placement chunks) | {:.1}× less time",
             v.len(),
             ms0 / ms.max(1e-9)
         );

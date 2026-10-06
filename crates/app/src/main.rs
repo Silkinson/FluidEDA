@@ -32,7 +32,14 @@ fn main() {
     // load metrics go to window.__fluideda_metrics, not the log.
     console_log::init_with_level(log::Level::Warn).ok();
 
-    let web_options = eframe::WebOptions::default();
+    let mut web_options = eframe::WebOptions::default();
+    // `?webgl` keeps wgpu on WebGL even where the browser offers WebGPU
+    // (which it prefers) — to measure the fallback path.
+    if webio::query_flag("webgl") {
+        if let egui_wgpu::WgpuSetup::CreateNew(setup) = &mut web_options.wgpu_options.wgpu_setup {
+            setup.instance_descriptor.backends = wgpu::Backends::GL;
+        }
+    }
     wasm_bindgen_futures::spawn_local(async {
         let document = web_sys::window().unwrap().document().unwrap();
         let canvas = document

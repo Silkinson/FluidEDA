@@ -112,9 +112,12 @@ mod wasm {
 
         let t0 = now_ms();
         // GDSII or OASIS, sniffed by magic (Phase 6).
-        let db = fluideda_core::load_layout_db(&bytes)
+        let mut db = fluideda_core::load_layout_db(&bytes)
             .map_err(|e| JsValue::from_str(&format!("parse failed: {e}")))?;
         drop(bytes); // free the raw file (278 MB on caravel) before serializing
+        // Phase 7.6: dense chunks draw as proxies in-core too, coloured by
+        // their look.
+        fluideda_core::pack::annotate_chunk_looks(&mut db);
         let parse_ms = now_ms() - t0;
 
         let cols = fluideda_core::serialize(&db);

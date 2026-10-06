@@ -546,3 +546,89 @@ Correctness:
 - The browser suites pass: the stream test (its placement-eviction check now
   uses a 0.25 MB budget; 1 MB no longer forces evictions), the streamed edit
   test, and the sync test, in-core and STREAMED.
+
+## 7.6 — the fit view
+
+**Problem.** Zoomed out, an in-core design drew everything it had. At
+caravel's fit, the cull produced 391,850 proxies (one per sub-pixel
+placement) and 2,160 chunk draws. Every chunk with geometry on screen was
+tessellated and uploaded, so 202 MB sat on the GPU, nearly all of it
+triangles smaller than a pixel. The fit view ran at 76 frames/s on WebGPU
+and 66 on WebGL, against 120 at mid and leaf. Phase 5c measured Dawn 14%
+behind ANGLE there. Each idle heartbeat frame redid the 8 ms cull (13.6% of
+the main thread). On the 50 M-placement design, the per-placement proxies
+were fatal: 50 M boxes overflow wasm32's 2 GB array limit, so the in-core
+load panicked ("capacity overflow").
+
+Streamed designs never had this problem. Since Phase 6 they fetch a chunk
+only once each of its shapes gets a pixel, and since 7.3 a dense placement
+chunk is one proxy.
+
+**Design.** Streaming's density rule now runs in the cull, for every design.
+- Shape chunks: each draw carries `dense`. It is set when the chunk's
+  footprint, at its placement's scale, gives its shapes fewer than
+  `DENSE_PX_PER_SHAPE` (1) pixels each. A dense chunk draws as its proxy,
+  in its look's colour, even when its mesh is already loaded from a closer
+  zoom. The app neither tessellates nor uploads it. Streaming now reads the
+  same flag instead of keeping its own copy of the rule.
+- In-core, only chunks of at least `DENSE_MIN_SHAPES` (1,024) shapes are
+  ruled dense. The rule exists to remove big chunks' thousands of sub-pixel
+  triangles. A small chunk, such as a standard cell's few dozen shapes,
+  costs next to nothing and keeps its exact look. Without this floor the
+  sky130 fit golden moved 4.18%; with it, every golden is unchanged. A
+  streamed cell keeps the rule at every size, because there it decides what
+  is fetched.
+- Placement chunks: a chunk whose placements would average under the LOD
+  size (`min_pixel`, 4 px) is one proxy box, as a streamed cell's has been
+  since 7.3. At caravel's fit (native `cull_bench`, 1,280 px), 129 of its
+  561 placement chunks become one box each. The cull emits 86,094 draws and
+  proxies where the full walk emits 585,515.
+- The parse worker and the native loader now annotate chunk looks, as the
+  pack does, so in-core proxies get the same colours as streamed ones.
+- The cull equivalence test now covers two cases, and asserts that both
+  occur:
+  - where no placement chunk is dense, the output is exactly the
+    per-placement walk's;
+  - where one is, every draw is also one the full walk makes.
+
+  `cull_bench` follows the same rule.
+- `?webgl` keeps wgpu on WebGL even where the browser offers WebGPU. Headless
+  Chromium now offers WebGPU by default, so without the flag a "WebGL" run
+  was really WebGPU. `UNCAP=1` in the harness lifts the display-rate cap.
+
+**Measured.** Same-session A/B, in-core caravel: the 7.8 commit served from a
+worktree on :8081 against this build (`fit_fps.mjs` with `?continuous`,
+`fit_ab.mjs`, `load_ab.mjs`):
+
+| | before (7.8) | dense rule (7.6) |
+|---|--:|--:|
+| fit, frames/s: WebGPU · WebGL (display cap 120) | 76.4 · 65.8 | **120.1 · 120.1** |
+| fit, frames/s uncapped: WebGPU · WebGL | 73.0 · 76.0 | **742 · 227** |
+| fit: cull per frame | 8.4 ms | **1.4 ms** |
+| fit: draws · proxies | 2,160 · 391,850 | **704 · 32,053** |
+| fit: chunks uploaded · GPU memory | 222 · 202 MB | **84 · 14 MB** |
+| fit: main thread while idle | 13.6% | **3.8%** |
+| mid uncapped, frames/s: WebGPU · WebGL | 3,657 · 998 | 3,643 · 1,001 (unchanged) |
+| place_50M in-core | fails ("capacity overflow") | **opens**: first frame 10.0 s, heap 1,258 MB |
+
+Mid and leaf at the display cap are unchanged too (120 frames/s, 29 draws,
+1 MB GPU on both backends).
+
+The fit view is no longer GPU-bound. WebGPU now leads WebGL by 3.3× there
+(742 vs 227 uncapped), where Phase 5c had it 14% behind. Before this slice
+the uncapped gap had already narrowed to 4% (73 vs 76).
+
+Fidelity at fit: 14.2% of pixels differ from the 7.8 view, but only 0.01%
+by more than 24/255 in any channel (mean absolute difference 0.21). At mid
+the views are identical. A dense chunk's coloured proxy averages to what
+its sub-pixel triangles blended to.
+
+place_50M now loads in-core, but its parse worker peaks at 3,986 MB, just
+under wasm32's 4 GB. The worker holds the 1.3 GB file and the whole
+database at once; 7.9 removes those peaks.
+
+Correctness:
+- 109 core tests (the cull equivalence and pack tests cover the new
+  semantics), 5 render tests with the goldens unchanged, 17 server tests.
+- The browser suites pass on this build: the stream test (11 checks), the
+  streamed edit test (11), and the sync test, in-core (33) and STREAMED (34).

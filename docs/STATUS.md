@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-10-04 · current branch: `phase7` (off `phase6-backend-oasis`)_
+_Last updated: 2026-10-06 · current branch: `phase7` (off `phase6-backend-oasis`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -97,6 +97,18 @@ front, then 7.4, edit streamed designs. **Both are done.**
     and parse worker 597 → 548 MB (same-session A/B against the 7.7 build).
   - Pack placements: caravel 24.2 → 3.1 MB, place_50M 2.65 GB → 251 MB.
     place_50M's pack builds in 6.1 s, down from 39 s.
+* **7.6 — the fit view.** Streaming's density rule now runs in the cull for
+  every design. Zoomed out, a big chunk whose shapes would get under a pixel
+  each draws as one proxy in its look's colour, and a dense placement chunk
+  as one box. Results, in-core caravel at fit, same-session A/B against 7.8:
+  - 76 → 120 frames/s on WebGPU and 66 → 120 on WebGL (the display rate).
+    Uncapped: WebGPU 73 → 742, WebGL 76 → 227. WebGPU now leads at fit; it
+    trailed by 14% in Phase 5c.
+  - Cull 8.4 → 1.4 ms. GPU memory 202 → 14 MB. Idle main thread 13.6% →
+    3.8%.
+  - 0.01% of pixels visibly differ. Mid, leaf and the goldens are
+    unchanged.
+  - The 50 M-placement design now opens in-core (it used to panic).
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -286,7 +298,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
-| 7 — scale + collaboration | `phase7` | ◑ 7.3 done (SLICES A–C) | 7.3 first (owner's order). SLICE A: placement chunks — caravel's in-browser cull at mid 10.0 → 0.73 ms/frame, leaf 9.7 → 0.37 ms/frame, output identical. SLICE B: pack v3 streams the hierarchy — streamed caravel heap 180 → 16 MB; a 50 M-placement design that fails in-core opens streamed (9 MB). SLICE C: coloured proxies — flat_11M fit 71% → 18% of pixels off in-core. Next: 7.1, 7.2, 7.4, 7.5, 7.6 |
+| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1a, 7.7, 7.8, 7.6 done | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). Next: 7.9, 7.1c, finer streamed picks, 7.1b, 7.2, 7.5 |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -297,11 +309,11 @@ still byte-identical).
 | main-thread parse freeze | **~0** (pannable) | was 1.2 s; parse runs in a Web Worker (STEP 2), which now also *fetches* the file (Phase 5c). The design arrives progressively: skeleton parsed in slices, installed as proxies, geometry filled in visible-first — ≤ 6 ms/frame, ~8 frames. Longest load frame at leaf **50 ms** (was 76–176 ms, same session, headless; what remains is the leaf view's inline tessellation) |
 | parse wall | 1.0–1.2 s | now off the main thread (in the worker) |
 | combined peak heap (worker+main) | **~1.28 GB** | was 1.46 GB: single-copy reconstruction drops the concatenated wasm-side columns (main heap 434 → 254 MB). Worker memory reclaimed on terminate |
-| fit fps | 47–78 | browser WebGL2 / native Metal; chunking cost ~6% at fit |
-| fit fps, **real WebGPU** (Metal) | sky130 **60** / caravel 44 | Phase 5c (wgpu 30): first real WebGPU numbers — WebGL2-on-Metal for the same views is 22 / 51 (3 runs each, headless, 120 Hz cap). sky130's fit (5,144 draws/frame, CPU-bound) is 2.7× faster: WebGPU's per-draw cost is lower than ANGLE's. caravel's fit (1,822 draws over millions of triangles, GPU-bound) is 14% slower on Dawn-Metal than ANGLE-Metal. mid/leaf identical (93–94 fps) |
+| fit fps | **120** (display rate) · uncapped WebGPU **742**, WebGL **227** | Phase 7.6: the density rule in-core — dense chunks draw as coloured proxies (same-session A/B against 7.8: 76 / 66 capped, 73 / 76 uncapped). Earlier: 47–78, browser WebGL2 / native Metal |
+| fit fps, **real WebGPU** (Metal) | sky130 **60** / caravel 44 | Phase 5c (wgpu 30): first real WebGPU numbers — WebGL2-on-Metal for the same views is 22 / 51 (3 runs each, headless, 120 Hz cap). sky130's fit (5,144 draws/frame, CPU-bound) is 2.7× faster: WebGPU's per-draw cost is lower than ANGLE's. caravel's fit (1,822 draws over millions of triangles, GPU-bound) is 14% slower on Dawn-Metal than ANGLE-Metal. mid/leaf identical (93–94 fps). caravel's fit since Phase 7.6: the row above |
 | longest fit-view frame | **62 ms** | was ~1.1 s inline freeze (measured, headless; ~2.5 s prior estimate). STEP 2: tessellation offloaded to a worker, main draws bbox proxies then streams. No frame > 100 ms. caravan-signoff 1.35 s → 64 ms |
 | fit-view TTFF | **1.7 s** (first frame of the new design) | Phase 5c: the skeleton (hierarchy + chunk boxes) installs before any geometry, so first paint no longer waits for the column copy either; all geometry in ~150 ms later (`geometry_ms`). Same session before/after: caravel 2.7 → 1.7 s, caravan-signoff 3.0 → 2.0 s; longest fit frame 112 → 84 ms / 119 → 82 ms (machine under load; absolute numbers above this table's older 62 ms were measured on a quiet machine) |
-| cull per frame (browser, caravel) | fit 17.7 ms · mid **0.73 ms** · leaf **0.37 ms** | Phase 7.3 SLICE A placement chunks: mid/leaf were 10.0 / 9.7 ms (same-build A/B, `?instwalk`); fit is the 553 k per-placement proxies — next for the density rule |
+| cull per frame (browser, caravel) | fit **1.4 ms** · mid **0.73 ms** · leaf **0.37 ms** | Phase 7.3 SLICE A placement chunks: mid/leaf were 10.0 / 9.7 ms (same-build A/B, `?instwalk`). Phase 7.6: dense placement chunks are one proxy each — fit 8.4 → 1.4 ms (same-session A/B against 7.8; the 7.3-era measurement was 17.7 ms) |
 | edit re-tess frame | < 2 ms | dirty chunks stay inline (finer-chunking, SLICE 2 path unchanged); offload never touches the edit path. caravel 1.8 ms, caravan-signoff 0.4 ms |
 | DRC: biggest cell full check | **2.9 s** (wasm, single-threaded) | caravel_core, 2.5 M shapes, merge-first (Phase 5b); was 10.3 s cold / 9.6 s warm per-shape. Native 2.3 s. Includes the 95 ms tile-grid build (budgeted, replaces the atomic R-tree). 2923 tiles, slowest 5.1 ms |
 | DRC: re-check after one edit | **1.1 ms** (wasm) | tiles within reach of the edit (1 tile for a typical shape); was a 9.6 s whole-cell re-check |
@@ -311,7 +323,7 @@ still byte-identical).
 | DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 | room link → design + edits (late joiner) | **1.41 s** | Phase 6 SLICE 2: `?room=` only — room lookup, caravel (291 MB) from the blob store, the room state from the server (first frame 998 ms; WebGPU, headless) |
-| largest design that opens | **2 GB / 32 M polygons, or 50 M placements, streamed** (in-core: both fail) | Phase 7.3 SLICE B: the hierarchy streams too — a 50 M-placement design opens in 92 ms with a 9 MB heap |
+| largest design that opens | **2 GB / 32 M polygons, or 50 M placements, streamed**; in-core, 50 M placements since 7.6 | Phase 7.3 SLICE B: the hierarchy streams too — a 50 M-placement design opens in 92 ms with a 9 MB heap. Phase 7.6: it also opens in-core (first frame 10.0 s, heap 1.26 GB; it used to panic) |
 | out-of-core memory (Phase 6) | streamed heap 6–8 MB | Phase 6 SLICE 3: streamed, browser memory scales with the screen + hierarchy, not geometry — flat_32M main heap 8 MB, flat_11M 6 MB (in-core 534 MB + 2.2 GB worker peak) |
 | first frame, streamed | caravel **79 ms** / flat_32M 45 ms | skeleton + chunk index from the server's pack, then on-screen chunks by byte range (in-core caravel: 873 ms) |
 | reconnect after a server restart | ~0.5 s | first retry at 0.5 s (backoff doubles to 8 s); the room comes back from its WAL or snapshot and offline edits merge |
@@ -454,8 +466,10 @@ still byte-identical).
   it (eframe prefers it; WebGL2 stays the fallback) — in headless Chromium with
   `--enable-unsafe-webgpu --use-angle=metal` that is the Apple GPU (`GPU=webgpu`
   in every harness; `scripts/launch.mjs`). The golden images pass unchanged.
-  The measured split (fit fps row above) is the next renderer question: the
-  GPU-bound caravel fit is ~14% slower on Dawn than on ANGLE.
+  The measured split (fit fps row above) was the next renderer question: the
+  GPU-bound caravel fit was ~14% slower on Dawn than on ANGLE. **Resolved by
+  Phase 7.6**: the gap was sub-pixel triangles. With dense chunks drawn as
+  proxies, WebGPU leads at fit (742 vs 227 frames/s uncapped).
 - ~~Golden PNGs are not committed~~ **RESOLVED** — `crates/render/tests/golden.rs`
   + 11 committed 512² reference PNGs (hier/sky130 fit/mid/leaf + 5 edit-overlay:
   base/moved/deleted/added/vertex), diffed with a documented tolerance in
@@ -597,4 +611,4 @@ Its measurements name the next steps:
   and the overlay.
 - **Coalesce chunk range requests** for real network latency.
 - **In-context DRC.** Still the DRC frontier from Phase 5b.
-- **The Dawn-vs-ANGLE fit-view gap.**
+- ~~**The Dawn-vs-ANGLE fit-view gap.**~~ Resolved in Phase 7.6.

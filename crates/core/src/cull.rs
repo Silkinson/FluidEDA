@@ -40,10 +40,30 @@ pub struct CellDraw {
     /// world at each placement — as a coarse proxy until the real mesh arrives.
     pub bbox: crate::types::Bbox,
     /// The colour this chunk's proxy draws in, packed straight RGBA8 — what
-    /// its layers make from far away (a streamed design, Phase 7.3 SLICE C);
-    /// 0 = the neutral proxy.
+    /// its layers make from far away (Phase 7.3 SLICE C); 0 = the neutral
+    /// proxy.
     pub rgba: u32,
+    /// Phase 7.6: too many shapes for the chunk's size on screen — fewer than
+    /// [`DENSE_PX_PER_SHAPE`] pixels each — so it draws as its proxy, in its
+    /// look's colour, whether or not its geometry is loaded. Streamed designs
+    /// have always done this (their dense chunks are never fetched); in-core
+    /// loads now do too, so both draw a zoomed-out view the same way.
+    pub dense: bool,
 }
+
+/// Phase 7.6 (streaming since 6 SLICE 3): a chunk is drawn as geometry only
+/// once its screen footprint gives each of its shapes at least this many
+/// pixels; denser chunks draw as one proxy coloured by their look. Work and
+/// GPU memory at a zoomed-out view are then bounded by the screen — about
+/// one shape per pixel — whatever the design's size.
+pub const DENSE_PX_PER_SHAPE: f64 = 1.0;
+
+/// Phase 7.6: an in-core chunk needs at least this many shapes to be drawn
+/// as a proxy for density. The GPU cost the rule removes is big chunks'
+/// thousands of sub-pixel triangles; a small chunk (a standard cell's few
+/// dozen shapes) costs next to nothing and keeps its exact look. A streamed
+/// cell applies the rule at every size: there it decides what is fetched.
+pub const DENSE_MIN_SHAPES: usize = 1024;
 
 /// Result of a viewport query.
 #[derive(Debug, Default)]
@@ -81,8 +101,11 @@ pub struct CullStats {
     /// Placement chunks skipped whole because their footprint missed the view
     /// (Phase 7.3).
     pub inst_chunks_skipped: u64,
-    /// Streamed cells' placement chunks drawn as one proxy for density.
+    /// Placement chunks drawn as one proxy for density (streamed cells
+    /// since 7.3; every chunked cell since 7.6).
     pub dense_inst_chunks: u64,
+    /// Shape chunks drawn as their proxy for density (Phase 7.6).
+    pub dense_chunks: u64,
 }
 
 /// Cull the design against a world-space viewport.
@@ -177,9 +200,17 @@ fn cull_inner(
         ctx.set.stats.instances_emitted += transforms.len() as u64;
         let dirty = dirty_cells.contains(&cell);
         let c = db.cell(cell);
-        let bbox = c.chunks[chunk as usize].bbox;
+        let ch = &c.chunks[chunk as usize];
+        let bbox = ch.bbox;
         let rgba = c.chunk_rgba.get(chunk as usize).copied().unwrap_or(0);
-        ctx.set.draws.push(CellDraw { cell, chunk, transforms, dirty, bbox, rgba });
+        // Density at this chunk's (first) placement's scale.
+        let scale = transforms.first().map_or(1.0, |t| t.det().abs().sqrt()) * px_per_nm;
+        let (w, h) = bbox.size();
+        let px = (w * scale).max(1.0) * (h * scale).max(1.0);
+        let dense = px < ch.len() as f64 * DENSE_PX_PER_SHAPE
+            && (c.remote_shapes.is_some() || ch.len() >= DENSE_MIN_SHAPES);
+        ctx.set.stats.dense_chunks += dense as u64;
+        ctx.set.draws.push(CellDraw { cell, chunk, transforms, dirty, bbox, rgba, dense });
     }
     ctx.set.stats.proxy_count = ctx.set.proxies.len();
 
@@ -360,6 +391,19 @@ impl CullCtx<'_> {
             if chunk_view.as_ref().is_some_and(|v| !bbox_intersects(&ch.bbox, v)) {
                 self.set.stats.inst_chunks_skipped += 1;
                 continue;
+            }
+            // Phase 7.6: a chunk whose placements would average under
+            // `min_pixel` draws as one proxy, as a streamed cell's does. At
+            // caravel's fit (1280 px wide) 129 chunks go this way, and the
+            // cull emits 86 k draws and proxies instead of 586 k.
+            if chunk_view.is_some() {
+                let wb = world_tf.apply_bbox(&ch.bbox);
+                let px = (wb.width() * self.px_per_nm).max(1.0) * (wb.height() * self.px_per_nm).max(1.0);
+                if px < ch.len() as f64 * self.min_pixel * self.min_pixel {
+                    self.set.proxies.push(clip(&wb, &self.view));
+                    self.set.stats.dense_inst_chunks += 1;
+                    continue;
+                }
             }
             for ii in ch.start as usize..ch.end as usize {
                 self.descend(id, ii, &cell.instances[ii], world_tf, hides);
@@ -674,14 +718,30 @@ mod tests {
             Bboxf { min_x: 49_000.0, min_y: -500.0, max_x: 52_000.0, max_y: 80_500.0 },    // a stripe across chunks
             Bboxf { min_x: -5_500.0, min_y: 30_000.0, max_x: -3_000.0, max_y: 50_000.0 },   // the array only
         ];
+        let (mut exact, mut dense) = (0, 0);
         for v in views {
             for scale in [0.002, 0.05, 1.0] {
                 let a = cull(&chunked, &v, scale, 4.0);
                 let b = cull(&walked, &v, scale, 4.0);
-                assert_eq!(canon(&a), canon(&b), "view {v:?} at {scale} px/nm");
+                if a.stats.dense_inst_chunks == 0 {
+                    assert_eq!(canon(&a), canon(&b), "view {v:?} at {scale} px/nm");
+                    exact += 1;
+                } else {
+                    // Phase 7.6: a chunk too dense for its size draws as one
+                    // proxy instead of its placements, so it only takes
+                    // geometry away: every draw is one the full walk makes.
+                    let (da, db) = (canon(&a).0, canon(&b).0);
+                    for (cell, chunk, tfs) in &da {
+                        let full = db.iter().find(|(c, k, _)| c == cell && k == chunk);
+                        let full = full.unwrap_or_else(|| panic!("draw {cell}/{chunk} not in the full walk"));
+                        assert!(tfs.iter().all(|t| full.2.contains(t)), "view {v:?} at {scale} px/nm");
+                    }
+                    dense += 1;
+                }
                 assert!(a.stats.nodes_visited <= b.stats.nodes_visited);
             }
         }
+        assert!(exact > 0 && dense > 0, "both cases exercised ({exact} exact, {dense} dense)");
         // A small view really skips most of the lattice.
         let small = cull(&chunked, &views[1], 1.0, 4.0);
         assert!(small.stats.inst_chunks_skipped > 0);

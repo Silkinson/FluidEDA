@@ -325,7 +325,9 @@ impl ColumnSource for NoColumns {
 /// geometry byte counts are filled in by the app as cells become visible.
 pub fn load_design(name: &str, bytes: &[u8]) -> anyhow::Result<Design> {
     let t = Instant::now();
-    let db = fluideda_core::load_layout_db(bytes)?; // GDSII or OASIS (Phase 6)
+    let mut db = fluideda_core::load_layout_db(bytes)?; // GDSII or OASIS (Phase 6)
+    // Phase 7.6: dense chunks draw as proxies coloured by their look.
+    fluideda_core::pack::annotate_chunk_looks(&mut db);
     let parse_ms = t.elapsed().as_secs_f64() * 1e3;
     // Sampled here, before tessellation/index — wasm memory never shrinks, so
     // this is the parse high-water (the streaming-parser headline).
