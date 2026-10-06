@@ -11,9 +11,11 @@
 //!   as a bbox proxy until its geometry arrives.
 //! * **geometry** — one self-contained record per chunk, cells in order and
 //!   each cell's chunks in order, each fetchable with one HTTP byte range:
-//!   `[n u32][nc u32][starts (n+1) u32, 0-based][layers n u32][coords nc i32]`,
-//!   little-endian. Every field is 4-byte aligned, so a fetched range is used
-//!   in place through typed-array views.
+//!   `[n u32][nc u32][starts (n+1) u32, 0-based][layers n u32]
+//!   [kinds n u8, zero-padded to 4][coords nc i32]`, little-endian. Every
+//!   column starts 4-byte aligned, so a fetched range is used in place
+//!   through typed-array views. `kinds` (pack v6, Phase 7.7) is the store's
+//!   rectangle column: a rectangle's coords are just its two corners.
 //! * **index** — `chunks + 1` little-endian u64 byte offsets into the
 //!   geometry: chunk `k` is `offsets[k]..offsets[k+1]`, with `k` numbered by
 //!   [`chunk_base`].
@@ -47,8 +49,9 @@ use std::io::{self, Write};
 /// remote — a cell table plus placement records (Phase 7.3 SLICE B). 4: the
 /// cell table carries each shape chunk's look — its layers' coverage
 /// (SLICE C). 5: the manifest carries each cell's placement count and
-/// flattened subtree size (Phase 7.4: "edit this placement only").
-pub const PACK_VERSION: u32 = 5;
+/// flattened subtree size (Phase 7.4: "edit this placement only"). 6:
+/// records carry a kind column, rectangles stored as two corners (7.7).
+pub const PACK_VERSION: u32 = 6;
 
 /// At most this many layers describe a chunk's look (the densest ones).
 pub const LOOK_LAYERS: usize = 8;
@@ -62,7 +65,7 @@ pub fn chunk_look(store: &crate::store::ShapeStore, chunk: &crate::chunk::Chunk)
     let bbox_area = (w * h).max(1.0);
     let mut area: Vec<(crate::types::Layer, f64)> = Vec::new();
     for i in chunk.start as usize..chunk.end as usize {
-        let a = crate::boolean::signed_area2(store.points(i)).unsigned_abs() as f64 / 2.0;
+        let a = crate::boolean::signed_area2(&store.points(i)).unsigned_abs() as f64 / 2.0;
         let l = store.layer(i);
         match area.iter_mut().find(|(k, _)| *k == l) {
             Some((_, v)) => *v += a,
@@ -148,12 +151,14 @@ pub fn write_geometry(db: &CellDb, out: &mut impl Write) -> io::Result<Vec<u64>>
     let mut rec: Vec<u8> = Vec::new();
     for cell in &db.cells {
         for ch in &cell.chunks {
-            let (coords, starts, layers) = cell.shapes.chunk_columns(ch.start, ch.end);
+            let (coords, starts, layers, kinds) = cell.shapes.chunk_columns(ch.start, ch.end);
             rec.clear();
             rec.extend_from_slice(&(layers.len() as u32).to_le_bytes());
             rec.extend_from_slice(&(coords.len() as u32).to_le_bytes());
             rec.extend_from_slice(cast_slice(&starts));
             rec.extend_from_slice(cast_slice(layers));
+            rec.extend_from_slice(kinds);
+            rec.resize(rec.len().next_multiple_of(4), 0);
             rec.extend_from_slice(cast_slice(coords));
             out.write_all(&rec)?;
             pos += rec.len() as u64;
@@ -180,8 +185,11 @@ pub fn parse_index(bytes: &[u8]) -> Result<Vec<u64>> {
     Ok(offsets)
 }
 
-/// One chunk record's columns: `(coords, starts, packed layers)`.
-pub fn decode_record(rec: &[u8]) -> Result<(Vec<i32>, Vec<u32>, Vec<u32>)> {
+/// A chunk record's columns: `(coords, starts, packed layers, kinds)`.
+pub type RecordColumns = (Vec<i32>, Vec<u32>, Vec<u32>, Vec<u8>);
+
+/// One chunk record's columns.
+pub fn decode_record(rec: &[u8]) -> Result<RecordColumns> {
     let word = |i: usize| -> Result<u32> {
         match rec.get(i * 4..i * 4 + 4) {
             Some(b) => Ok(u32::from_le_bytes(b.try_into().unwrap())),
@@ -190,26 +198,43 @@ pub fn decode_record(rec: &[u8]) -> Result<(Vec<i32>, Vec<u32>, Vec<u32>)> {
     };
     let n = word(0)? as usize;
     let nc = word(1)? as usize;
-    let words = 2 + (n + 1) + n + nc;
+    // Words before the kinds; the kinds take n bytes, padded to whole words.
+    let head = 2 + (n + 1) + n;
+    let kind_words = n.div_ceil(4);
+    let words = head + kind_words + nc;
     if rec.len() != words * 4 {
         bail!("pack record: {} bytes, header says {}", rec.len(), words * 4);
     }
     let starts: Vec<u32> = (0..=n).map(|i| word(2 + i)).collect::<Result<_>>()?;
     let layers: Vec<u32> = (0..n).map(|i| word(3 + n + i)).collect::<Result<_>>()?;
-    let coords: Vec<i32> = (0..nc).map(|i| word(3 + 2 * n + i).map(|w| w as i32)).collect::<Result<_>>()?;
+    let kinds = rec[head * 4..head * 4 + n].to_vec();
+    let at = head + kind_words;
+    let coords: Vec<i32> = (0..nc).map(|i| word(at + i).map(|w| w as i32)).collect::<Result<_>>()?;
     if starts.last().copied().unwrap_or(0) as usize * 2 != nc {
         bail!("pack record: starts end at {} points, coords hold {}", starts.last().unwrap_or(&0), nc / 2);
     }
-    Ok((coords, starts, layers))
+    // A rectangle is exactly two stored points; a ring at least one.
+    for i in 0..n {
+        let len = starts[i + 1].checked_sub(starts[i]);
+        let ok = match kinds[i] {
+            crate::store::KIND_RING => len.is_some(),
+            1..=16 => len == Some(2),
+            _ => false,
+        };
+        if !ok {
+            bail!("pack record: shape {i} has kind {} and {:?} points", kinds[i], len);
+        }
+    }
+    Ok((coords, starts, layers, kinds))
 }
 
 /// One chunk record as a shape store of its own (its shape `j` is the
 /// chunk's shape `start + j`): what a streamed client keeps in memory to
 /// pick and edit (Phase 7.4).
 pub fn decode_store(rec: &[u8]) -> Result<crate::store::ShapeStore> {
-    let (coords, starts, layers) = decode_record(rec)?;
+    let (coords, starts, layers, kinds) = decode_record(rec)?;
     let layers = bytemuck::cast_slice::<u32, crate::types::Layer>(&layers).to_vec();
-    Ok(crate::store::ShapeStore::from_columns(coords, starts, layers))
+    Ok(crate::store::ShapeStore::from_columns(coords, starts, layers, kinds))
 }
 
 #[cfg(test)]
@@ -229,11 +254,15 @@ mod tests {
             for (i, ch) in cell.chunks.iter().enumerate() {
                 let k = (base[c] + i as u32) as usize;
                 let rec = &geometry[offsets[k] as usize..offsets[k + 1] as usize];
-                let (coords, starts, layers) = decode_record(rec).unwrap();
-                let (c0, s0, l0) = cell.shapes.chunk_columns(ch.start, ch.end);
-                assert_eq!((coords.as_slice(), &starts, layers.as_slice()), (c0, &s0, l0), "{label}: cell {c} chunk {i}");
+                let (coords, starts, layers, kinds) = decode_record(rec).unwrap();
+                let (c0, s0, l0, k0) = cell.shapes.chunk_columns(ch.start, ch.end);
+                assert_eq!(
+                    (coords.as_slice(), &starts, layers.as_slice(), kinds.as_slice()),
+                    (c0, &s0, l0, k0),
+                    "{label}: cell {c} chunk {i}"
+                );
                 // …so it tessellates exactly like the local chunk.
-                let streamed = crate::tessellate_columns(&coords, &starts, &layers);
+                let streamed = crate::tessellate_columns(&coords, &starts, &layers, &kinds);
                 let local = crate::tessellate_chunk(&cell.shapes, ch);
                 assert_eq!(streamed.len(), local.len(), "{label}: cell {c} chunk {i} meshes");
                 for (a, b) in streamed.iter().zip(&local) {

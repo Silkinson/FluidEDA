@@ -64,9 +64,9 @@ async fn a_stored_design_becomes_a_streamable_pack() {
             let range = format!("bytes={}-{}", offsets[k], offsets[k + 1] - 1);
             let (s, rec) = get(&hub, &format!("/blobs/{}", m.geometry.hash), Some(&range)).await;
             assert_eq!(s, StatusCode::PARTIAL_CONTENT);
-            let (coords, starts, layers) = fluideda_core::pack::decode_record(&rec).unwrap();
-            let (c0, s0, l0) = cell.shapes.chunk_columns(ch.start, ch.end);
-            assert_eq!((coords.as_slice(), &starts, layers.as_slice()), (c0, &s0, l0));
+            let (coords, starts, layers, kinds) = fluideda_core::pack::decode_record(&rec).unwrap();
+            let (c0, s0, l0, k0) = cell.shapes.chunk_columns(ch.start, ch.end);
+            assert_eq!((coords.as_slice(), &starts, layers.as_slice(), kinds.as_slice()), (c0, &s0, l0, k0));
         }
     }
 

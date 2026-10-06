@@ -78,7 +78,7 @@ fn main() {
     // One edit's incremental cost: re-check the tiles near shape 0.
     let pts = cell.shapes.points(0);
     let mut b = fluideda_core::Bbox::empty();
-    for p in pts {
+    for p in pts.iter() {
         b.expand(*p);
     }
     let dirty = grid.tiles_near(&b);
@@ -174,7 +174,7 @@ fn covered_by_child(db: &CellDb, cell: CellId, v: &Violation) -> bool {
                 let p = Point::new(lx.round() as i32, ly.round() as i32);
                 let child = db.cell(inst.child);
                 if (0..child.shapes.len())
-                    .any(|i| child.shapes.layer(i) == v.layer && point_in_polygon(child.shapes.points(i), p))
+                    .any(|i| child.shapes.layer(i) == v.layer && point_in_polygon(&child.shapes.points(i), p))
                 {
                     return true;
                 }

@@ -413,6 +413,10 @@ fn run_worker(
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
 
+    // `?norects`: keep every shape a ring (Phase 7.7 — the memory A/B knob).
+    if query_flag("norects") {
+        let _ = js_sys::Reflect::set(&payload, &"norects".into(), &JsValue::TRUE);
+    }
     // `?nohash`: skip the design digest (Phase 6 — the load-time A/B knob).
     if query_flag("nohash") {
         let _ = js_sys::Reflect::set(&payload, &"nohash".into(), &JsValue::TRUE);
@@ -453,6 +457,7 @@ fn run_worker(
             coords: js_sys::Int32Array::new(&get_val(&data, "coords")),
             starts: js_sys::Uint32Array::new(&get_val(&data, "starts")),
             layers: js_sys::ArrayBuffer::from(get_val(&data, "layers")),
+            kinds: js_sys::Uint8Array::new(&get_val(&data, "kinds")),
         };
         let msg = crate::design::WorkerMsg {
             name: name_for_msg.clone(),
@@ -503,6 +508,8 @@ struct JsColumns {
     starts: js_sys::Uint32Array,
     /// Packed layers (u32 each = the `Layer` byte layout); read as u16 pairs.
     layers: js_sys::ArrayBuffer,
+    /// One shape kind per shape (Phase 7.7).
+    kinds: js_sys::Uint8Array,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -547,6 +554,10 @@ impl fluideda_core::ColumnSource for JsColumns {
             v.set_len(len);
         }
         Ok(v)
+    }
+    fn kinds(&mut self, off: usize, len: usize) -> anyhow::Result<Vec<u8>> {
+        let (a, b) = check_range(off, len, self.kinds.length(), "kinds")?;
+        Ok(self.kinds.subarray(a, b).to_vec())
     }
 }
 
@@ -675,11 +686,13 @@ impl TessWorker {
     /// Dispatch a chunk-tessellation job. The three columns are copied once into
     /// JS buffers and **transferred** (moved) to the worker; `cell`/`chunk`/`gen`
     /// ride along so the reply can be keyed and staleness-checked.
-    pub fn post(&self, cell: usize, chunk: u32, gen: u32, coords: &[i32], starts: &[u32], layers: &[u32]) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn post(&self, cell: usize, chunk: u32, gen: u32, coords: &[i32], starts: &[u32], layers: &[u32], kinds: &[u8]) {
         use wasm_bindgen::JsValue;
         let carr = js_sys::Int32Array::from(coords);
         let sarr = js_sys::Uint32Array::from(starts);
         let larr = js_sys::Uint32Array::from(layers);
+        let karr = js_sys::Uint8Array::from(kinds);
         let payload = js_sys::Object::new();
         let set = |k: &str, v: &JsValue| {
             let _ = js_sys::Reflect::set(&payload, &k.into(), v);
@@ -691,7 +704,8 @@ impl TessWorker {
         set("coords", &carr.buffer());
         set("starts", &sarr.buffer());
         set("layers", &larr.buffer());
-        let transfer = js_sys::Array::of3(&carr.buffer(), &sarr.buffer(), &larr.buffer());
+        set("kinds", &karr.buffer());
+        let transfer = js_sys::Array::of4(&carr.buffer(), &sarr.buffer(), &larr.buffer(), &karr.buffer());
         if let Err(e) = self.worker.post_message_with_transfer(&payload, &transfer) {
             log::error!("tess post failed: {e:?}");
         }
@@ -783,7 +797,8 @@ impl TessWorker {
     pub fn new(_slot: TessSlot) -> Result<Self, String> {
         Err("tessellation worker is web-only".into())
     }
-    pub fn post(&self, _cell: usize, _chunk: u32, _gen: u32, _coords: &[i32], _starts: &[u32], _layers: &[u32]) {}
+    #[allow(clippy::too_many_arguments)]
+    pub fn post(&self, _cell: usize, _chunk: u32, _gen: u32, _coords: &[i32], _starts: &[u32], _layers: &[u32], _kinds: &[u8]) {}
     pub fn post_fetch(&self, _cell: usize, _chunk: u32, _gen: u32, _url: &str, _start: u64, _end: u64) {}
 }
 

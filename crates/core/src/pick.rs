@@ -79,11 +79,11 @@ fn pick_in_cell_except(
             }
             let pts = store.points((i - base) as usize);
             // Cheap per-shape bbox reject before the full point-in-polygon test.
-            if !shape_bbox_contains(pts, p) {
+            if !shape_bbox_contains(&pts, p) {
                 continue;
             }
-            if point_in_polygon(pts, p) {
-                let area = bbox_area(pts);
+            if point_in_polygon(&pts, p) {
+                let area = bbox_area(&pts);
                 if best.map_or(true, |(_, a)| area < a) {
                     best = Some((i, area));
                 }
@@ -126,7 +126,7 @@ fn walk_pick(
     if let Some(idx) = pick_in_cell(cell, local) {
         // Compare hits by WORLD area so a small leaf feature beats the big cell
         // it sits inside, regardless of each cell's local scale.
-        let area = bbox_area(cell.shape_points(idx as usize).unwrap_or(&[])) as f64 * world_tf.det().abs();
+        let area = cell.shape_points(idx as usize).map_or(0, |pts| bbox_area(&pts)) as f64 * world_tf.det().abs();
         if best.as_ref().map_or(true, |&(_, a)| area < a) {
             *best = Some((PickHit { id: (id, idx), world_tf }, area));
         }
@@ -258,7 +258,8 @@ fn walk_composite(
         }
     };
     if let Some(idx) = pick_in_cell_except(cell, id, local, overlay.suppressed_in(id), needs) {
-        offer(PickTarget::Base((id, idx)), cell.shape_points(idx as usize).unwrap_or(&[]), false);
+        let pts = cell.shape_points(idx as usize);
+        offer(PickTarget::Base((id, idx)), pts.as_deref().unwrap_or(&[]), false);
     }
     if overlay.edits_cell(id) {
         for (&(c, i), s) in &overlay.edited {
@@ -467,7 +468,7 @@ mod tests {
         // Move it +50 000 nm in x (LEAF-local): hit at its new place, not the old.
         let mut mv = EditOverlay::new();
         let c = db.cell(leaf);
-        mv.move_shape(base, crate::edit::translate(c.shapes.layer(base.1 as usize), c.shapes.points(base.1 as usize), 50_000, 0));
+        mv.move_shape(base, crate::edit::translate(c.shapes.layer(base.1 as usize), &c.shapes.points(base.1 as usize), 50_000, 0));
         let moved_at = Point::new(at.x + 50_000, at.y);
         let h = pick_composite(&db, &mv, moved_at).expect("hit the moved copy");
         assert_eq!(h.target, PickTarget::Base(base));

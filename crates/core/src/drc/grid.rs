@@ -304,7 +304,7 @@ impl DrcGridBuilder {
                 continue;
             }
             let mut b = Bbox::empty();
-            for p in pts {
+            for p in pts.iter() {
                 b.expand(*p);
             }
             let (x0, x1) = self.grid.span(b.min.x as i64 - r, b.max.x as i64 + r, ox);

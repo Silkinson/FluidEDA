@@ -199,7 +199,7 @@ mod oracle {
             assert_eq!(cs.shapes.len(), co.shapes.len(), "{label}: cell '{}' shape count", cs.name);
             for i in 0..cs.shapes.len() {
                 assert_eq!(cs.shapes.layer(i), co.shapes.layer(i), "{label}: '{}' shape {i} layer", cs.name);
-                assert_eq!(cs.shapes.points(i), co.shapes.points(i), "{label}: '{}' shape {i} points", cs.name);
+                assert_eq!(&*cs.shapes.points(i), &*co.shapes.points(i), "{label}: '{}' shape {i} points", cs.name);
             }
             assert_eq!(cs.instances.len(), co.instances.len(), "{label}: cell '{}' instance count", cs.name);
             for (j, (a, b)) in cs.instances.iter().zip(&co.instances).enumerate() {

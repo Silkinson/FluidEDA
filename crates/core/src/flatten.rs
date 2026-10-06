@@ -210,7 +210,7 @@ fn collect(
                 continue;
             }
             let j = (i - base) as usize;
-            push(out, Shape { layer: store.layer(j), points: map(store.points(j)) })?;
+            push(out, Shape { layer: store.layer(j), points: map(&store.points(j)) })?;
         }
     }
     for s in overlay.live_shapes_in(id) {

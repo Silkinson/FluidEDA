@@ -37,11 +37,14 @@ self.onmessage = async (e) => {
         : Promise.resolve(msg.bytes);
     const [buf] = await Promise.all([body, ready]);
     const bytes = new Uint8Array(buf);
+    // Phase 7.7: `?norects` keeps every shape a ring (the same-build A/B).
+    wasm_bindgen.set_compact_rects(!msg.norects);
     const result = wasm_bindgen.parse(bytes); // the heavy work, off the main thread
 
     const coords = result.coords;
     const starts = result.starts;
     const layers = result.layers;
+    const kinds = result.kinds;
     const meta = result.meta;
     const layer_set = result.layer_set;
     const world_bbox = result.world_bbox; // Float64Array [minx,miny,maxx,maxy]
@@ -53,6 +56,7 @@ self.onmessage = async (e) => {
         coords: coords.buffer,
         starts: starts.buffer,
         layers: layers.buffer,
+        kinds: kinds.buffer,
         meta: meta.buffer,
         layer_set: layer_set.buffer,
         world_bbox: [world_bbox[0], world_bbox[1], world_bbox[2], world_bbox[3]],
@@ -63,7 +67,7 @@ self.onmessage = async (e) => {
         worker_heap_bytes: result.worker_heap_bytes,
         parse_ms: result.parse_ms,
       },
-      [coords.buffer, starts.buffer, layers.buffer, meta.buffer, layer_set.buffer]
+      [coords.buffer, starts.buffer, layers.buffer, kinds.buffer, meta.buffer, layer_set.buffer]
     );
     result.free();
 

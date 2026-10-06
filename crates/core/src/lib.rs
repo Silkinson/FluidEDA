@@ -63,7 +63,7 @@ pub use pick::{
 pub use serialize::{
     deserialize, deserialize_from, serialize, skeleton_meta, ColumnSource, DbColumns, ProgressiveLoad, SkeletonParse,
 };
-pub use store::ShapeStore;
+pub use store::{set_compact_rects, Ring, ShapeStore};
 
 /// Version of the rule that numbers each cell's shapes and placements (the
 /// index in a [`BaseShapeId`] or a [`PlacementKey`]). Collaborative edits are

@@ -80,6 +80,15 @@ front, then 7.4, edit streamed designs. **Both are done.**
   44% → 5% (streamed caravel). In-core caravel: 30 → 3.8 frames/s, 100% →
   17%. Panning frame rates, load times and peer-edit latency (19 → 20 ms)
   are unchanged. `?continuous` restores the old behaviour.
+* **7.7 — compact rectangles.** 99.8% of caravel's polygons are rectangles.
+  They are now stored as two corners plus a kind byte that re-expands to the
+  exact original ring, so exports are byte-identical. Results:
+  - Shape memory 209 → 104 MB.
+  - Tessellation 35× faster (3,051 → 88 ms for every chunk; rectangles skip
+    lyon).
+  - In-core caravel: parse worker 1,080 → 597 MB, all geometry in 2.38 →
+    1.79 s.
+  - Pack geometry (v6) 189 → 99 MB, so streamed picks fetch half as much.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).

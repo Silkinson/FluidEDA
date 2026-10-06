@@ -8,7 +8,7 @@
 // (the main thread respawns it on a new load / chunk re-partition).
 //
 // Protocol — one message per chunk:
-//   in : { type:'tess', cell, chunk, gen, coords, starts, layers }   (buffers transferred in)
+//   in : { type:'tess', cell, chunk, gen, coords, starts, layers, kinds }   (buffers transferred in)
 //   out: { type:'tess_done', cell, chunk, gen, mesh_layers, vert_counts,
 //          index_counts, verts, indices }                            (buffers transferred back)
 // `cell`/`chunk`/`gen` are echoed so the main thread can key the reply and drop
@@ -20,7 +20,9 @@
 //   in : { type:'tess_fetch', cell, chunk, gen, url, start, end }
 //   out: tess_done (as above) + fetch_bytes, fetch_ms
 // Record layout (crates/core/src/pack.rs), little-endian, 4-byte aligned:
-//   [n u32][nc u32][starts (n+1) u32][layers n u32][coords nc i32]
+//   [n u32][nc u32][starts (n+1) u32][layers n u32][kinds n u8, padded to 4]
+//   [coords nc i32] — `kinds` (Phase 7.7): a rectangle is stored as its two
+//   corners.
 
 importScripts('worker.js');
 
@@ -31,13 +33,16 @@ const ready = wasm_bindgen('worker_bg.wasm');
 function recordColumns(buf) {
   const head = new Uint32Array(buf, 0, 2);
   const n = head[0], nc = head[1];
-  if (buf.byteLength !== 4 * (2 + (n + 1) + n + nc)) {
-    throw new Error(`chunk record: ${buf.byteLength} bytes, header says ${4 * (3 + 2 * n + nc)}`);
+  const kindsAt = 4 * (3 + 2 * n);
+  const coordsAt = kindsAt + 4 * Math.ceil(n / 4);
+  if (buf.byteLength !== coordsAt + 4 * nc) {
+    throw new Error(`chunk record: ${buf.byteLength} bytes, header says ${coordsAt + 4 * nc}`);
   }
   return {
     starts: new Uint32Array(buf, 8, n + 1),
     layers: new Uint32Array(buf, 8 + 4 * (n + 1), n),
-    coords: new Int32Array(buf, 8 + 4 * (2 * n + 1), nc),
+    kinds: new Uint8Array(buf, kindsAt, n),
+    coords: new Int32Array(buf, coordsAt, nc),
   };
 }
 
@@ -64,18 +69,19 @@ self.onmessage = async (e) => {
   const msg = e.data || {};
   if (msg.type !== 'tess' && msg.type !== 'tess_fetch') return;
   try {
-    let coords, starts, layers, fetched = null;
+    let coords, starts, layers, kinds, fetched = null;
     if (msg.type === 'tess_fetch') {
       fetched = await fetchRecord(msg);
-      ({ coords, starts, layers } = recordColumns(fetched.buf));
+      ({ coords, starts, layers, kinds } = recordColumns(fetched.buf));
     } else {
       // coords/starts/layers are transferred ArrayBuffers (moved from main).
       coords = new Int32Array(msg.coords);
       starts = new Uint32Array(msg.starts);
       layers = new Uint32Array(msg.layers);
+      kinds = new Uint8Array(msg.kinds);
     }
     await ready;
-    const r = wasm_bindgen.tessellate(coords, starts, layers); // the heavy work, off-main
+    const r = wasm_bindgen.tessellate(coords, starts, layers, kinds); // the heavy work, off-main
 
     const mesh_layers = r.mesh_layers;
     const vert_counts = r.vert_counts;

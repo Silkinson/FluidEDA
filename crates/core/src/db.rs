@@ -173,7 +173,7 @@ impl Cell {
     }
 
     /// Shape `i`'s ring, if it is in memory (always, in-core).
-    pub fn shape_points(&self, i: usize) -> Option<&[Point]> {
+    pub fn shape_points(&self, i: usize) -> Option<crate::store::Ring<'_>> {
         match &self.remote_shapes {
             None => (i < self.shapes.len()).then(|| self.shapes.points(i)),
             Some(_) => {

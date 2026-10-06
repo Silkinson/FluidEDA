@@ -249,7 +249,7 @@ impl Session {
             match (kind, base) {
                 (EditKind::Delete, _) => o.delete(id),
                 (EditKind::Move { dx, dy }, Some((layer, pts))) => {
-                    o.move_shape(id, fluideda_core::edit::translate(layer, pts, dx, dy));
+                    o.move_shape(id, fluideda_core::edit::translate(layer, &pts, dx, dy));
                 }
                 // A vertex edit ships the full ring (SLICE 2 amendment); the
                 // layer comes from the receiver's own base — it never changes.

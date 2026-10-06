@@ -83,7 +83,7 @@ pub fn write_gds(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
             if overlay.deleted.contains(&(id, i as u32)) {
                 continue;
             }
-            w.boundary(cell.shapes.layer(i), cell.shapes.points(i));
+            w.boundary(cell.shapes.layer(i), &cell.shapes.points(i));
         }
         // A move tombstones the base and records the moved copy; added shapes
         // follow. In a fixed order: the same edits write the same file.
@@ -495,7 +495,7 @@ mod tests {
             let mut o = EditOverlay::new();
             for &(i, d) in order {
                 let c = db.cell(top);
-                o.move_shape((top, i), crate::edit::translate(c.shapes.layer(i as usize), c.shapes.points(i as usize), d, -d));
+                o.move_shape((top, i), crate::edit::translate(c.shapes.layer(i as usize), &c.shapes.points(i as usize), d, -d));
             }
             o
         };

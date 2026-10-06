@@ -314,6 +314,9 @@ impl ColumnSource for NoColumns {
     fn layers(&mut self, _: usize, _: usize) -> anyhow::Result<Vec<Layer>> {
         anyhow::bail!("columns already taken")
     }
+    fn kinds(&mut self, _: usize, _: usize) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("columns already taken")
+    }
 }
 
 /// Parse only. Tessellation is now **lazy** (Phase 2a STEP 3): the app

@@ -18,3 +18,5 @@ miniz_oxide.workspace = true
 
 [dev-dependencies]
 libc = "0.2"
+# rect_bench (Phase 7.7): export digests.
+sha2 = "0.10"

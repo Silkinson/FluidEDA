@@ -219,8 +219,8 @@ pub fn gather_tile(
         let layer = cell.shapes.layer(i as usize);
         let Some(win) = window(layer) else { continue };
         let pts = cell.shapes.points(i as usize);
-        if intersects(&ring_bbox(pts), &win) {
-            input.push(layer, pts);
+        if intersects(&ring_bbox(&pts), &win) {
+            input.push(layer, &pts);
         }
     }
     for s in overlay.live_shapes_in(cell_id) {

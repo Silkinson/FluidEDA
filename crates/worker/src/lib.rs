@@ -27,6 +27,7 @@ mod wasm {
         coords: Int32Array,
         starts: Uint32Array,
         layers: Uint32Array,
+        kinds: Uint8Array,
         meta: Uint8Array,
         worker_heap_bytes: f64,
         parse_ms: f64,
@@ -54,6 +55,11 @@ mod wasm {
         #[wasm_bindgen(getter)]
         pub fn layers(&self) -> Uint32Array {
             self.layers.clone()
+        }
+        /// One shape kind per shape (Phase 7.7: rectangles stored compactly).
+        #[wasm_bindgen(getter)]
+        pub fn kinds(&self) -> Uint8Array {
+            self.kinds.clone()
         }
         #[wasm_bindgen(getter)]
         pub fn meta(&self) -> Uint8Array {
@@ -92,6 +98,13 @@ mod wasm {
         }
     }
 
+    /// Store rectangles compactly from now on (Phase 7.7; off = `?norects`,
+    /// the same-build A/B).
+    #[wasm_bindgen]
+    pub fn set_compact_rects(on: bool) {
+        fluideda_core::set_compact_rects(on);
+    }
+
     /// Parse GDS bytes into a serialized `CellDb`. Runs entirely in the worker.
     #[wasm_bindgen]
     pub fn parse(bytes: Vec<u8>) -> Result<ParseResult, JsValue> {
@@ -128,12 +141,14 @@ mod wasm {
         let coords = Int32Array::from(&cols.coords[..]);
         let starts = Uint32Array::from(&cols.starts[..]);
         let layers = Uint32Array::from(&cols.layers[..]);
+        let kinds = Uint8Array::from(&cols.kinds[..]);
         let meta = Uint8Array::from(&cols.meta[..]);
 
         Ok(ParseResult {
             coords,
             starts,
             layers,
+            kinds,
             meta,
             worker_heap_bytes,
             parse_ms,
@@ -189,10 +204,10 @@ mod wasm {
     /// here, off the main thread; `crate::tessellate_columns` guarantees the
     /// output is identical to the main thread's inline `tessellate_chunk`.
     #[wasm_bindgen]
-    pub fn tessellate(coords: Vec<i32>, starts: Vec<u32>, layers: Vec<u32>) -> TessResult {
+    pub fn tessellate(coords: Vec<i32>, starts: Vec<u32>, layers: Vec<u32>, kinds: Vec<u8>) -> TessResult {
         console_error_panic_hook::set_once();
 
-        let meshes = fluideda_core::tessellate_columns(&coords, &starts, &layers);
+        let meshes = fluideda_core::tessellate_columns(&coords, &starts, &layers, &kinds);
 
         let mut mesh_layers = Vec::with_capacity(meshes.len());
         let mut vert_counts = Vec::with_capacity(meshes.len());

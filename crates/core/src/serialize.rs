@@ -41,8 +41,9 @@ const MAGIC: u32 = u32::from_le_bytes(*b"FEDB");
 /// 3: a cell's instances are inline, or *remote* — only counted here, and
 /// fetched by placement chunk (a streamed design, Phase 7.3 SLICE B).
 /// 4: each cell's shape chunks' looks — layer coverage — when computed
-/// (SLICE C).
-const VERSION: u32 = 4;
+/// (SLICE C). 5: a fourth column, one kind byte per shape — rectangles are
+/// stored as two corners (Phase 7.7).
+const VERSION: u32 = 5;
 
 /// A serialized `CellDb`: three Pod columns (transferred as typed arrays) plus a
 /// metadata blob. Field order mirrors what the worker hands to `postMessage`.
@@ -50,6 +51,8 @@ pub struct DbColumns {
     pub coords: Vec<i32>,
     pub starts: Vec<u32>,
     pub layers: Vec<u32>,
+    /// One shape kind per shape (Phase 7.7: rectangles are stored compactly).
+    pub kinds: Vec<u8>,
     pub meta: Vec<u8>,
 }
 
@@ -65,17 +68,19 @@ pub fn serialize(db: &CellDb) -> DbColumns {
     let mut coords = Vec::new();
     let mut starts = Vec::new();
     let mut layers = Vec::new();
+    let mut kinds = Vec::new();
     let meta = write_meta(
         db,
         |cell| {
-            let (c, s, l) = cell.shapes.columns();
+            let (c, s, l, k) = cell.shapes.columns();
             coords.extend_from_slice(c);
             starts.extend(s.iter().copied());
             layers.extend(l.iter().map(|&lay| pack_layer(lay)));
+            kinds.extend_from_slice(k);
         },
         |_| true,
     );
-    DbColumns { coords, starts, layers, meta }
+    DbColumns { coords, starts, layers, kinds, meta }
 }
 
 /// Just the metadata blob — the skeleton — without copying any geometry
@@ -168,7 +173,7 @@ fn write_meta(db: &CellDb, mut columns: impl FnMut(&Cell), inline: impl Fn(&Cell
     meta.u32(db.cells.len() as u32);
 
     for cell in &db.cells {
-        let (c, _, l) = cell.shapes.columns();
+        let (c, _, l, _) = cell.shapes.columns();
         // Per-cell column lengths — the splitter needs these on the way back.
         meta.u32(c.len() as u32); // coord count (= 2 * point count)
         meta.u32(l.len() as u32); // shape count (starts has this + 1)
@@ -232,6 +237,9 @@ pub trait ColumnSource {
     fn starts(&mut self, off: usize, len: usize) -> Result<Vec<u32>>;
     /// `len` packed layers starting at element `off` of the layer column.
     fn layers(&mut self, off: usize, len: usize) -> Result<Vec<Layer>>;
+    /// `len` shape kinds starting at element `off` of the kind column (which
+    /// runs parallel to the layer column — Phase 7.7).
+    fn kinds(&mut self, off: usize, len: usize) -> Result<Vec<u8>>;
 }
 
 /// The in-memory source: slices of already-copied `Vec` columns.
@@ -239,6 +247,7 @@ struct VecSource<'a> {
     coords: &'a [i32],
     starts: &'a [u32],
     layers: &'a [u32],
+    kinds: &'a [u8],
 }
 
 impl ColumnSource for VecSource<'_> {
@@ -255,6 +264,9 @@ impl ColumnSource for VecSource<'_> {
         // all our natives) this cast is a memcpy, not per-shape unpack calls.
         Ok(bytemuck::cast_slice::<u32, Layer>(take(self.layers, off, len)?).to_vec())
     }
+    fn kinds(&mut self, off: usize, len: usize) -> Result<Vec<u8>> {
+        Ok(take(self.kinds, off, len)?.to_vec())
+    }
 }
 
 fn take<T>(buf: &[T], off: usize, len: usize) -> Result<&[T]> {
@@ -267,8 +279,8 @@ fn take<T>(buf: &[T], off: usize, len: usize) -> Result<&[T]> {
 /// Rebuild a `CellDb` from the worker's transferred columns. Does no geometry
 /// work — the columns and chunk tables are already final.
 pub fn deserialize(cols: DbColumns) -> Result<CellDb> {
-    let DbColumns { coords, starts, layers, meta } = cols;
-    deserialize_from(meta, &mut VecSource { coords: &coords, starts: &starts, layers: &layers })
+    let DbColumns { coords, starts, layers, kinds, meta } = cols;
+    deserialize_from(meta, &mut VecSource { coords: &coords, starts: &starts, layers: &layers, kinds: &kinds })
 }
 
 /// Rebuild a `CellDb` in one go from its metadata blob, pulling each cell's
@@ -464,7 +476,7 @@ impl ProgressiveLoad {
     }
 
     fn from_spans(spans: Vec<CellSpan>) -> ProgressiveLoad {
-        let total_bytes = spans.iter().map(|s| s.n_coords * 4 + s.n_shapes * 8).sum();
+        let total_bytes = spans.iter().map(|s| s.n_coords * 4 + s.n_shapes * 9).sum();
         let cell_count = spans.len();
         let mut loaded = vec![false; cell_count];
         let mut remaining = cell_count;
@@ -526,12 +538,13 @@ impl ProgressiveLoad {
             let p = self.partial.take().unwrap();
             let s = src.starts(sp.start_off, sp.n_shapes + 1)?;
             let l = src.layers(sp.layer_off, sp.n_shapes)?;
-            budget = budget.saturating_sub(sp.n_shapes * 8);
-            self.bytes_copied += sp.n_shapes * 8;
+            let k = src.kinds(sp.layer_off, sp.n_shapes)?;
+            budget = budget.saturating_sub(sp.n_shapes * 9);
+            self.bytes_copied += sp.n_shapes * 9;
             if s.last().copied().unwrap_or(0) as usize * 2 != p.coords.len() {
                 bail!("CellDb blob: cell starts/coords mismatch");
             }
-            out.push((p.cell, ShapeStore::from_columns(p.coords, s, l)));
+            out.push((p.cell, ShapeStore::from_columns(p.coords, s, l, k)));
             self.loaded[p.cell] = true;
             self.remaining -= 1;
             if budget == 0 && self.remaining > 0 {
@@ -660,7 +673,7 @@ mod tests {
     fn progressive_load_matches_one_shot() {
         let db = crate::gds::load_gds_db(FIXTURE).unwrap();
         let cols = serialize(&db);
-        let mut src = VecSource { coords: &cols.coords, starts: &cols.starts, layers: &cols.layers };
+        let mut src = VecSource { coords: &cols.coords, starts: &cols.starts, layers: &cols.layers, kinds: &cols.kinds };
         // Skeleton parsed in small budgeted steps, as the app drives it.
         let mut sp = SkeletonParse::new(cols.meta.clone()).unwrap();
         let mut sk_steps = 1;
@@ -676,13 +689,14 @@ mod tests {
             assert_eq!(a.instances.len(), b.instances.len(), "skeleton carries the hierarchy");
             assert!(a.shapes.is_empty(), "…but no geometry yet");
         }
-        // Load the LAST cell first (a priority request), in 64-byte steps.
+        // Load the LAST cell first (a priority request), in 16-byte steps
+        // (the fixture is all rectangles: 16 B each since Phase 7.7).
         let prio = [db.cells.len() - 1];
         let (mut steps, mut done) = (0, Vec::new());
-        while !load.step(&mut src, 64, &prio, &mut done).unwrap() {
+        while !load.step(&mut src, 16, &prio, &mut done).unwrap() {
             steps += 1;
         }
-        assert!(steps > 3, "a 64-byte budget must take several steps ({steps})");
+        assert!(steps > 3, "a 16-byte budget must take several steps ({steps})");
         assert_eq!(done.first().map(|d| d.0), Some(prio[0]), "priority cell finished first");
         for (c, store) in done {
             skel.cells[c].set_shapes(store);
@@ -709,7 +723,7 @@ mod tests {
             assert_eq!(a.shapes.len(), b.shapes.len(), "{label}: '{}' shape count", a.name);
             for i in 0..a.shapes.len() {
                 assert_eq!(a.shapes.layer(i), b.shapes.layer(i), "{label}: '{}' shape {i} layer", a.name);
-                assert_eq!(a.shapes.points(i), b.shapes.points(i), "{label}: '{}' shape {i} pts", a.name);
+                assert_eq!(&*a.shapes.points(i), &*b.shapes.points(i), "{label}: '{}' shape {i} pts", a.name);
             }
             assert_eq!(a.instances.len(), b.instances.len(), "{label}: '{}' inst count", a.name);
             for (j, (x, y)) in a.instances.iter().zip(&b.instances).enumerate() {

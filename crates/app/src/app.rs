@@ -596,6 +596,9 @@ pub struct FluidApp {
 
 impl FluidApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // `?norects` (Phase 7.7): every shape stays a ring — the same-build A/B
+        // for compact rectangles (the parse worker gets the flag too).
+        fluideda_core::set_compact_rects(!webio::query_flag("norects"));
         // Load the embedded default synchronously so there is always something.
         let design = design::load_design("hier.gds (embedded)", HIER_GDS)
             .expect("embedded hier.gds should parse");
@@ -1149,7 +1152,7 @@ impl FluidApp {
                 .is_some_and(|a| fluideda_core::point_in_polygon(&a.shape.points, p)),
             Selection::Base(id) => match self.overlay.edited.get(&id) {
                 Some(moved) => fluideda_core::point_in_polygon(&moved.points, p),
-                None => self.db.cell(id.0).shape_points(id.1 as usize).is_some_and(|pts| fluideda_core::point_in_polygon(pts, p)),
+                None => self.db.cell(id.0).shape_points(id.1 as usize).is_some_and(|pts| fluideda_core::point_in_polygon(&pts, p)),
             },
         }
     }
@@ -1323,7 +1326,8 @@ impl FluidApp {
     fn existing_delta(&self, id: BaseShapeId) -> (i32, i32) {
         match self.overlay.edited.get(&id) {
             Some(moved) => {
-                let base = self.db.cell(id.0).shape_points(id.1 as usize).unwrap_or(&[]);
+                let base = self.db.cell(id.0).shape_points(id.1 as usize);
+                let base = base.as_deref().unwrap_or(&[]);
                 match (base.first(), moved.points.first()) {
                     (Some(b), Some(m)) => (m.x - b.x, m.y - b.y),
                     _ => (0, 0),
@@ -1343,7 +1347,7 @@ impl FluidApp {
         let (Some(layer), Some(pts)) = (cell.shape_layer(id.1 as usize), cell.shape_points(id.1 as usize)) else {
             return; // a streamed chunk not in memory (it is fetched on selection)
         };
-        let moved = fluideda_core::edit::translate(layer, pts, dx, dy);
+        let moved = fluideda_core::edit::translate(layer, &pts, dx, dy);
         self.overlay.move_shape(id, moved);
         self.move_delta = (dx, dy);
         self.invalidate(id);
@@ -1959,8 +1963,8 @@ impl FluidApp {
                     }
                 }
                 if let Some(w) = &self.tess {
-                    let (coords, starts, layers) = cell.shapes.chunk_columns(chunk.start, chunk.end);
-                    w.post(d.cell, d.chunk, self.tess_gen, coords, &starts, layers);
+                    let (coords, starts, layers, kinds) = cell.shapes.chunk_columns(chunk.start, chunk.end);
+                    w.post(d.cell, d.chunk, self.tess_gen, coords, &starts, layers, kinds);
                     self.tess_pending.insert(key);
                     dispatched += 1;
                     continue;
@@ -2357,8 +2361,8 @@ impl FluidApp {
                 // is tessellated from that copy, not downloaded again.
                 match self.db.cells[d.cell].chunk_store(d.chunk as usize) {
                     Some((store, _)) => {
-                        let (coords, starts, layers) = store.chunk_columns(0, store.len() as u32);
-                        w.post(d.cell, d.chunk, self.tess_gen, coords, &starts, layers);
+                        let (coords, starts, layers, kinds) = store.chunk_columns(0, store.len() as u32);
+                        w.post(d.cell, d.chunk, self.tess_gen, coords, &starts, layers, kinds);
                     }
                     None => w.post_fetch(d.cell, d.chunk, self.tess_gen, &st.info.geometry_url, start, end),
                 }
@@ -3016,7 +3020,7 @@ fn edit_regions(
     let mut out = Vec::new();
     for &id in changed {
         // (A streamed chunk not in memory contributes only the copies.)
-        let mut b = ring_bbox(db.cell(id.0).shape_points(id.1 as usize).unwrap_or(&[]));
+        let mut b = ring_bbox(db.cell(id.0).shape_points(id.1 as usize).as_deref().unwrap_or(&[]));
         for s in [old.edited.get(&id), new.edited.get(&id)].into_iter().flatten() {
             let r = ring_bbox(&s.points);
             b.expand(r.min);
@@ -3486,7 +3490,7 @@ impl FluidApp {
                         tile_max_ms = tile_max_ms.max(tt.elapsed().as_secs_f64() * 1e3);
                     }
                     let cold_ms = t0.elapsed().as_secs_f64() * 1e3;
-                    let near = grid.tiles_near(&ring_bbox(cref.shapes.points(0)));
+                    let near = grid.tiles_near(&ring_bbox(&cref.shapes.points(0)));
                     let t1 = web_time::Instant::now();
                     for &t in &near {
                         let input = fluideda_core::gather_tile(cref, cell, &self.overlay, &grid, &rules, t);
@@ -4141,7 +4145,7 @@ impl FluidApp {
                 let pts: Vec<Point> = match sel {
                     Selection::Base((cell, idx)) => match self.overlay.edited.get(&(cell, idx)) {
                         Some(shape) => shape.points.clone(),
-                        None => self.db.cell(cell).shape_points(idx as usize).map(<[Point]>::to_vec).unwrap_or_default(),
+                        None => self.db.cell(cell).shape_points(idx as usize).map(|r| r.to_vec()).unwrap_or_default(),
                     },
                     Selection::Added(id) => self
                         .overlay

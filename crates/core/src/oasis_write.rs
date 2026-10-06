@@ -45,7 +45,7 @@ pub fn write_oasis(db: &CellDb, overlay: &EditOverlay) -> Vec<u8> {
         let mut modal: Option<Layer> = None;
         for i in 0..cell.shapes.len() {
             if !overlay.deleted.contains(&(id, i as u32)) {
-                shape(cell.shapes.layer(i), cell.shapes.points(i), &mut modal, &mut body);
+                shape(cell.shapes.layer(i), &cell.shapes.points(i), &mut modal, &mut body);
             }
         }
         for s in overlay.live_shapes_in(id) {
@@ -317,7 +317,7 @@ mod tests {
                 let mut polys: Vec<(Layer, Vec<(i32, i32)>)> = (0..c.shapes.len())
                     .map(|i| {
                         let mut r: Vec<(i32, i32)> =
-                            crate::boolean::open_ring(c.shapes.points(i)).iter().map(|p| (p.x, p.y)).collect();
+                            crate::boolean::open_ring(&c.shapes.points(i)).iter().map(|p| (p.x, p.y)).collect();
                         let k = (0..r.len()).min_by_key(|&k| r[k]).unwrap();
                         r.rotate_left(k);
                         (c.shapes.layer(i), r)
@@ -385,6 +385,6 @@ mod tests {
         let db = crate::oasis::load_oasis_db(&f).unwrap();
         let c = db.cell(db.id_of("T").unwrap());
         assert_eq!(c.shapes.layer(0), Layer::new(5, 6));
-        assert_eq!(crate::boolean::open_ring(c.shapes.points(0)), &tri[..3]);
+        assert_eq!(crate::boolean::open_ring(&c.shapes.points(0)), &tri[..3]);
     }
 }

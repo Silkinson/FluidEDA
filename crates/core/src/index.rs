@@ -33,7 +33,7 @@ impl ShapeIndex {
                     return None;
                 }
                 let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-                for p in pts {
+                for p in pts.iter() {
                     lo[0] = lo[0].min(p.x as f64);
                     lo[1] = lo[1].min(p.y as f64);
                     hi[0] = hi[0].max(p.x as f64);

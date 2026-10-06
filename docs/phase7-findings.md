@@ -5,7 +5,8 @@ hierarchy) to the front. **7.3 is done** in three slices: **A** placement
 chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
 proxies (pack v4). **7.4 is done** (edit streamed designs): **A** picking and editing, **B**
 rooms and "edit this placement only", **C** server-side export. The owner
-then asked to finish all of Phase 7: **7.1a** (idle repaint) is done.
+then asked to finish all of Phase 7: **7.1a** (idle repaint) and **7.7**
+(compact rectangles) are done.
 
 ## 7.3 SLICE A — placement chunks
 
@@ -430,3 +431,58 @@ passes in the default mode: the stream test, the streamed edit test, the sync
 test (in-core and STREAMED), and the persistence test. In the persistence
 test, a dropped peer reconnects on its own 490 ms after a server restart,
 driven by the heartbeat.
+
+## 7.7 — compact rectangles
+
+**Problem.** 99.8% of caravel's 3,925,012 polygons are axis-aligned
+rectangles, each stored as a closed 5-point ring: 40 B of coordinates plus
+8 B per shape. The shape stores were 209 MB of caravel in-core, the pack's
+geometry 189 MB, and every rectangle went through lyon's general polygon
+tessellator.
+
+**Design.**
+- A rectangle is stored as its two extreme corners (16 B) plus a kind byte.
+  The kind records how the file drew it: start corner, winding, and whether
+  the first point repeats (16 variants). `ShapeStore::points` returns a
+  `Ring` that derefs to exactly the original points. A ring that would not
+  re-expand bit for bit stays a ring, so exports, vertex numbering and picks
+  are unchanged.
+- The kind column travels with the others: in the worker-to-main transfer
+  (serialize v5), in pack records (v6: kinds after layers, padded to 4
+  bytes), and in the tessellation worker's columns.
+- Tessellation turns a rectangle into two triangles directly, without lyon.
+  It uses the same four corners, and whichever diagonal splits them, each
+  pixel inside is covered once. The 4 golden images and every pixel-identity
+  check are unchanged.
+- `?norects` keeps every shape a ring: the same-build A/B switch (the parse
+  worker gets it too).
+- The GPU side is unchanged: a rectangle is still 4 vertices and 6 indices
+  there. Drawing rectangles as instances would need storage buffers in the
+  vertex stage (WebGPU only); left for later.
+
+**Measured** (same build, rings → compact):
+
+| | rings | compact |
+|---|--:|--:|
+| caravel shape stores (native) | 209.4 MB | **104.1 MB** |
+| tessellating every chunk (native) | 3,051 ms | **88 ms** (same 7,895,663 triangles) |
+| parse (native) | 661 ms | 664 ms |
+| GDS export (native) | — | **byte-identical**; every ring identical |
+| parse worker peak (browser, in-core caravel) | 1,080 MB | **597 MB** |
+| all geometry in | 2,376 ms | **1,785 ms** |
+| first frame | 2,031 ms | **1,723 ms** |
+| main heap after load (high-water) | 361 MB | **305 MB** |
+| fit-view tessellation on the main thread | 131 ms | **14 ms** |
+| caravel pack geometry (v5 → v6) | 188.8 MB | **98.7 MB** (pack build 2.5 → 1.8 s) |
+| streamed: 128 picks fetch · heap after (vs 7.4) | 73.9 MB · 128 MB | **38.6 MB · 83 MB** |
+
+The browser rows are medians of 3 alternating runs (`rect_ab.mjs`, WebGPU);
+parse time in the browser was 1,160 vs 1,224 ms with overlapping runs. The
+native rows come from `rect_bench`. Correctness:
+- 107 core tests. New: every rectangle variant round-trips, and
+  near-rectangles stay rings.
+- 17 server tests, and the goldens unchanged.
+- `stream_test`: 0 px at 8 views.
+- `stream_edit_test`: 128/128 picks, edits, flatten, and the in-core save =
+  the server export.
+- `edit_sync_test`: 33 checks in-core and 34 streamed.

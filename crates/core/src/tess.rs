@@ -38,7 +38,29 @@ pub fn tessellate(layout: &FlatLayout) -> Vec<LayerMesh> {
 
 /// Tessellate a slice of polygons (the Phase 0 flat path).
 pub fn tessellate_shapes(polygons: &[Polygon]) -> Vec<LayerMesh> {
-    tessellate_iter(polygons.iter().map(|p| (p.layer, p.points.as_slice())))
+    tessellate_iter(polygons.iter().map(|p| (p.layer, Outline::Ring(p.points.as_slice()))))
+}
+
+/// What a shape gives the tessellator: a ring for lyon, or a stored
+/// rectangle's corners `[x0, y0, x1, y1]`, which become two triangles with no
+/// lyon work at all (Phase 7.7). The two triangles cover exactly the pixels
+/// lyon's would: the same four corners, and whichever diagonal splits them,
+/// each pixel inside is drawn once.
+#[derive(Clone, Copy)]
+enum Outline<'a> {
+    Ring(&'a [Point]),
+    Rect([i32; 4]),
+}
+
+/// Shape `i` of `store` as the tessellator takes it.
+fn outline(store: &ShapeStore, i: usize) -> Outline<'_> {
+    match store.rect(i) {
+        Some(r) => Outline::Rect(r),
+        None => match store.points(i) {
+            crate::store::Ring::Stored(s) => Outline::Ring(s),
+            crate::store::Ring::Rect(..) => unreachable!("rect() covers every rectangle"),
+        },
+    }
 }
 
 /// Tessellate one chunk of a cell definition — the Phase 2b unit of work.
@@ -48,9 +70,7 @@ pub fn tessellate_shapes(polygons: &[Polygon]) -> Vec<LayerMesh> {
 /// Because chunking reorders the store so a chunk is a contiguous range, this is
 /// a slice of the cell's shapes, not a gather.
 pub fn tessellate_chunk(store: &ShapeStore, chunk: &Chunk) -> Vec<LayerMesh> {
-    tessellate_iter(
-        (chunk.start as usize..chunk.end as usize).map(|i| (store.layer(i), store.points(i))),
-    )
+    tessellate_iter((chunk.start as usize..chunk.end as usize).map(|i| (store.layer(i), outline(store, i))))
 }
 
 /// Like [`tessellate_chunk`] but **skips** the shape indices in `suppressed`
@@ -66,7 +86,7 @@ pub fn tessellate_chunk_filtered(
     tessellate_iter(
         (chunk.start as usize..chunk.end as usize)
             .filter(|i| !suppressed.contains(&(*i as u32)))
-            .map(|i| (store.layer(i), store.points(i))),
+            .map(|i| (store.layer(i), outline(store, i))),
     )
 }
 
@@ -76,28 +96,45 @@ pub fn tessellate_chunk_filtered(
 /// `coords` is interleaved x,y nm; `starts` is 0-based per-shape point offsets
 /// (`len == n_shapes + 1`, `starts[0] == 0`); `layers` is one packed layer per
 /// shape (`layer | datatype << 16` — the little-endian byte layout of [`Layer`],
-/// see `crate::serialize`). Produces the exact same per-layer meshes
+/// see `crate::serialize`); `kinds` is the store's kind column (a rectangle's
+/// points are its two corners). Produces the exact same per-layer meshes
 /// [`tessellate_chunk`] would for those shapes, so the worker path and the inline
 /// path are byte-for-byte interchangeable. Pure geometry — core stays
 /// wgpu/network-free, so the worker links it directly.
-pub fn tessellate_columns(coords: &[i32], starts: &[u32], layers: &[u32]) -> Vec<LayerMesh> {
+pub fn tessellate_columns(coords: &[i32], starts: &[u32], layers: &[u32], kinds: &[u8]) -> Vec<LayerMesh> {
     // Two Pod casts, not per-shape unpacks: [i32;2] == Point, and a packed layer
     // u32 has Layer's exact LE bytes (see `serialize::pack_layer`).
     let pts: &[Point] = cast_slice(coords);
     let layers: &[Layer] = cast_slice(layers);
     tessellate_iter(layers.iter().enumerate().map(|(i, &layer)| {
         let (s, e) = (starts[i] as usize, starts[i + 1] as usize);
-        (layer, &pts[s..e])
+        let shape = match kinds[i] {
+            crate::store::KIND_RING => Outline::Ring(&pts[s..e]),
+            _ => Outline::Rect([pts[s].x, pts[s].y, pts[s + 1].x, pts[s + 1].y]),
+        };
+        (layer, shape)
     }))
 }
 
 /// One `LayerMesh` per distinct layer, sorted (= draw order).
-fn tessellate_iter<'a>(shapes: impl Iterator<Item = (Layer, &'a [Point])>) -> Vec<LayerMesh> {
+fn tessellate_iter<'a>(shapes: impl Iterator<Item = (Layer, Outline<'a>)>) -> Vec<LayerMesh> {
     let mut per_layer: BTreeMap<Layer, VertexBuffers<Vertex, u32>> = BTreeMap::new();
     let mut tess = FillTessellator::new();
     let opts = FillOptions::non_zero();
 
-    for (layer, points) in shapes {
+    for (layer, shape) in shapes {
+        let points = match shape {
+            Outline::Rect([x0, y0, x1, y1]) => {
+                let buffers = per_layer.entry(layer).or_default();
+                let base = buffers.vertices.len() as u32;
+                for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+                    buffers.vertices.push(Vertex { pos: [x as f32, y as f32] });
+                }
+                buffers.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                continue;
+            }
+            Outline::Ring(points) => points,
+        };
         if points.len() < 3 {
             continue;
         }
@@ -145,8 +182,8 @@ mod tests {
         let chunk = Chunk { start: 0, end: store.len() as u32, bbox: store.total_bbox() };
 
         let inline = tessellate_chunk(&store, &chunk);
-        let (coords, starts, layers) = store.chunk_columns(chunk.start, chunk.end);
-        let via_columns = tessellate_columns(coords, &starts, layers);
+        let (coords, starts, layers, kinds) = store.chunk_columns(chunk.start, chunk.end);
+        let via_columns = tessellate_columns(coords, &starts, layers, kinds);
 
         assert_eq!(inline.len(), via_columns.len(), "layer-mesh count");
         for (a, b) in inline.iter().zip(&via_columns) {
@@ -169,8 +206,8 @@ mod tests {
         // Shapes [2, 5) only.
         let chunk = Chunk { start: 2, end: 5, bbox: crate::types::Bbox::empty() };
         let inline = tessellate_chunk(&store, &chunk);
-        let (coords, starts, layers) = store.chunk_columns(2, 5);
-        let via_columns = tessellate_columns(coords, &starts, layers);
+        let (coords, starts, layers, kinds) = store.chunk_columns(2, 5);
+        let via_columns = tessellate_columns(coords, &starts, layers, kinds);
         assert_eq!(inline.len(), via_columns.len());
         for (a, b) in inline.iter().zip(&via_columns) {
             let (av, bv): (&[u8], &[u8]) = (cast_slice(&a.vertices), cast_slice(&b.vertices));
