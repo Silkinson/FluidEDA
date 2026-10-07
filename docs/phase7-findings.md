@@ -1022,3 +1022,135 @@ Answers trade bandwidth for a round trip.
   are unchanged. Its 1 MB-budget section now opens with `?wholepicks`, so
   picks still fill and evict that budget.
 - Suites: stream 11, streamed edit 11, sync 33, sync STREAMED 34; 3 server pack tests and the auth matrix.
+
+## 7.5 — in-context DRC
+
+**Problem.** DRC checked each cell on its own. On caravel's sky130 deck
+that gives 3,303 flags in 251 cells, almost all in the I/O pad cells. 697
+of them sit on a child cell's same-layer metal, so they are artifacts of
+checking a cell without its children; whether the rest were real was
+unknown. And a violation between two cells could not be seen at all.
+
+(Phase 5b counted 3,305 flags in 252 cells. Two li1 spacing flags in one
+cell went away in Phase 6, when the GDS readers began converting paths into
+outlines; the DRC code has not changed since Phase 5d, and Phase 7 matches
+Phase 6 rule for rule.)
+
+**Sizing first.** Before building the plan's machinery (interaction
+regions, context dedup by cell pair and transform), I measured the simple
+alternative: cut the world into tiles, gather each tile's complete geometry
+through the hierarchy, and check it exactly. On a 2% sample of caravel's
+tiles it cost about 40 s single-threaded; gathering is cheap and checking
+dominates. Spread over the cores, that fits the plan's 15 s target. So the
+in-context check is exact by construction: the same tile function as the
+intra-cell check, on everything that is really there. Context dedup survives
+as tiles with identical content checked once.
+
+**Design** (`crates/core/src/drc/world.rs`).
+- **Tiles.** 20 µm world tiles. Each gathers the geometry within rule reach
+  through the cull (placement chunks prune big placement lists, 7.3), each
+  cell's R-tree and the placement transforms.
+- **Edits.** Suppressed shapes are skipped. Live copies and drawn shapes
+  are placed once per check at every visible placement of their cell,
+  skipping hidden placements. (The overlay-aware cull could do this, but
+  would lose its placement-chunk shortcut whenever edits exist.) The
+  checked area grows by whatever edits reach past the design.
+- **Threads.** Tiles run on every core. `CellDb` is now `Sync`: the shape
+  index moved from `OnceCell` to `OnceLock`.
+- **Dedup and merge.** Tiles whose content is identical relative to the
+  tile are checked once (two 64-bit hashes of the content). Markers are
+  merged across tile edges.
+- **`review_flags`** places every intra-cell flag at every placement in the
+  world and sorts it against the in-context result: genuine (an in-context
+  violation of the same rule overlaps it) or context-only. It also counts
+  what only the in-context check finds.
+- **Server.** `POST /drc/<design>?deck=[&area=]` checks the design with the
+  edits of the document state in the body; `POST /rooms/<r>/drc` checks a
+  room's design with the room's edits. The parsed design stays cached
+  between checks; one check runs at a time. Links apply as for export:
+  viewers may check a room, and checking an arbitrary state needs an
+  editor's link.
+- **App.** "Check whole design in context (server)" in the DRC panel, for
+  in-core and streamed designs alike; the violations draw as orange
+  markers. After an edit, the app asks the server to re-check only the
+  view's tiles and replaces the markers there: the incremental path.
+
+**Measured** (caravel, sky130 deck, native, 10 cores):
+
+| | |
+|---|--:|
+| intra-cell: flags · cells · time | 3,303 · 251 · 4.4 s (1 thread) |
+| intra-cell flags placed in the world | 184,771 |
+| **in context: violations** | **0**: every intra-cell flag is context-only |
+| in context, whole chip | **8.4 s on 10 threads** (+0.7 s building cell indexes) |
+| tiles with geometry · content shared with a checked tile | 45,636 · 16% |
+| shapes gathered | 48.8 M |
+
+caravel is a taped-out chip, so a clean result is plausible, but the check
+had to be shown able to fail:
+- **Two injected violations** below the die (a 100 nm met1 sliver and a
+  100 nm met2 gap) are found exactly, and they are the only intra-cell
+  flags judged genuine.
+- **400 random rectangles** on li1, met1 and met2, inside the die among the
+  real geometry, give 155 violations in context (8.3 s). Of the new
+  intra-cell flags, 105 are genuine and 6 context-only (the rectangle
+  merges with metal inside a child cell). 42 violations exist only in
+  context: they involve geometry inside child cells, which intra-cell
+  checking cannot see.
+- **KLayout** checks the same design, written out as GDS with the
+  rectangles in it, with `scripts/oracle/sky130_deck.drc`: flat, with our
+  semantics (projection width, Euclidean space, shielded).
+  `scripts/oracle/compare_drc.py` matches markers per rule by overlap:
+
+  | rule | ours | KLayout | covered by the other side |
+  |---|--:|--:|---|
+  | li1 space | 21 | 34 | all, both ways |
+  | li1 width | 46 | 47 | all, both ways |
+  | met1 space | 11 | 11 | all, both ways |
+  | met1 width | 39 | 42 | all, both ways |
+  | met2 space | 10 | 11 | all, both ways |
+  | met2 width | 28 | 31 | all, both ways |
+
+  Every one of our markers overlaps a KLayout marker of the same rule, and
+  every KLayout marker overlaps one of ours. The counts differ because
+  KLayout reports each measured edge pair, where we report one box per
+  violating region. Our check of the written file gives exactly the 155
+  markers the check through the edit overlay gave. (KLayout's flat run
+  took 11.6 min on one core and 4.8 GB. It is the oracle here, not a
+  benchmark: its tiled and deep modes are faster.)
+- **From the app** (`scripts/drc_context_test.mjs`): in-core caravel is
+  clean in context (9.8 s on the server, including its parse). A 100 nm
+  met1 sliver drawn below the die makes the server re-check the view's
+  tiles (1 ms of server time), which hold exactly one violation; undo
+  re-checks and it is gone. Streamed caravel gets the same clean answer
+  (8.4 s, the parse cached; the page holds none of the geometry).
+
+**Acceptance.**
+- The context-only flags resolve to the genuine set, which is empty. ✓
+- KLayout agrees, and the count difference is explained. ✓
+- Whole-chip sweep under 15 s natively. ✓
+- An edit re-checks incrementally: the view's tiles, not the edit's own
+  reach, which is coarser than planned but still milliseconds. ✓
+
+**Tests.**
+- **Core:** on 12 random hierarchies, the in-context check equals a flat
+  check of the flattened design, single-threaded and on 4 threads. The
+  hierarchies have abutting, overlapping, rotated and mirrored placements,
+  arrays, and parent shapes over children; intra-cell checking disagrees
+  with the flat check on them, so they exercise context.
+- **Core, with edits:** deletes, moves, drawn shapes and a hidden array
+  element give the same result as the edited design flattened. The
+  overlay-aware cull places each live shape at each visible placement, as
+  this module does.
+- **Server:** the endpoint equals the check run in-process; an area
+  re-check returns what lies there; bad decks, areas and states are
+  refused; the auth matrix covers both routes.
+- **Browser:** the 4 checks above. Suites: stream 11, streamed edit 11,
+  sync 33, sync STREAMED 34. All 163 workspace tests pass.
+
+**Not done (scoped).** The plan put in-context checks in the browser's
+worker pool, for the visible window. They run on the server instead, for
+in-core and streamed designs alike: a whole chip in about 9 s, a view in
+milliseconds. The browser keeps its intra-cell worker-pool checks, which
+work offline. Moving world tiles into the worker pool is the remaining
+step.

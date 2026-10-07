@@ -19,6 +19,11 @@
 //!   edits of the document state in the body, written into the blob store
 //!   ([`export`], Phase 7.4); `POST /rooms/<name>/export?format=` does the
 //!   same with the room's design and state.
+//! * `POST /drc/<sha256>?deck=sky130|blanket[&area=x0,y0,x1,y1]` — the design
+//!   with the edits of the document state in the body checked **in context**
+//!   (Phase 7.5, [`drc`]): world tiles, the whole design or one area;
+//!   `POST /rooms/<name>/drc?deck=` does the same with the room's design and
+//!   state.
 //! * `POST /rooms/<name>/share?role=editor|viewer[&ttl=<s>]` — mint a link
 //!   token (owner); `POST /rooms/<name>/rotate` — revoke every link issued
 //!   so far (owner; answers with a fresh owner token).
@@ -38,6 +43,7 @@
 //!   hashes are only revealed through the endpoints above.
 
 pub mod auth;
+pub mod drc;
 pub mod export;
 pub mod packs;
 pub mod room;
@@ -86,6 +92,8 @@ pub fn app(hub: Arc<Hub>) -> Router {
         .route("/rooms/:room", get(room_info))
         .route("/rooms/:room/export", post(export_room))
         .route("/rooms/:room/share", post(share_room))
+        .route("/rooms/:room/drc", post(drc_room))
+        .route("/drc/:design", post(drc_design))
         .route("/rooms/:room/rotate", post(rotate_room))
         .route("/packs/:design", get(pack_manifest))
         .route("/packs/:design/pick", post(pack_pick))
@@ -721,6 +729,111 @@ async fn rotate_room(
     log::info!("room {name}: key rotated (epoch {epoch}); earlier links are revoked");
     let token = hub.auth.mint(&name, Role::Owner, 0, epoch);
     ([(header::CACHE_CONTROL, "no-store")], Json(Minted { room: name, role: Role::Owner, expires: 0, token })).into_response()
+}
+
+// --- in-context DRC (Phase 7.5) ---------------------------------------------
+
+/// One whole-design check at a time (it uses every core).
+static CHECKS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[derive(Deserialize)]
+struct DrcQuery {
+    /// `sky130` (the default) or `blanket`.
+    deck: Option<String>,
+    /// `x0,y0,x1,y1`, world nm: re-check only this area (after an edit).
+    area: Option<String>,
+    /// The client's shape-id scheme: its edits number shapes by it.
+    ids: Option<u32>,
+    t: Option<String>,
+}
+
+impl DrcQuery {
+    fn parse(&self) -> Result<(fluideda_core::DrcRules, Option<[i32; 4]>), String> {
+        let deck = fluideda_core::Deck::from_name(self.deck.as_deref().unwrap_or("sky130"))
+            .ok_or_else(|| "deck: sky130 or blanket".to_string())?;
+        let area = match &self.area {
+            None => None,
+            Some(a) => {
+                let v: Vec<i32> = a.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                match v[..] {
+                    [x0, y0, x1, y1] if x0 <= x1 && y0 <= y1 => Some([x0, y0, x1, y1]),
+                    _ => return Err("area: x0,y0,x1,y1 (nm)".into()),
+                }
+            }
+        };
+        Ok((deck.rules(), area))
+    }
+}
+
+/// `POST /drc/<design>`: the design with the edits of the document state in
+/// the body, checked in context.
+async fn drc_design(
+    State(hub): State<Arc<Hub>>,
+    Path(design): Path<String>,
+    Query(q): Query<DrcQuery>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    if !store::is_hash(&design) {
+        return bad_request("not a sha256 hex digest");
+    }
+    if let Err(d) = allow_design(&hub, auth::token_of(&headers, q.t.as_deref()).as_deref(), &design, Role::Editor).await {
+        return denied(d);
+    }
+    if let Some(ids) = q.ids.filter(|&i| i != fluideda_core::SHAPE_ID_SCHEME) {
+        return id_scheme_conflict(ids);
+    }
+    let Ok(state) = axum::body::to_bytes(body, MAX_STATE).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, format!("document states are at most {MAX_STATE} bytes")).into_response();
+    };
+    run_drc(&hub, design, state.to_vec(), &q).await
+}
+
+/// `POST /rooms/<room>/drc`: the room's design with the room's edits.
+async fn drc_room(State(hub): State<Arc<Hub>>, Path(name): Path<String>, Query(q): Query<DrcQuery>, headers: HeaderMap) -> Response {
+    if !store::is_room_name(&name) {
+        return bad_request("room names are 1-64 characters of [A-Za-z0-9_-]");
+    }
+    if let Err(d) = hub.allow(auth::token_of(&headers, q.t.as_deref()).as_deref(), &name, Role::Viewer) {
+        return denied(d);
+    }
+    let h = hub.clone();
+    let found = tokio::task::spawn_blocking(move || h.existing_room(&name).map(|r| r.map(|r| r.design_and_state())))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)));
+    match found {
+        Ok(Some((Some(design), state))) => {
+            if design.ids != fluideda_core::SHAPE_ID_SCHEME {
+                return id_scheme_conflict(design.ids);
+            }
+            run_drc(&hub, design.hash, state, &q).await
+        }
+        Ok(Some((None, _))) => (StatusCode::NOT_FOUND, "the room is not bound to a design").into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such room").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn run_drc(hub: &Arc<Hub>, design: String, state: Vec<u8>, q: &DrcQuery) -> Response {
+    let (rules, area) = match q.parse() {
+        Ok(p) => p,
+        Err(e) => return bad_request(e),
+    };
+    let _one = CHECKS.lock().await;
+    let store = hub.store.clone();
+    let done = tokio::task::spawn_blocking(move || drc::check(&store, &design, &state, &rules, area))
+        .await
+        .unwrap_or_else(|e| Err(drc::DrcError::Io(io::Error::other(e))));
+    match done {
+        Ok(c) => {
+            log::info!("drc: {} violations over {} tiles in {:.0} ms on {} threads", c.violations.len(), c.tiles, c.ms, c.threads);
+            ([(header::CACHE_CONTROL, "no-cache")], Json(c)).into_response()
+        }
+        Err(drc::DrcError::NoDesign) => (StatusCode::NOT_FOUND, "no such design blob").into_response(),
+        Err(drc::DrcError::BadState(m)) => bad_request(m),
+        Err(drc::DrcError::BadDesign(m)) => (StatusCode::UNPROCESSABLE_ENTITY, m).into_response(),
+        Err(drc::DrcError::Io(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// Edits numbered under another shape-id scheme would land on other shapes.

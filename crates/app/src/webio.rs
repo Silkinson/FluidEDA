@@ -1200,6 +1200,76 @@ pub fn export_on_server(_design: String, _oasis: bool, _state: Vec<u8>, _name: S
     *slot.borrow_mut() = ExportState::Failed("server export is web-only".into());
 }
 
+/// Phase 7.5: the server's in-context DRC of this design with this page's
+/// edits — every violation, or those in `area` (the re-check after an edit).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub enum ContextDrc {
+    Idle,
+    Running,
+    Done { violations: Vec<fluideda_core::Violation>, area: Option<[i32; 4]>, ms: f64, tiles: usize, threads: usize },
+    Failed(String),
+}
+
+pub type ContextDrcSlot = Rc<RefCell<ContextDrc>>;
+
+#[cfg(target_arch = "wasm32")]
+pub fn drc_on_server(design: String, deck: &'static str, state: Vec<u8>, area: Option<[i32; 4]>, slot: ContextDrcSlot) {
+    *slot.borrow_mut() = ContextDrc::Running;
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            let mut url = format!("/drc/{design}?deck={deck}&ids={}", fluideda_core::SHAPE_ID_SCHEME);
+            if let Some([x0, y0, x1, y1]) = area {
+                url += &format!("&area={x0},{y0},{x1},{y1}");
+            }
+            let body: wasm_bindgen::JsValue = js_sys::Uint8Array::from(state.as_slice()).into();
+            let resp = http(&url, "POST", Some(&body)).await?;
+            if !resp.ok() {
+                return Err(format!("POST {url}: HTTP {}", resp.status()));
+            }
+            let m = wasm_bindgen_futures::JsFuture::from(resp.json().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("POST {url}: {e:?}"))?;
+            let list = js_sys::Array::from(&get_val(&m, "violations"));
+            let mut violations = Vec::with_capacity(list.length() as usize);
+            for v in list.iter() {
+                let b = js_sys::Array::from(&get_val(&v, "bbox"));
+                let n = |i: u32| b.get(i).as_f64().unwrap_or(0.0) as i32;
+                violations.push(fluideda_core::Violation {
+                    kind: if get_str(&v, "kind").as_deref() == Some("width") {
+                        fluideda_core::DrcKind::Width
+                    } else {
+                        fluideda_core::DrcKind::Spacing
+                    },
+                    layer: fluideda_core::Layer::new(get_f64(&v, "layer") as u16, get_f64(&v, "datatype") as u16),
+                    bbox: fluideda_core::Bbox { min: fluideda_core::Point::new(n(0), n(1)), max: fluideda_core::Point::new(n(2), n(3)) },
+                });
+            }
+            let a = get_val(&m, "area");
+            let area = (!a.is_null() && !a.is_undefined()).then(|| {
+                let a = js_sys::Array::from(&a);
+                let n = |i: u32| a.get(i).as_f64().unwrap_or(0.0) as i32;
+                [n(0), n(1), n(2), n(3)]
+            });
+            Ok::<_, String>(ContextDrc::Done {
+                violations,
+                area,
+                ms: get_f64(&m, "ms"),
+                tiles: get_f64(&m, "tiles") as usize,
+                threads: get_f64(&m, "threads") as usize,
+            })
+        }
+        .await;
+        *slot.borrow_mut() = result.unwrap_or_else(ContextDrc::Failed);
+        wake();
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn drc_on_server(_design: String, _deck: &'static str, _state: Vec<u8>, _area: Option<[i32; 4]>, slot: ContextDrcSlot) {
+    *slot.borrow_mut() = ContextDrc::Failed("in-context DRC runs on the server (web)".into());
+}
+
 /// Hand `url` (same origin) to the browser's download as `name`.
 #[cfg(target_arch = "wasm32")]
 fn download_url(url: &str, name: &str) -> Result<(), String> {

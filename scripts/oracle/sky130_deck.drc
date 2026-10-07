@@ -1,0 +1,29 @@
+# Phase 7.5 oracle: FluidEDA's sky130 deck (crates/core/src/drc/decks.rs) in
+# KLayout's DRC engine, on the whole design (merged, in context):
+#
+#   klayout -b -r scripts/oracle/sky130_deck.drc -rd input=<file.gds> -rd report=<out.lyrdb>
+#
+# Same semantics as ours: width uses the projection metric (Manhattan
+# signoff), space the Euclidean one; space covers notches within one polygon
+# and gaps between polygons; KLayout shields by default, as we do. Flat mode,
+# so every marker is in the top cell's frame, as ours are
+# (scripts/oracle/compare_drc.py compares them).
+source($input)
+report("FluidEDA sky130 deck", $report)
+flat
+threads(8)
+
+[
+  [64, 20, "nwell", 840, 1270], [65, 20, "diff", 150, 270], [65, 44, "tap", 150, 270],
+  [66, 20, "poly", 150, 210], [66, 44, "licon1", 170, 170], [67, 20, "li1", 170, 170],
+  [67, 44, "mcon", 170, 190], [68, 20, "met1", 140, 140], [68, 44, "via", 150, 170],
+  [69, 20, "met2", 140, 140], [69, 44, "via2", 200, 200], [70, 20, "met3", 300, 300],
+  [70, 44, "via3", 200, 200], [71, 20, "met4", 300, 300], [71, 44, "via4", 800, 800],
+  [72, 20, "met5", 1600, 1600], [75, 20, "hvi", 600, 700], [78, 44, "hvtp", 380, 380],
+  [93, 44, "nsdm", 380, 380], [94, 20, "psdm", 380, 380], [95, 20, "npc", 270, 270],
+  [125, 44, "lvtn", 380, 380],
+].each do |l, d, name, w, s|
+  layer = input(l, d)
+  layer.width(w.nm, projection).output("#{name} width", "#{l}/#{d} width < #{w} nm")
+  layer.space(s.nm, euclidian).output("#{name} space", "#{l}/#{d} space < #{s} nm")
+end

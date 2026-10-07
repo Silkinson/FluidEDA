@@ -695,6 +695,14 @@ pub struct FluidApp {
     export: webio::ExportSlot,
     /// Phase 7.2: the last link shared (or the rotation) and its outcome.
     link: webio::LinkSlot,
+    /// Phase 7.5: the server's in-context DRC — the request in flight or its
+    /// answer — and the violations held (world nm), once a check has run.
+    ctx_drc: webio::ContextDrcSlot,
+    ctx_violations: Option<Vec<fluideda_core::Violation>>,
+    /// The last answer taken in (so each is applied once).
+    ctx_seen: Option<webio::ContextDrc>,
+    /// Edits since the last in-context check: re-check the view once idle.
+    ctx_stale: bool,
     /// The export last reported in the status line.
     export_seen: Option<webio::ExportState>,
     /// The blob check ran for the current connection.
@@ -859,6 +867,10 @@ impl FluidApp {
             upload: Rc::new(RefCell::new(webio::UploadState::Idle)),
             export: Rc::new(RefCell::new(webio::ExportState::Idle)),
             link: Rc::new(RefCell::new(webio::LinkState::Idle)),
+            ctx_drc: Rc::new(RefCell::new(webio::ContextDrc::Idle)),
+            ctx_violations: None,
+            ctx_seen: None,
+            ctx_stale: false,
             export_seen: None,
             upload_checked: false,
             last_frame: 0.0,
@@ -1729,6 +1741,56 @@ impl FluidApp {
         match saved {
             Ok(bytes) => self.status = format!("saved {name} ({} KB)", bytes / 1024),
             Err(e) => self.status = format!("save failed: {e}"),
+        }
+    }
+
+    /// Phase 7.5: ask the server to check this design in context with this
+    /// page's edits — all of it, or `area` (world nm).
+    fn request_context_drc(&mut self, area: Option<[i32; 4]>) {
+        if self.metrics.hash.is_empty() || matches!(*self.ctx_drc.borrow(), webio::ContextDrc::Running) {
+            return;
+        }
+        let deck = match self.drc_deck {
+            fluideda_core::Deck::Sky130 => "sky130",
+            fluideda_core::Deck::Blanket => "blanket",
+        };
+        let state = self.session.state();
+        webio::drc_on_server(self.metrics.hash.clone(), deck, state, area, self.ctx_drc.clone());
+        self.ctx_stale = false;
+    }
+
+    /// Take in-context answers as they come: a whole-design answer replaces
+    /// what is held; an area's replaces what lies in that area. After an edit,
+    /// the view is re-checked (incremental: only its tiles).
+    fn drive_context_drc(&mut self) {
+        let now = self.ctx_drc.borrow().clone();
+        if self.ctx_seen.as_ref() != Some(&now) {
+            if let webio::ContextDrc::Done { violations, area, .. } = &now {
+                match (area, self.ctx_violations.as_mut()) {
+                    (Some([x0, y0, x1, y1]), Some(held)) => {
+                        let a = fluideda_core::Bbox { min: Point::new(*x0, *y0), max: Point::new(*x1, *y1) };
+                        held.retain(|v| !(v.bbox.min.x >= a.min.x && v.bbox.max.x <= a.max.x && v.bbox.min.y >= a.min.y && v.bbox.max.y <= a.max.y));
+                        held.extend(violations.iter().cloned());
+                    }
+                    _ => self.ctx_violations = Some(violations.clone()),
+                }
+            }
+            self.ctx_seen = Some(now.clone());
+        }
+        if self.ctx_stale && self.ctx_violations.is_some() && !matches!(now, webio::ContextDrc::Running) {
+            let v = self.view_bbox();
+            self.request_context_drc(Some([v.min.x, v.min.y, v.max.x, v.max.y]));
+        }
+    }
+
+    /// The view, world nm.
+    fn view_bbox(&self) -> fluideda_core::Bbox {
+        let half_w = (self.camera.viewport.x as f64 * 0.5) / self.camera.scale as f64;
+        let half_h = (self.camera.viewport.y as f64 * 0.5) / self.camera.scale as f64;
+        let (cx, cy) = (self.camera.center.x as f64, self.camera.center.y as f64);
+        fluideda_core::Bbox {
+            min: Point::new((cx - half_w).floor() as i32, (cy - half_h).floor() as i32),
+            max: Point::new((cx + half_w).ceil() as i32, (cy + half_h).ceil() as i32),
         }
     }
 
@@ -3205,6 +3267,9 @@ impl FluidApp {
     /// local, remote, or undo — and invalidate the chunks whose edit-state
     /// changed. Skipped mid-drag so a live move preview isn't clobbered.
     fn reconcile_edits(&mut self) {
+        // Phase 7.5: the design changed — an in-context result shown is
+        // re-checked over the view.
+        self.ctx_stale = true;
         // Which base shapes currently carry a geometry record (SetPoints) — their
         // later translations must rewrite geometry, not commit a Move op.
         self.geom_edited = self
@@ -3394,6 +3459,7 @@ impl eframe::App for FluidApp {
         }
         self.drive_room(now);
         self.drive_export();
+        self.drive_context_drc();
 
         self.drive_test_hook();
 
@@ -3468,7 +3534,8 @@ impl FluidApp {
             "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{},\"hidden\":{},\
              \"room\":\"{}\",\"connecting\":{},\"synced\":{},\"design_hash\":\"{}\",\"room_design\":\"{}\",\
              \"room_design_name\":\"{}\",\"refused\":{},\"join_error\":\"{}\",\"upload\":\"{}\",\"reconnects\":{},\
-             \"loading\":{},\"export\":\"{}\",\"role\":\"{}\",\"read_only\":{},\"link\":\"{}\"}}",
+             \"loading\":{},\"export\":\"{}\",\"role\":\"{}\",\"read_only\":{},\"link\":\"{}\",\
+             \"ctx_drc\":{},\"ctx_drc_state\":\"{}\",\"ctx_drc_ms\":{:.0}}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -3515,6 +3582,18 @@ impl FluidApp {
                 webio::LinkState::Done(l) => l.clone(),
                 webio::LinkState::Failed(e) => format!("failed: {e}"),
             }),
+            self.ctx_violations.as_ref().map_or(-1, |v| v.len() as i64),
+            json_str(&match &*self.ctx_drc.borrow() {
+                webio::ContextDrc::Idle => "idle".to_string(),
+                webio::ContextDrc::Running => "running".into(),
+                webio::ContextDrc::Done { area: None, .. } => "done".into(),
+                webio::ContextDrc::Done { area: Some(_), .. } => "done_area".into(),
+                webio::ContextDrc::Failed(e) => format!("failed: {e}"),
+            }),
+            match &*self.ctx_drc.borrow() {
+                webio::ContextDrc::Done { ms, .. } => *ms,
+                _ => 0.0,
+            },
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
     }
@@ -3792,6 +3871,13 @@ impl FluidApp {
                 self.cull_max_ms = 0.0;
             }
             Some("drc_check") => self.drc_enqueue_visible(),
+            // Phase 7.5: `drc_context` checks the whole design in context on
+            // the server; `drc_context_view` only the view.
+            Some("drc_context") => self.request_context_drc(None),
+            Some("drc_context_view") => {
+                let v = self.view_bbox();
+                self.request_context_drc(Some([v.min.x, v.min.y, v.max.x, v.max.y]));
+            }
             Some("drc_bench") => {
                 // Measure merge-first tiled DRC on the biggest cell (caravel_core
                 // on caravel), synchronously and single-threaded, as the inline
@@ -4174,6 +4260,32 @@ impl FluidApp {
                 }
                 if ui.button("Check visible cells").clicked() {
                     self.drc_enqueue_visible();
+                }
+                // Phase 7.5: the whole design in context — every cell with
+                // its neighbours and parents merged in — on the server.
+                if ui
+                    .button("Check whole design in context (server)")
+                    .on_hover_text("cells checked as placed: what a cell's neighbours merge into it, and what lies between cells")
+                    .clicked()
+                {
+                    self.request_context_drc(None);
+                }
+                match &*self.ctx_drc.borrow() {
+                    webio::ContextDrc::Running => {
+                        ui.small("in context: checking on the server…");
+                    }
+                    webio::ContextDrc::Done { ms, tiles, threads, area, .. } => {
+                        let what = if area.is_some() { "this view re-checked" } else { "whole design" };
+                        ui.small(format!(
+                            "in context: {} violation(s) ({what}: {tiles} tiles, {:.1} s on {threads} threads)",
+                            self.ctx_violations.as_ref().map_or(0, Vec::len),
+                            ms / 1000.0
+                        ));
+                    }
+                    webio::ContextDrc::Failed(e) => {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("in context: {e}"));
+                    }
+                    webio::ContextDrc::Idle => {}
                 }
                 ui.small(format!(
                     "violations: {} across {} cell(s)",
@@ -4581,6 +4693,20 @@ impl FluidApp {
                                 drawn += 1;
                             }
                         }
+                    }
+                }
+            }
+
+            // Phase 7.5: in-context violations, world nm (orange; capped).
+            if let Some(ctx) = &self.ctx_violations {
+                let stroke = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 160, 32));
+                for v in ctx.iter().take(DRC_MARKER_CAP) {
+                    let r = egui::Rect::from_two_pos(
+                        self.world_to_screen(Vec2::new(v.bbox.min.x as f32, v.bbox.min.y as f32), rect),
+                        self.world_to_screen(Vec2::new(v.bbox.max.x as f32, v.bbox.max.y as f32), rect),
+                    );
+                    if r.intersects(rect) {
+                        painter.rect_stroke(r.expand(3.0), 0.0, stroke, egui::StrokeKind::Outside);
                     }
                 }
             }

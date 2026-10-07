@@ -42,3 +42,7 @@ backend = "http://127.0.0.1:9000/packs"
 # Phase 7.4: server-side export of a streamed design with its edits.
 [[proxy]]
 backend = "http://127.0.0.1:9000/export"
+
+# Phase 7.5: in-context DRC on the server (/drc/<sha256>).
+[[proxy]]
+backend = "http://127.0.0.1:9000/drc"

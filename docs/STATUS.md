@@ -1,6 +1,6 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-10-06 · current branch: `phase7` (off `phase6-backend-oasis`)_
+_Last updated: 2026-10-07 · current branch: `phase7` (off `phase6-backend-oasis`)_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
 > fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
@@ -159,6 +159,17 @@ front, then 7.4, edit streamed designs. **Both are done.**
   results. Each pick now costs one round trip (104 ms median at 80 ms
   latency), where whole chunks cost up to 1.6 s the first time an area is
   picked.
+* **7.5 — in-context DRC.** World tiles with each tile's complete geometry
+  gathered through the hierarchy, checked exactly by the intra-cell tile
+  function, on every core. Edits are included, and tiles with identical
+  content are checked once. Whole caravel: **0 violations in 8.4 s** on 10
+  threads (native); all 3,303 intra-cell flags (184,771 once placed) are
+  context-only. Injected violations are found, and on 400 random
+  rectangles KLayout agrees marker for marker (155 regions vs its 176 edge
+  pairs, every one covered both ways). The server checks a design or a
+  room (`/drc`), the app shows the result, and after an edit it re-checks
+  only the view (1 ms of server time). Streamed designs get the same
+  check. Not done: in-context checks in the browser's worker pool.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -348,7 +359,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
-| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1, 7.7, 7.8, 7.6, 7.9, 7.2, 7.10 done | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). 7.9: files stream in and out (in-core save no longer grows the heap: caravel stays 122 MB, was 689; worker peak 548 → 364 MB; place_50M saves). 7.1b: randomized convergence — peers and a crashing room converge (256 + 64 property cases); yrs diverges under arbitrary reordering, which our relay never does. 7.1c: batched + prefetched fetches (80 ms latency: 26.3 → 4.7 requests per pan, 353 → 20 ms to draw, 100% of pans with no proxies). 7.2: capability links — signed room/role/expiry tokens, viewers read-only by the server, share and revoke in the app. 7.10: finer streamed picks — the server answers which shapes hold the point (128 picks: 38.8 → 0.29 MB). Next: 7.5 |
+| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1, 7.7, 7.8, 7.6, 7.9, 7.2, 7.10, 7.5 done (closing docs pending) | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). 7.9: files stream in and out (in-core save no longer grows the heap: caravel stays 122 MB, was 689; worker peak 548 → 364 MB; place_50M saves). 7.1b: randomized convergence — peers and a crashing room converge (256 + 64 property cases); yrs diverges under arbitrary reordering, which our relay never does. 7.1c: batched + prefetched fetches (80 ms latency: 26.3 → 4.7 requests per pan, 353 → 20 ms to draw, 100% of pans with no proxies). 7.2: capability links — signed room/role/expiry tokens, viewers read-only by the server, share and revoke in the app. 7.10: finer streamed picks — the server answers which shapes hold the point (128 picks: 38.8 → 0.29 MB). 7.5: in-context DRC — whole caravel 0 violations in 8.4 s on 10 threads, KLayout agrees on injected violations |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 

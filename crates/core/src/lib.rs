@@ -48,8 +48,9 @@ pub use chunk::{Chunk, ChunkId};
 pub use cull::{cull, cull_counted, cull_with_overlay, CellDraw, CullStats, VisibleSet};
 pub use db::{Cell, CellDb, CellId, Instance, InstanceKind, PickAnswer};
 pub use drc::{
-    build_grid, cell_tiles, check_cell, check_tile, check_tile_columns, gather_tile, Deck, DrcDriver, DrcGrid,
-    DrcGridBuilder, DrcKind, DrcRules, DrcStep, LayerRule, PassStats, TileInput, TileJob, TileKey, Violation,
+    build_grid, cell_tiles, check_cell, check_tile, check_tile_columns, check_world, check_world_tiles, gather_tile,
+    gather_world_tile, review_flags, world_tiles, Deck, DrcDriver, DrcGrid, DrcGridBuilder, DrcKind, DrcRules, DrcStep,
+    FlagReview, LayerRule, PassStats, TileInput, TileJob, TileKey, Violation, WorldReport, WORLD_TILE,
 };
 pub use edit::{AddId, AddedShape, BaseShapeId, EditOverlay, PlacementKey, Shape};
 pub use flatten::{flatten_hop, flatten_needs, flatten_placement, placement_counts, subtree_shapes, FLATTEN_LIMIT};

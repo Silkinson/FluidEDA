@@ -18,7 +18,7 @@ use crate::index::ShapeIndex;
 use crate::store::ShapeStore;
 use crate::transform::{Bboxf, Transform};
 use crate::types::{Bbox, FlatLayout, Layer, Point, Polygon};
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 use std::collections::HashMap;
 
 pub type CellId = usize;
@@ -221,7 +221,7 @@ pub struct Cell {
     /// here. Read shapes through [`Cell::shape_points`] /
     /// [`Cell::chunk_store`], which serve both kinds of cell. `None` in-core.
     pub remote_shapes: Option<RemoteShapes>,
-    index: OnceCell<ShapeIndex>,
+    index: OnceLock<ShapeIndex>,
 }
 
 /// The resident shape chunks of a streamed cell (Phase 7.4): chunk `i`'s
@@ -269,7 +269,7 @@ impl Cell {
             chunk_looks: Vec::new(),
             chunk_rgba: Vec::new(),
             remote_shapes: None,
-            index: OnceCell::new(),
+            index: OnceLock::new(),
         }
     }
 
@@ -381,7 +381,7 @@ impl Cell {
     /// R-tree, which was built from the old store.
     pub fn set_shapes(&mut self, shapes: ShapeStore) {
         self.shapes = shapes;
-        self.index = OnceCell::new();
+        self.index = OnceLock::new();
     }
 
     /// The cell's spatial index, built on first access and cached thereafter.
@@ -477,7 +477,7 @@ pub struct CellDb {
 impl Cell {
     /// Reconstruct a cell from already-computed parts (Phase 2b worker transfer):
     /// name, chunked shape store, instances, and both chunk tables. The R-tree
-    /// index is **not** transferred — it stays a lazy `OnceCell`, rebuilt on the
+    /// index is **not** transferred — it stays a lazy `OnceLock`, rebuilt on the
     /// main thread on first query exactly as for a locally-parsed cell.
     pub fn from_parts(
         name: String,
@@ -486,7 +486,7 @@ impl Cell {
         chunks: Vec<Chunk>,
         inst_chunks: Vec<Chunk>,
     ) -> Self {
-        Self { name, shapes, instances, chunks, inst_chunks, remote: None, chunk_looks: Vec::new(), chunk_rgba: Vec::new(), remote_shapes: None, index: OnceCell::new() }
+        Self { name, shapes, instances, chunks, inst_chunks, remote: None, chunk_looks: Vec::new(), chunk_rgba: Vec::new(), remote_shapes: None, index: OnceLock::new() }
     }
 }
 

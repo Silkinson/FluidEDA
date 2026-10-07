@@ -19,11 +19,12 @@
 //!
 //! ## Scope (still honest)
 //!
-//! Checks remain **intra-cell**: a cell is checked in its own frame, composited
-//! with the edit overlay; a shape in cell A near an *instance* of cell B is not
-//! seen (hierarchical / cross-instance context is the deferred hard problem).
-//! Rules are min width + min space per layer; wide-metal, end-of-line and
-//! enclosure rules are out of scope.
+//! [`check_cell`] is **intra-cell**: a cell is checked in its own frame,
+//! composited with the edit overlay; a shape in cell A near an *instance* of
+//! cell B is not seen there. Phase 7.5's [`world`] checks the design **in
+//! context** — world tiles, geometry gathered through the hierarchy — with the
+//! same tile function. Rules are min width + min space per layer; wide-metal,
+//! end-of-line and enclosure rules are out of scope.
 //!
 //! No wgpu, no network — core stays the Web Worker seam.
 
@@ -31,10 +32,12 @@ pub mod decks;
 pub mod driver;
 pub mod edges;
 pub mod grid;
+pub mod world;
 
 pub use decks::{Deck, DeckEntry, SKY130};
 pub use driver::{DrcDriver, DrcStep, PassStats, TileJob};
 pub use grid::{DrcGrid, DrcGridBuilder, TileKey, TILE_TARGET_SHAPES};
+pub use world::{check_world, check_world_tiles, gather_world_tile, review_flags, world_tiles, FlagReview, WorldReport, WORLD_TILE};
 
 use crate::boolean::union_clipped;
 use crate::db::{Cell, CellId};
@@ -137,7 +140,7 @@ pub enum DrcKind {
 
 /// One violation marker, in the checked cell's local nm: the region of the
 /// merged boundary that is too close to itself, clipped to one tile's core.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Violation {
     pub kind: DrcKind,
     pub layer: Layer,
@@ -154,7 +157,7 @@ pub struct TileInput {
 }
 
 impl TileInput {
-    fn push(&mut self, layer: Layer, pts: &[Point]) {
+    pub(crate) fn push(&mut self, layer: Layer, pts: &[Point]) {
         if self.starts.is_empty() {
             self.starts.push(0);
         }
@@ -190,7 +193,7 @@ fn inflate(b: &Bbox, r: i32) -> Bbox {
     }
 }
 
-fn intersects(a: &Bbox, b: &Bbox) -> bool {
+pub(crate) fn intersects(a: &Bbox, b: &Bbox) -> bool {
     a.min.x <= b.max.x && b.min.x <= a.max.x && a.min.y <= b.max.y && b.min.y <= a.max.y
 }
 
@@ -296,7 +299,7 @@ fn clip_to_core(m: &BoxF, core: &Bbox) -> Option<Bbox> {
 
 /// Merge boxes that overlap or touch into their union bboxes (one marker per
 /// connected cluster — e.g. the two edge pairs of one corner-to-corner gap).
-fn merge_overlapping(mut boxes: Vec<Bbox>) -> Vec<Bbox> {
+pub(crate) fn merge_overlapping(mut boxes: Vec<Bbox>) -> Vec<Bbox> {
     if boxes.len() < 2 {
         return boxes;
     }
