@@ -334,11 +334,52 @@ pub struct Hub {
     pub store: Arc<Store>,
     pub policy: SnapshotPolicy,
     rooms: Mutex<HashMap<String, Arc<Room>>>,
+    /// Phase 7.2: capability links, and the bytes each token has uploaded.
+    pub auth: crate::auth::Auth,
+    uploads: Mutex<HashMap<String, u64>>,
 }
 
 impl Hub {
+    /// A hub with links not required (loopback, tests).
     pub fn new(store: Store, policy: SnapshotPolicy) -> Self {
-        Self { store: Arc::new(store), policy, rooms: Mutex::new(HashMap::new()) }
+        Self::with_auth(store, policy, false).expect("the store's secret")
+    }
+
+    /// A hub that requires a link token for rooms, packs, uploads and exports
+    /// when `required`.
+    pub fn with_auth(store: Store, policy: SnapshotPolicy, required: bool) -> io::Result<Self> {
+        let auth = crate::auth::Auth::open(store.root(), required)?;
+        Ok(Self { store: Arc::new(store), policy, rooms: Mutex::new(HashMap::new()), auth, uploads: Mutex::new(HashMap::new()) })
+    }
+
+    /// The grant `token` carries, checked now; `None` when links are not
+    /// required (everything is allowed).
+    pub fn grant(&self, token: Option<&str>) -> Result<Option<crate::auth::Grant>, crate::auth::Denied> {
+        if !self.auth.required {
+            return Ok(None);
+        }
+        let t = token.ok_or(crate::auth::Denied::Missing)?;
+        self.auth.check(t, crate::auth::now(), |room| self.store.room_epoch(room)).map(Some)
+    }
+
+    /// `token` allows `need` in `room`.
+    pub fn allow(&self, token: Option<&str>, room: &str, need: crate::auth::Role) -> Result<(), crate::auth::Denied> {
+        match self.grant(token)? {
+            None => Ok(()),
+            Some(g) if g.room == room && g.role >= need => Ok(()),
+            Some(_) => Err(crate::auth::Denied::NotAllowed),
+        }
+    }
+
+    /// Count `bytes` against `token`'s upload quota; false once over it.
+    pub fn charge_upload(&self, token: &str, bytes: u64, quota: u64) -> bool {
+        let mut used = self.uploads.lock().unwrap();
+        let u = used.entry(token.to_string()).or_insert(0);
+        if *u + bytes > quota {
+            return false;
+        }
+        *u += bytes;
+        true
     }
 
     /// Room `name` (must satisfy [`crate::store::is_room_name`]), restored

@@ -16,8 +16,25 @@
 //!   edits of the document state in the body, written into the blob store
 //!   ([`export`], Phase 7.4); `POST /rooms/<name>/export?format=` does the
 //!   same with the room's design and state.
+//! * `POST /rooms/<name>/share?role=editor|viewer[&ttl=<s>]` — mint a link
+//!   token (owner); `POST /rooms/<name>/rotate` — revoke every link issued
+//!   so far (owner; answers with a fresh owner token).
 //! * `GET /health`.
+//!
+//! Phase 7.2: when links are required ([`auth`]; by default on any address
+//! but loopback), a request carries a token (`Authorization: Bearer`, or
+//! `?t=` — a WebSocket cannot set headers):
+//! * the socket and `GET /rooms/<r>`, `POST /rooms/<r>/export` need any
+//!   role in the room. A viewer's document updates are dropped; its
+//!   presence is relayed. A refused socket gets
+//!   `{"error":"unauthorized",...}` and a close (code 4401);
+//! * `GET /packs/<d>` needs any role in a room bound to design `d`, and
+//!   `POST /export/<d>` editor or owner there;
+//! * `PUT /blobs` needs editor or owner, within a per-token quota;
+//! * `GET /blobs/<h>` needs none: a SHA-256 is itself unguessable, and
+//!   hashes are only revealed through the endpoints above.
 
+pub mod auth;
 pub mod export;
 pub mod packs;
 pub mod room;
@@ -34,6 +51,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use auth::{Denied, Role};
 use futures::{sink::SinkExt, stream::StreamExt};
 use room::{DesignKey, Hub, Room, TAG_AWARENESS, TAG_DOC};
 use serde::Deserialize;
@@ -64,6 +82,8 @@ pub fn app(hub: Arc<Hub>) -> Router {
         .route("/blobs/:hash", get(get_blob).put(put_blob))
         .route("/rooms/:room", get(room_info))
         .route("/rooms/:room/export", post(export_room))
+        .route("/rooms/:room/share", post(share_room))
+        .route("/rooms/:room/rotate", post(rotate_room))
         .route("/packs/:design", get(pack_manifest))
         .route("/export/:design", post(export_design))
         .route("/health", get(|| async { "ok" }))
@@ -94,6 +114,18 @@ struct WsQuery {
     design: Option<String>,
     ids: Option<u32>,
     name: Option<String>,
+    /// Phase 7.2: the link token.
+    t: Option<String>,
+}
+
+/// A request's `?t=` (Phase 7.2).
+#[derive(Deserialize)]
+struct TokenQuery {
+    t: Option<String>,
+}
+
+fn denied(d: Denied) -> Response {
+    (d.status(), d.reason()).into_response()
 }
 
 fn default_room() -> String {
@@ -104,10 +136,23 @@ fn bad_request(msg: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, msg.into()).into_response()
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, Query(q): Query<WsQuery>, State(hub): State<Arc<Hub>>) -> Response {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(q): Query<WsQuery>,
+    headers: HeaderMap,
+    State(hub): State<Arc<Hub>>,
+) -> Response {
     if !store::is_room_name(&q.room) {
         return bad_request("room names are 1-64 characters of [A-Za-z0-9_-]");
     }
+    // Phase 7.2: what the link allows here (everything when links are off).
+    let token = auth::token_of(&headers, q.t.as_deref());
+    let role = match hub.grant(token.as_deref()) {
+        Ok(None) => Role::Owner,
+        Ok(Some(g)) if g.room == q.room => g.role,
+        Ok(Some(_)) => return ws.on_upgrade(|socket| refuse(socket, Denied::NotAllowed)),
+        Err(d) => return ws.on_upgrade(move |socket| refuse(socket, d)),
+    };
     let design = match q.design {
         Some(hash) if store::is_hash(&hash) => Some(DesignKey {
             hash,
@@ -121,10 +166,18 @@ async fn ws_handler(ws: WebSocketUpgrade, Query(q): Query<WsQuery>, State(hub): 
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("room {}: {e}", q.room)).into_response(),
     };
-    ws.on_upgrade(move |socket| handle_socket(socket, room, design))
+    ws.on_upgrade(move |socket| handle_socket(socket, room, design, role))
 }
 
-async fn handle_socket(socket: WebSocket, room: Arc<Room>, design: Option<DesignKey>) {
+/// Phase 7.2: tell a peer why it may not join, then close (code 4401).
+async fn refuse(mut socket: WebSocket, d: Denied) {
+    let msg = serde_json::json!({ "error": "unauthorized", "reason": d.reason() });
+    let _ = socket.send(Message::Text(msg.to_string())).await;
+    let close = CloseFrame { code: 4401, reason: d.reason().into() };
+    let _ = socket.send(Message::Close(Some(close))).await;
+}
+
+async fn handle_socket(socket: WebSocket, room: Arc<Room>, design: Option<DesignKey>, role: Role) {
     let peer_id = rand_id();
     let (mut sink, mut stream) = socket.split();
     let (state, mut rx) = match room.join(design.as_ref()) {
@@ -151,6 +204,8 @@ async fn handle_socket(socket: WebSocket, room: Arc<Room>, design: Option<Design
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 Message::Binary(data) => match data.first() {
+                    // A viewer watches: its document updates go nowhere.
+                    Some(&TAG_DOC) if role < Role::Editor => {}
                     Some(&TAG_DOC) => {
                         if !room_in.apply(peer_id, data) {
                             log::warn!("peer {peer_id}: undecodable update dropped");
@@ -318,12 +373,35 @@ impl From<io::Error> for PutError {
     }
 }
 
-async fn put_blob(State(hub): State<Arc<Hub>>, Path(hash): Path<String>, body: Body) -> Response {
+/// Phase 7.2: what one link token may upload in all (`FLUIDEDA_UPLOAD_QUOTA_GB`).
+fn upload_quota() -> u64 {
+    std::env::var("FLUIDEDA_UPLOAD_QUOTA_GB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(32) << 30
+}
+
+async fn put_blob(
+    State(hub): State<Arc<Hub>>,
+    Path(hash): Path<String>,
+    Query(tq): Query<TokenQuery>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
     if !store::is_hash(&hash) {
         return bad_request("not a sha256 hex digest");
     }
+    let token = auth::token_of(&headers, tq.t.as_deref());
+    match hub.grant(token.as_deref()) {
+        Ok(Some(g)) if g.role < Role::Editor => return denied(Denied::NotAllowed),
+        Err(d) => return denied(d),
+        _ => {}
+    }
     if hub.store.has_blob(&hash) {
         return (StatusCode::OK, "exists").into_response();
+    }
+    if let (true, Some(t)) = (hub.auth.required, token.as_deref()) {
+        let size = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok()).unwrap_or(0);
+        if !hub.charge_upload(t, size, upload_quota()) {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "this link's upload quota is used up").into_response();
+        }
     }
     match receive_blob(&hub.store, &hash, body).await {
         Ok(_) => {
@@ -373,9 +451,17 @@ async fn receive_blob(store: &store::Store, hash: &str, body: Body) -> Result<bo
 
 // --- rooms ------------------------------------------------------------------
 
-async fn room_info(State(hub): State<Arc<Hub>>, Path(name): Path<String>) -> Response {
+async fn room_info(
+    State(hub): State<Arc<Hub>>,
+    Path(name): Path<String>,
+    Query(tq): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !store::is_room_name(&name) {
         return bad_request("room names are 1-64 characters of [A-Za-z0-9_-]");
+    }
+    if let Err(d) = hub.allow(auth::token_of(&headers, tq.t.as_deref()).as_deref(), &name, Role::Viewer) {
+        return denied(d);
     }
     // Disk reads, and possibly a wait for a snapshot to finish: off the async workers.
     let info = tokio::task::spawn_blocking(move || match hub.existing_room(&name)? {
@@ -395,9 +481,17 @@ async fn room_info(State(hub): State<Arc<Hub>>, Path(name): Path<String>) -> Res
 /// One pack build at a time (a build parses a whole design).
 static PACK_BUILDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-async fn pack_manifest(State(hub): State<Arc<Hub>>, Path(design): Path<String>) -> Response {
+async fn pack_manifest(
+    State(hub): State<Arc<Hub>>,
+    Path(design): Path<String>,
+    Query(tq): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !store::is_hash(&design) {
         return bad_request("not a sha256 hex digest");
+    }
+    if let Err(d) = allow_design(&hub, auth::token_of(&headers, tq.t.as_deref()).as_deref(), &design, Role::Viewer).await {
+        return denied(d);
     }
     let store = hub.store.clone();
     let built = tokio::task::spawn_blocking(move || {
@@ -427,6 +521,8 @@ struct ExportQuery {
     format: Option<String>,
     /// The client's shape-id scheme: its edits number shapes by it.
     ids: Option<u32>,
+    /// Phase 7.2: the link token.
+    t: Option<String>,
 }
 
 impl ExportQuery {
@@ -445,10 +541,14 @@ async fn export_design(
     State(hub): State<Arc<Hub>>,
     Path(design): Path<String>,
     Query(q): Query<ExportQuery>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     if !store::is_hash(&design) {
         return bad_request("not a sha256 hex digest");
+    }
+    if let Err(d) = allow_design(&hub, auth::token_of(&headers, q.t.as_deref()).as_deref(), &design, Role::Editor).await {
+        return denied(d);
     }
     let oasis = match q.oasis() {
         Ok(o) => o,
@@ -464,9 +564,17 @@ async fn export_design(
 }
 
 /// `POST /rooms/<room>/export`: the room's design with the room's edits.
-async fn export_room(State(hub): State<Arc<Hub>>, Path(name): Path<String>, Query(q): Query<ExportQuery>) -> Response {
+async fn export_room(
+    State(hub): State<Arc<Hub>>,
+    Path(name): Path<String>,
+    Query(q): Query<ExportQuery>,
+    headers: HeaderMap,
+) -> Response {
     if !store::is_room_name(&name) {
         return bad_request("room names are 1-64 characters of [A-Za-z0-9_-]");
+    }
+    if let Err(d) = hub.allow(auth::token_of(&headers, q.t.as_deref()).as_deref(), &name, Role::Viewer) {
+        return denied(d);
     }
     let oasis = match q.oasis() {
         Ok(o) => o,
@@ -487,6 +595,89 @@ async fn export_room(State(hub): State<Arc<Hub>>, Path(name): Path<String>, Quer
         Ok(None) => (StatusCode::NOT_FOUND, "no such room").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Phase 7.2: `token` allows `need` in a room bound to `design` (always, when
+/// links are off).
+async fn allow_design(hub: &Arc<Hub>, token: Option<&str>, design: &str, need: Role) -> Result<(), Denied> {
+    let Some(g) = hub.grant(token)? else { return Ok(()) };
+    if g.role < need {
+        return Err(Denied::NotAllowed);
+    }
+    let h = hub.clone();
+    let room = g.room.clone();
+    let bound = tokio::task::spawn_blocking(move || h.existing_room(&room).ok().flatten().and_then(|r| r.design_and_state().0))
+        .await
+        .ok()
+        .flatten();
+    match bound {
+        Some(d) if d.hash == design => Ok(()),
+        _ => Err(Denied::NotAllowed),
+    }
+}
+
+// --- sharing (Phase 7.2) ---------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ShareQuery {
+    /// `editor` or `viewer` (an owner may also mint `owner`).
+    role: String,
+    /// Seconds the link lives; none = until the room's key is rotated.
+    ttl: Option<u64>,
+    t: Option<String>,
+}
+
+/// What [`share_room`] and [`rotate_room`] answer.
+#[derive(serde::Serialize)]
+struct Minted {
+    room: String,
+    role: Role,
+    /// Unix seconds; 0 = never.
+    expires: u64,
+    token: String,
+}
+
+/// `POST /rooms/<r>/share?role=`: a link token for the room (owner only).
+async fn share_room(
+    State(hub): State<Arc<Hub>>,
+    Path(name): Path<String>,
+    Query(q): Query<ShareQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !store::is_room_name(&name) {
+        return bad_request("room names are 1-64 characters of [A-Za-z0-9_-]");
+    }
+    if let Err(d) = hub.allow(auth::token_of(&headers, q.t.as_deref()).as_deref(), &name, Role::Owner) {
+        return denied(d);
+    }
+    let Some(role) = Role::parse(&q.role) else { return bad_request("role: owner, editor or viewer") };
+    let expires = q.ttl.map_or(0, |s| auth::now() + s.max(1));
+    let token = hub.auth.mint(&name, role, expires, hub.store.room_epoch(&name));
+    ([(header::CACHE_CONTROL, "no-store")], Json(Minted { room: name, role, expires, token })).into_response()
+}
+
+/// `POST /rooms/<r>/rotate`: revoke every link to the room (owner only).
+/// Answers with a fresh owner token, the caller's own having just stopped
+/// working.
+async fn rotate_room(
+    State(hub): State<Arc<Hub>>,
+    Path(name): Path<String>,
+    Query(tq): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !store::is_room_name(&name) {
+        return bad_request("room names are 1-64 characters of [A-Za-z0-9_-]");
+    }
+    if let Err(d) = hub.allow(auth::token_of(&headers, tq.t.as_deref()).as_deref(), &name, Role::Owner) {
+        return denied(d);
+    }
+    let epoch = match hub.store.bump_epoch(&name) {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    log::info!("room {name}: key rotated (epoch {epoch}); earlier links are revoked");
+    let token = hub.auth.mint(&name, Role::Owner, 0, epoch);
+    ([(header::CACHE_CONTROL, "no-store")], Json(Minted { room: name, role: Role::Owner, expires: 0, token })).into_response()
 }
 
 /// Edits numbered under another shape-id scheme would land on other shapes.

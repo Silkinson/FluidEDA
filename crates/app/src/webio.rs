@@ -110,6 +110,118 @@ pub fn query_param(_name: &str) -> Option<String> {
     None
 }
 
+// --- Phase 7.2: capability links ---------------------------------------------
+
+thread_local! {
+    /// The page's link token (`?t=`), replaced when its room's key is rotated.
+    static LINK: RefCell<Option<String>> = RefCell::new(query_param("t").filter(|t| !t.is_empty()));
+}
+
+/// The page's link token, if it came with one.
+pub fn link_token() -> Option<String> {
+    LINK.with(|l| l.borrow().clone())
+}
+
+/// The role the page's link grants: `viewer`, `editor` or `owner`. A token
+/// reads `room.role.expires.epoch.signature`; only the server can check it,
+/// so this only decides what the UI offers.
+pub fn link_role() -> Option<String> {
+    link_token().and_then(|t| t.split('.').nth(1).map(str::to_string))
+}
+
+/// Replace the page's token (after a rotation revoked the old one), and the
+/// `?t=` in its address so a reload keeps working.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn set_link_token(t: String) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(win) = web_sys::window() {
+        if let (Ok(href), Ok(history)) = (win.location().href(), win.history()) {
+            if let Ok(url) = web_sys::Url::new(&href) {
+                url.search_params().set("t", &t);
+                let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url.href()));
+            }
+        }
+    }
+    LINK.with(|l| *l.borrow_mut() = Some(t));
+}
+
+/// A link minted by the server (Phase 7.2): `Done(url)` or why not.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub enum LinkState {
+    Idle,
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+pub type LinkSlot = Rc<RefCell<LinkState>>;
+
+/// `POST /rooms/<room>/share?role=` (owner only): a link to this room for
+/// `role`, copied to the clipboard. `rotate` instead revokes every link to
+/// the room (`POST /rooms/<room>/rotate`); the page keeps working with the
+/// fresh owner token the server answers with.
+#[cfg(target_arch = "wasm32")]
+pub fn room_link(room: String, role: Option<&'static str>, slot: LinkSlot) {
+    *slot.borrow_mut() = LinkState::Running;
+    wasm_bindgen_futures::spawn_local(async move {
+        let url = match role {
+            Some(r) => format!("/rooms/{room}/share?role={r}"),
+            None => format!("/rooms/{room}/rotate"),
+        };
+        let result = async {
+            let resp = http(&url, "POST", None).await?;
+            if !resp.ok() {
+                let why = wasm_bindgen_futures::JsFuture::from(resp.text().map_err(|e| format!("{e:?}"))?)
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                return Err(format!("HTTP {}: {why}", resp.status()));
+            }
+            let json = wasm_bindgen_futures::JsFuture::from(resp.json().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("{url}: {e:?}"))?;
+            get_str(&json, "token").ok_or_else(|| "no token in the answer".to_string())
+        }
+        .await;
+        *slot.borrow_mut() = match result {
+            Ok(token) if role.is_none() => {
+                set_link_token(token);
+                LinkState::Done(String::new())
+            }
+            Ok(token) => {
+                let link = web_sys::window()
+                    .and_then(|w| w.location().origin().ok())
+                    .map(|o| format!("{o}/?room={room}&t={token}"))
+                    .unwrap_or(token);
+                copy_text(&link);
+                LinkState::Done(link)
+            }
+            Err(e) => LinkState::Failed(e),
+        };
+        wake();
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn room_link(_room: String, _role: Option<&'static str>, slot: LinkSlot) {
+    *slot.borrow_mut() = LinkState::Failed("sharing is web-only".into());
+}
+
+/// Best effort: put `text` on the clipboard (`navigator.clipboard`).
+#[cfg(target_arch = "wasm32")]
+fn copy_text(text: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(win) = web_sys::window() else { return };
+    let Ok(clip) = js_sys::Reflect::get(&win.navigator(), &"clipboard".into()) else { return };
+    if let Ok(write) = js_sys::Reflect::get(&clip, &"writeText".into()) {
+        if let Some(f) = write.dyn_ref::<js_sys::Function>() {
+            let _ = f.call1(&clip, &text.into());
+        }
+    }
+}
+
 /// Read the `room` query parameter (Phase 6: the room to join once the
 /// design is in), if any.
 #[cfg(target_arch = "wasm32")]
@@ -1148,6 +1260,12 @@ async fn http(url: &str, method: &str, body: Option<&wasm_bindgen::JsValue>) -> 
     init.set_method(method);
     if let Some(b) = body {
         init.set_body(b);
+    }
+    // Phase 7.2: the page's link token goes with every request it makes.
+    if let Some(t) = link_token() {
+        let headers = web_sys::Headers::new().map_err(|e| format!("{e:?}"))?;
+        headers.set("Authorization", &format!("Bearer {t}")).map_err(|e| format!("{e:?}"))?;
+        init.set_headers(&headers);
     }
     let req = web_sys::Request::new_with_str_and_init(url, &init).map_err(|e| format!("{method} {url}: {e:?}"))?;
     let resp = wasm_bindgen_futures::JsFuture::from(win.fetch_with_request(&req))

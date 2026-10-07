@@ -156,6 +156,26 @@ impl Store {
         self.room_dir(room).is_dir()
     }
 
+    /// The room's key epoch (Phase 7.2): links signed for an older one are
+    /// revoked. 0 until the room's key is first rotated.
+    pub fn room_epoch(&self, room: &str) -> u64 {
+        if !is_room_name(room) {
+            return 0;
+        }
+        fs::read_to_string(self.room_dir(room).join("epoch")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+    }
+
+    /// Rotate the room's key: every link issued so far stops working.
+    pub fn bump_epoch(&self, room: &str) -> io::Result<u64> {
+        let dir = self.room_dir(room);
+        fs::create_dir_all(&dir)?;
+        let next = self.room_epoch(room) + 1;
+        let tmp = self.tmp_path();
+        fs::write(&tmp, next.to_string())?;
+        fs::rename(&tmp, dir.join("epoch"))?;
+        Ok(next)
+    }
+
     /// The room's current snapshot, if it has one.
     pub fn head(&self, room: &str) -> Option<String> {
         let s = fs::read_to_string(self.room_dir(room).join("head")).ok()?;

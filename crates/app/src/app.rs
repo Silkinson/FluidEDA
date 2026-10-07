@@ -653,6 +653,8 @@ pub struct FluidApp {
     upload: webio::UploadSlot,
     /// A streamed design's last server-side export (Phase 7.4).
     export: webio::ExportSlot,
+    /// Phase 7.2: the last link shared (or the rotation) and its outcome.
+    link: webio::LinkSlot,
     /// The export last reported in the status line.
     export_seen: Option<webio::ExportState>,
     /// The blob check ran for the current connection.
@@ -804,11 +806,7 @@ impl FluidApp {
             last_pick_us: 0.0,
             last_edit_chunks: 0,
             last_edit_ms: 0.0,
-            session: Session::new(Presence {
-                cursor: Vec2::ZERO,
-                name: "guest".to_string(),
-                color: color_from_id(0),
-            }),
+            session: page_session("guest"),
             name: "guest".to_string(),
             pending_join: room_query.is_some(),
             room: room_query.unwrap_or_else(|| "demo".to_string()),
@@ -820,6 +818,7 @@ impl FluidApp {
             reconnects: 0,
             upload: Rc::new(RefCell::new(webio::UploadState::Idle)),
             export: Rc::new(RefCell::new(webio::ExportState::Idle)),
+            link: Rc::new(RefCell::new(webio::LinkState::Idle)),
             export_seen: None,
             upload_checked: false,
             last_frame: 0.0,
@@ -887,11 +886,7 @@ impl FluidApp {
         // Fresh freeze measurement for this design (from the install frame onward).
         self.max_frame_ms = 0.0;
         self.perf_frames = 0;
-        self.session = Session::new(Presence {
-            cursor: Vec2::ZERO,
-            name: self.name.clone(),
-            color: color_from_id(0),
-        });
+        self.session = page_session(&self.name);
         // The old design's room connection went with the old session; a
         // pending `?room=` join still happens once this design is in.
         self.design_source = design.source.clone();
@@ -2933,6 +2928,37 @@ impl FluidApp {
         if let Some(d) = self.session.room_design() {
             ui.small(format!("design: {} ({})", d.name, &d.hash[..12.min(d.hash.len())]));
         }
+        // Phase 7.2: an owner's link shares the room, and can revoke.
+        if webio::link_role().as_deref() == Some("owner") && valid_room(&self.room) {
+            ui.horizontal(|ui| {
+                ui.label("share");
+                if ui.small_button("editor link").clicked() {
+                    webio::room_link(self.room.clone(), Some("editor"), self.link.clone());
+                }
+                if ui.small_button("viewer link").clicked() {
+                    webio::room_link(self.room.clone(), Some("viewer"), self.link.clone());
+                }
+                if ui.small_button("revoke all").on_hover_text("every link to this room stops working").clicked() {
+                    webio::room_link(self.room.clone(), None, self.link.clone());
+                }
+            });
+            match &*self.link.borrow() {
+                webio::LinkState::Done(l) if !l.is_empty() => {
+                    ui.small("copied to the clipboard:");
+                    let mut text = l.clone();
+                    ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY));
+                }
+                webio::LinkState::Done(_) => {
+                    ui.small("links revoked; this page has a fresh one");
+                }
+                webio::LinkState::Failed(e) => {
+                    ui.colored_label(egui::Color32::LIGHT_RED, e.to_string());
+                }
+                _ => {}
+            }
+        } else if let Some(role) = webio::link_role() {
+            ui.small(format!("your link: {role}"));
+        }
         let upload = self.upload.borrow().clone();
         if upload != webio::UploadState::Idle {
             ui.small(format!("in store: {}", upload.label()));
@@ -3339,7 +3365,7 @@ impl FluidApp {
             "{{\"connected\":{},\"peers\":{},\"edited\":{},\"moves\":{},\"deletes\":{},\"adds\":{},\"geom_edits\":{},\"selected\":{},\"selected_cell\":{},\"selected_added\":{},\"top_shapes\":{},\"drc_viols\":{},\"drc_queue\":{},\"sel_points\":{},\"sel_count\":{},\"adds_nontop\":{},\"hidden\":{},\
              \"room\":\"{}\",\"connecting\":{},\"synced\":{},\"design_hash\":\"{}\",\"room_design\":\"{}\",\
              \"room_design_name\":\"{}\",\"refused\":{},\"join_error\":\"{}\",\"upload\":\"{}\",\"reconnects\":{},\
-             \"loading\":{},\"export\":\"{}\"}}",
+             \"loading\":{},\"export\":\"{}\",\"role\":\"{}\",\"read_only\":{},\"link\":\"{}\"}}",
             self.session.is_connected(),
             self.session.remote.len(),
             edited,
@@ -3377,6 +3403,14 @@ impl FluidApp {
                 webio::ExportState::Running => "running".into(),
                 webio::ExportState::Done { hash, .. } => hash.clone(),
                 webio::ExportState::Failed(e) => format!("failed: {e}"),
+            }),
+            webio::link_role().unwrap_or_default(),
+            self.session.is_read_only(),
+            json_str(&match &*self.link.borrow() {
+                webio::LinkState::Idle => String::new(),
+                webio::LinkState::Running => "running".into(),
+                webio::LinkState::Done(l) => l.clone(),
+                webio::LinkState::Failed(e) => format!("failed: {e}"),
             }),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_state".into(), &state.into());
@@ -3417,7 +3451,21 @@ impl FluidApp {
                     self.open_room_design(&d.hash, &d.name);
                 }
             }
-            Some("edit_mode") => self.edit_mode = true,
+            Some("edit_mode") => self.edit_mode = !self.session.is_read_only(),
+            // Phase 7.2: `share editor|viewer` mints a link (owner); `rotate`
+            // revokes every link to the room.
+            Some("share") => {
+                let role = match parts.next() {
+                    Some("editor") => Some("editor"),
+                    Some("viewer") => Some("viewer"),
+                    Some("owner") => Some("owner"),
+                    _ => None,
+                };
+                if let Some(r) = role {
+                    webio::room_link(self.room.clone(), Some(r), self.link.clone());
+                }
+            }
+            Some("rotate") => webio::room_link(self.room.clone(), None, self.link.clone()),
             Some("select") => {
                 // `select <idx>` selects a TOP shape; `select <cell> <idx>` selects
                 // a specific master (SLICE 2 non-TOP editing). The placement
@@ -3871,7 +3919,13 @@ impl FluidApp {
                     st.s_evicted
                 ));
             }
-            ui.checkbox(&mut self.edit_mode, "Edit mode (click to select)");
+            if self.session.is_read_only() {
+                // Phase 7.2: a viewer link follows the room; it cannot edit.
+                self.edit_mode = false;
+                ui.small("viewing: this link cannot edit");
+            } else {
+                ui.checkbox(&mut self.edit_mode, "Edit mode (click to select)");
+            }
             if self.edit_mode {
                 // Phase 5 SLICE 1: the canvas tools + the layer new shapes draw on.
                 ui.horizontal(|ui| {
@@ -4489,14 +4543,25 @@ fn valid_room(r: &str) -> bool {
     (1..=64).contains(&r.len()) && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// This page's session (Phase 7.2: one opened with a viewer link only
+/// follows the room — the server would drop its edits anyway).
+fn page_session(name: &str) -> Session {
+    let mut s = Session::new(Presence { cursor: Vec2::ZERO, name: name.to_string(), color: color_from_id(0) });
+    s.set_read_only(webio::link_role().as_deref() == Some("viewer"));
+    s
+}
+
 /// The room socket's URL: the room plus the loaded design's identity (hash,
-/// shape-id scheme, file name), when known.
+/// shape-id scheme, file name), when known, and (Phase 7.2) the page's link.
 fn server_url(room: &str, hash: &str, name: &str) -> String {
     let mut q = format!("room={room}");
     if !hash.is_empty() {
         // "hier.gds (embedded)" → "hier.gds": drop a trailing label.
         let name = name.rsplit_once(" (").filter(|(_, r)| r.ends_with(')')).map_or(name, |(l, _)| l);
         q += &format!("&design={hash}&ids={}&name={}", fluideda_core::SHAPE_ID_SCHEME, encode_query(name));
+    }
+    if let Some(t) = webio::link_token() {
+        q += &format!("&t={}", encode_query(&t));
     }
     #[cfg(target_arch = "wasm32")]
     {

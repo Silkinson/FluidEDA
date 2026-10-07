@@ -27,6 +27,8 @@ sha2 = "0.10"
 fluideda-core = { path = "../crates/core" }
 # Phase 7.4 SLICE C: exports read edits through the client's own overlay builder.
 fluideda-sync = { path = "../crates/sync" }
+# Phase 7.2: the signing secret for capability links.
+getrandom = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

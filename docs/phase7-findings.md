@@ -872,3 +872,87 @@ Correctness: 3 app tests (new: nearby records share a request, a wide gap
 or a full request starts the next). The browser suites pass: stream 11
 (pixel identity at eight views, residency under 16 MB and 0.25 MB
 budgets), streamed edit 11, sync 33, sync STREAMED 34.
+
+## 7.2 — auth and room permissions
+
+**Problem.** Anyone who could reach the server could join any room, read
+its state and upload blobs of up to 16 GiB. That is fine on 127.0.0.1 and
+unusable beyond it.
+
+**Design: capability links** (the owner's choice; no identity provider).
+- **Tokens.** A token reads `room.role.expires.epoch.signature`.
+  - Roles: viewer, editor, owner.
+  - `expires` is in Unix seconds; 0 means never.
+  - The signature is HMAC-SHA256 under the server's secret, `store/secret`:
+    32 random bytes made on first start.
+  - A token is readable, which is how the app knows its role, but it cannot
+    be altered or forged. HMAC is implemented on the existing `sha2` and
+    checked against RFC 4231's test vector; signatures are compared in
+    constant time.
+- **Revocation.** Each room has a key epoch, signed into its tokens.
+  `POST /rooms/<r>/rotate` (owner) bumps it, so every link issued before
+  stops working. It answers with a fresh owner token, because the caller's
+  own was revoked too.
+- **Enforcement.** A token comes as `Authorization: Bearer`, or `?t=` where
+  headers cannot be set (WebSockets).
+  - **The socket:** any role in the room. A refused peer gets
+    `{"error":"unauthorized"}` and close code 4401. A **viewer's document
+    updates are dropped by the server** (presence is relayed), so a viewer
+    is read-only by construction, not only by its UI.
+  - **`GET /rooms/<r>` and `POST /rooms/<r>/export`:** any role in the room.
+  - **`GET /packs/<d>`:** any role in a room bound to design `d`.
+  - **`POST /export/<d>`:** editor or owner there.
+  - **`PUT /blobs`:** editor or owner of any room, within a per-token quota
+    (`FLUIDEDA_UPLOAD_QUOTA_GB`, default 32).
+  - **`GET /blobs/<h>`:** needs no token. A SHA-256 cannot be guessed, and
+    hashes are only revealed through the endpoints above.
+- **Sharing.** `POST /rooms/<r>/share?role=editor|viewer[&ttl=]` (owner)
+  mints a link token. `fluideda-server token <room> owner [ttl]` prints the
+  first owner link from the command line.
+- **Default.** Links are required unless the server listens only on
+  loopback (`FLUIDEDA_AUTH=on|off` overrides). The dev setup and every
+  existing test therefore run unchanged.
+- **TLS** belongs to a reverse proxy in front of the server.
+- **Client.**
+  - A page's `?t=` goes with every request: `Bearer` on HTTP, `&t=` on the
+    socket.
+  - An owner's room panel offers **Share: editor link, viewer link** (copied
+    to the clipboard) and **Revoke all**. After a revoke, the page keeps its
+    fresh owner token, in memory and in its address.
+  - A viewer link makes the session read-only (every mutation is refused),
+    and edit mode is unavailable.
+
+**Tested.**
+- **Server, every endpoint** against no token, forged, expired, viewer,
+  editor, owner, and another room's editor (6 endpoints × 7 tokens).
+  - New uploads by viewers are refused and by editors stored; blobs need no
+    token.
+  - A rotation revokes viewer, editor and owner links, while the fresh owner
+    token and another room's links keep working.
+  - With links off, everything works without a token.
+- **Server, over real sockets:** a viewer follows an editor's edits live.
+  Its own edit stays on its screen and never reaches the room's document or
+  its WAL; a restore from disk holds only the editor's edits. Pages with no
+  link or a forged one are refused before any state moves.
+- **Tokens:** altered role, room or signature, another secret, expiry,
+  epoch. Roles are ordered.
+- **Browser** (`scripts/auth_test.mjs`, server with `FLUIDEDA_AUTH=on`, the
+  owner link from the CLI). All 9 checks pass:
+  - the owner's link can edit;
+  - `share viewer` gives a room link;
+  - the viewer, read-only, follows the owner's delete live;
+  - its delete, nudge and drawn rectangle change nothing on either screen;
+  - pages with no link or a forged one are refused at join;
+  - after a rotation the old viewer link is refused, and the owner's fresh
+    token shares a new link that works.
+- The existing suites pass with links off: stream 11, streamed edit 11,
+  sync 33, sync STREAMED 34, persistence 11.
+- Unit and integration tests: 3 token tests, 3 integration tests (the
+  endpoint matrix, links off, live viewer over sockets) and 1 sync test (a
+  read-only session only follows).
+
+**Not done.**
+- A rotation does not disconnect sockets that are already open; it stops
+  new joins and requests.
+- Quotas are per token and kept in memory, so they reset on restart.
+- There are no accounts: whoever holds a link has its role.

@@ -154,6 +154,9 @@ pub struct Session {
     /// Called when the socket has news (Phase 7.1a: an idle UI draws only
     /// when woken).
     wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Phase 7.2: a viewer's session. Every mutation is refused here (the
+    /// server drops a viewer's updates too).
+    read_only: bool,
     /// Per-client counter minting [`AddId`]s for shapes drawn in this session.
     /// `(client_id, seq)` is unique across peers (distinct client ids) and across
     /// this session's own adds (monotonic seq) — the id survives concurrent adds.
@@ -214,6 +217,7 @@ impl Session {
             remote: HashMap::new(),
             client_id,
             wakeup: None,
+            read_only: false,
             next_add_seq: 0,
         }
     }
@@ -383,8 +387,21 @@ impl Session {
         sock.tx.send(WsMessage::Binary(buf));
     }
 
+    /// Phase 7.2: a viewer link's session refuses every edit, undo and
+    /// marker; it only follows the room.
+    pub fn set_read_only(&mut self, on: bool) {
+        self.read_only = on;
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     /// Add a shared marker; broadcasts to peers.
     pub fn add_marker(&mut self, m: Marker) {
+        if self.read_only {
+            return;
+        }
         {
             let mut txn = self.doc.transact_mut();
             let entry = MapPrelim::from([
@@ -414,6 +431,9 @@ impl Session {
     /// Last-writer-wins per shape id: two peers editing the *same* shape converge
     /// on one entry; editing *different* shapes keeps both.
     pub fn set_edit(&mut self, id: BaseShapeId, kind: EditKind) {
+        if self.read_only {
+            return;
+        }
         let key = key_of(id);
         let value = edit_value(&kind);
         {
@@ -429,6 +449,9 @@ impl Session {
     /// for the batch's `Add` ops, in order.
     pub fn apply_batch(&mut self, ops: Vec<BatchOp>) -> Vec<AddId> {
         let mut minted = Vec::new();
+        if self.read_only {
+            return minted;
+        }
         {
             let mut txn = self.doc.transact_mut_with(self.origin.clone());
             for op in ops {
@@ -516,6 +539,9 @@ impl Session {
     /// (An overwrite, not a key removal, so a concurrent geometry rewrite and a
     /// delete converge by plain LWW like every other pair of ops.)
     pub fn delete_added(&mut self, id: AddId) {
+        if self.read_only {
+            return;
+        }
         {
             let mut txn = self.doc.transact_mut_with(self.origin.clone());
             self.edits.insert(&mut txn, add_key_of(id), "X".to_string());
@@ -524,6 +550,9 @@ impl Session {
     }
 
     fn write_add(&mut self, id: AddId, cell: CellId, layer: Layer, points: &[Point]) {
+        if self.read_only {
+            return;
+        }
         let value = add_value(cell, layer, points);
         {
             let mut txn = self.doc.transact_mut_with(self.origin.clone());
@@ -550,6 +579,9 @@ impl Session {
     /// Undo the last **local** edit (per-user: the UndoManager tracks only this
     /// client's origin). Broadcasts the revert. Returns true if anything changed.
     pub fn undo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         let changed = self.undo.undo().unwrap_or(false);
         if changed {
             self.broadcast_local();
@@ -559,6 +591,9 @@ impl Session {
 
     /// Redo the last undone local edit. Broadcasts. Returns true if changed.
     pub fn redo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
         let changed = self.undo.redo().unwrap_or(false);
         if changed {
             self.broadcast_local();
@@ -1003,6 +1038,24 @@ mod tests {
 
     fn tri(x: i32, y: i32) -> Vec<Point> {
         vec![Point::new(x, y), Point::new(x + 100, y), Point::new(x + 100, y + 80), Point::new(x, y)]
+    }
+
+    /// Phase 7.2: a viewer's session refuses every mutation, but still
+    /// follows the room.
+    #[test]
+    fn a_read_only_session_only_follows() {
+        let mut v = Session::new(Presence { cursor: Vec2::ZERO, name: "v".into(), color: [0.0; 4] });
+        let mut e = Session::new(Presence { cursor: Vec2::ZERO, name: "e".into(), color: [0.0; 4] });
+        v.set_read_only(true);
+        v.set_edit((0, 1), EditKind::Delete);
+        let id = v.add_shape(0, Layer::new(1, 0), &tri(0, 0));
+        v.delete_added(id);
+        v.apply_batch(vec![BatchOp::Hide((0, 1, 0, 0)), BatchOp::Edit((0, 2), EditKind::Delete)]);
+        assert!(!v.undo() && !v.redo());
+        assert!(v.edits().is_empty() && v.adds().is_empty() && v.hidden().is_empty());
+        e.set_edit((0, 3), EditKind::Move { dx: 1, dy: 2 });
+        v.apply_remote(&e.state()).unwrap();
+        assert_eq!(v.edits(), vec![((0, 3), EditKind::Move { dx: 1, dy: 2 })]);
     }
 
     #[test]
