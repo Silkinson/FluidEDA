@@ -722,3 +722,66 @@ runs, despite keep-awake: about 15 minutes asleep, then a short wake. Three
 measurements that crossed a sleep are left out of the table: one load's
 wall time (1,051 s), one OASIS save (962 s), and one streamed edit run, which
 timed out waiting for a frame and passed when re-run.
+
+## 7.1b — randomized convergence
+
+**Problem.** Convergence was tested only by hand-picked scenarios. The
+document carries moves, deletes, vertex rings, adds, batches, hidden
+placements and undo; bugs would hide in their interleavings.
+
+**Design.**
+- `crates/sync/tests/convergence.rs` (proptest). Three peers make up to 600
+  random operations over a small id space (8 base shapes, a few adds, 24
+  placements), so they collide constantly:
+  - moves, deletes and vertex edits of base shapes;
+  - adds, their edits and deletes;
+  - hiding and showing placements;
+  - batches of those, undo and redo.
+- Delivery follows the room. Every update enters one log in the order it
+  was made, the order the room relays it in, and each peer reads the log at
+  its own random pace. Some updates arrive twice, and a peer can fall behind
+  until the end.
+- Properties:
+  - after everything is delivered, every peer holds the same edits, adds
+    and hidden placements;
+  - an undo or redo changes only entries its own peer wrote; it never
+    reverts another peer's edit.
+- `server/tests/room_convergence.rs` puts a real `Room` in the loop. It
+  applies, logs and relays every update. At random points it writes a
+  snapshot, or crashes: the WAL is cut at a random byte (losing an
+  arbitrary suffix, more than a process crash can) and the room is restored
+  from disk. Peers then reconnect: each takes the room's state and pushes
+  its own. After everything is delivered, the room's document equals every
+  peer's.
+- Sessions gained transport-free sync hooks: `state_vector`,
+  `update_since` and `apply_remote` (the socket path now uses
+  `apply_remote`). Tests also get fixed client ids, so a failing case
+  replays and shrinks exactly.
+
+**Measured.**
+- 256 cases in 8.9 s, and 64 server cases in 7.9 s (debug builds; the
+  acceptance asked for 256 in under 30 s).
+- The tests have teeth. Without the reconnect push, the server variant
+  fails on its first case.
+
+**Found: yrs does not converge if updates arrive in an arbitrary order.**
+- **yrs 0.19.2 (ours) drops a deletion that arrives before anything from
+  its item's client.** `apply_delete` neither applies those ranges nor keeps
+  them pending. Minimal reproduction: P inserts `k`, then removes it; R
+  applies the removal first and the insert second, and R keeps `k`. The
+  same function also records the wrong range when a deletion straddles the
+  known clock.
+- **yrs 0.28 fixes that case but still diverges.** In a case shrunk to 23
+  operations, a map key written by three peers, with one peer's undo and
+  redo, ended deleted on one peer and set on the others.
+- **None of this is reachable in FluidEDA.** The room applies updates in
+  arrival order and relays them in that order. A peer sends its own updates
+  in order, after everything it has seen, so every peer receives updates in
+  causal order. Reconnects and lagging peers exchange whole states, which
+  are self-contained.
+- The property is therefore checked under causal delivery, which is what
+  the room provides. `CONV_REORDER=1` runs the arbitrary-order variant, as
+  a check for a future yrs. Upgrading would not change our correctness and
+  is left out of Phase 7: 0.28 compiled with five small API changes (undo
+  construction, blocking undo and redo, `ClientID`, `apply_update`'s
+  `Result`).

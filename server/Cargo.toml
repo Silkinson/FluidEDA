@@ -32,3 +32,5 @@ fluideda-sync = { path = "../crates/sync" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 glam.workspace = true
+# Phase 7.1b: randomized convergence through a crashing room.
+proptest = "1"

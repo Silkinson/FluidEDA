@@ -11,3 +11,7 @@ ewebsock.workspace = true
 glam.workspace = true
 log.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# Phase 7.1b: randomized convergence (tests/convergence.rs).
+proptest = "1"

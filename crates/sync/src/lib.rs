@@ -35,6 +35,7 @@ use std::sync::Arc;
 use yrs::types::ToJson;
 use yrs::undo::{Options as UndoOptions, UndoManager};
 use yrs::updates::decoder::Decode;
+use yrs::updates::encoder::Encode;
 use yrs::{
     Any, Array, ArrayRef, Doc, Map, MapPrelim, MapRef, Origin, Out, ReadTxn, StateVector, Transact,
 };
@@ -164,7 +165,17 @@ impl Session {
     /// no socket. Editing and undo work immediately; [`join`](Self::join)
     /// connects later.
     pub fn new(local: Presence) -> Self {
-        let doc = Doc::new();
+        Self::with_doc(Doc::new(), local)
+    }
+
+    /// [`new`](Self::new) with a fixed CRDT client id, which must be unique
+    /// per peer (Phase 7.1b: a test replays a failing sequence exactly).
+    #[doc(hidden)]
+    pub fn with_client_id(local: Presence, client_id: u64) -> Self {
+        Self::with_doc(Doc::with_client_id(client_id), local)
+    }
+
+    fn with_doc(doc: Doc, local: Presence) -> Self {
         let markers = doc.get_or_insert_array("markers");
         let edits = doc.get_or_insert_map("edits");
         let meta = doc.get_or_insert_map("meta");
@@ -563,6 +574,34 @@ impl Session {
         !self.undo.redo_stack().is_empty()
     }
 
+    // --- diff sync (Phase 7.1b) -------------------------------------------------
+    //
+    // The socket's exchange without the socket: a test (or another transport)
+    // moves updates between sessions and a server room with these.
+
+    /// This session's state vector (v1): what another document needs to send
+    /// it everything it lacks ([`update_since`](Self::update_since)).
+    pub fn state_vector(&self) -> Vec<u8> {
+        self.doc.transact().state_vector().encode_v1()
+    }
+
+    /// Everything this session holds that a document at state vector `sv`
+    /// lacks, as one v1 update.
+    pub fn update_since(&self, sv: &[u8]) -> Result<Vec<u8>> {
+        let sv = StateVector::decode_v1(sv)?;
+        Ok(self.doc.transact().encode_state_as_update_v1(&sv))
+    }
+
+    /// Apply a v1 update from elsewhere exactly as one arriving on the
+    /// socket: with no origin, so it is not on this session's undo stack,
+    /// and is not sent back out. Fails only if it does not decode.
+    pub fn apply_remote(&mut self, update: &[u8]) -> Result<()> {
+        let update = yrs::Update::decode_v1(update)?;
+        self.doc.transact_mut().apply_update(update);
+        self.last_sv = self.doc.transact().state_vector();
+        Ok(())
+    }
+
     // --- transport -----------------------------------------------------------
 
     /// Send the delta since `last_sv` (the changes a local op just made), then
@@ -634,14 +673,9 @@ impl Session {
         for buf in incoming {
             match buf.first().copied() {
                 Some(tag::DOC) => {
-                    if let Ok(update) = yrs::Update::decode_v1(&buf[1..]) {
-                        // No origin ⇒ the local UndoManager ignores it (per-user
-                        // undo), and it is not re-broadcast (see last_sv advance).
-                        {
-                            let mut txn = self.doc.transact_mut();
-                            let _ = txn.apply_update(update);
-                        }
-                        self.last_sv = self.doc.transact().state_vector();
+                    // No origin ⇒ the local UndoManager ignores it (per-user
+                    // undo), and it is not re-broadcast (see last_sv advance).
+                    if self.apply_remote(&buf[1..]).is_ok() {
                         self.synced = true;
                         changed = true;
                     }
