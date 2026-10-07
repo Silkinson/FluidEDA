@@ -785,3 +785,90 @@ placements and undo; bugs would hide in their interleavings.
   is left out of Phase 7: 0.28 compiled with five small API changes (undo
   construction, blocking undo and redo, `ClientID`, `apply_update`'s
   `Result`).
+
+## 7.1c — batched and prefetched chunk fetches
+
+**Problem.** A streamed view fetched each chunk with its own HTTP request:
+about 26 per one-screen pan on caravel's pad ring. On localhost that costs
+nothing. Over a network, HTTP/1.1's six connections per host queue those
+requests behind each other, a round trip each, and nothing was fetched ahead
+of the view: every pan showed proxies until its chunks arrived.
+
+**Design.**
+- **Batching.** A frame's chunk fetches are sorted by offset in the
+  geometry blob. Records at most 128 KiB apart share one range request, up
+  to 8 MiB; the gap is downloaded and dropped. The tessellation worker
+  fetches the range once and splits it by the chunks' own offsets. Each
+  chunk is still tessellated and answered on its own, so nothing downstream
+  changed. Up to 64 fetches are dispatched per frame and 128 kept in
+  flight (they were 8 and 32 chunks); the per-frame upload limit still
+  bounds what a frame costs.
+- **Prefetch ring.** Once everything on screen is drawn and nothing is in
+  flight, the app culls the area one screen around the view at the current
+  zoom: 3 × 3 screens, with the same density rule. It fetches what is
+  missing there, placement lists first and the shapes under them on a later
+  pass, batched the same way, once per view. Prefetched chunks join the
+  same LRU, and eviction drops older views' chunks first.
+  (`?noprefetch` turns the ring off, for a same-build A/B.)
+- **A latency harness.** `FLUIDEDA_LATENCY_MS` makes the server wait before
+  every blob read, standing in for a round trip.
+  - `pan_bench.mjs` pans one screen at a time along the pad ring and
+    reports, per step: requests sent, time until the view is drawn, and
+    whether the first frame showed proxies.
+  - Between steps the page rests until idle (at most 3 s), as a user's
+    pause would.
+  - A view counts as drawn when no on-screen chunk is missing and no
+    placement list it needs is missing. Placement fetches still in flight
+    may be the prefetch's, for the next view.
+- The perf JSON gained `requests`, `unfilled` (on-screen chunks not drawn
+  yet) and `prefetched`.
+
+**Measured** (20 one-screen pans along caravel's pad ring, streamed, WebGPU):
+
+| | before (7.9) | batching only (`?noprefetch`) | batching + ring (7.1c) |
+|---|--:|--:|--:|
+| 80 ms latency: requests per pan | 26.3 | 3.8 | **4.7** |
+| 80 ms: time until the view is drawn (median) | 353 ms | 187 ms | **16–20 ms** |
+| 80 ms: pans with no proxies on the first frame | 5% | 5% | **100%** |
+| 80 ms: bytes per pan | 1.45 MB | 1.54 MB | 1.72 MB |
+| no added latency: requests · drawn in · no proxies | 25.9 · 26 ms · 20% | | **4.7 · 16 ms · 100%** |
+
+Where the columns come from:
+- "Before": the 7.9 commit, served from a worktree.
+- "Batching only": this build with `?noprefetch`.
+- "Batching + ring": this build, in two runs (16 and 20 ms, 100% both).
+
+Earlier runs, before the ring was bounded, agreed: 7.9 at 349–353 ms.
+
+The plan's acceptance:
+- **≤ 1/5 of the requests per view:** 4.7 of 26.3, or 0.18. ✓
+- **A view drawn within 1.5 × RTT + tessellation:** 16–20 ms with the ring. ✓
+  Batching alone takes 187 ms, about two round trips: a placement list has
+  to arrive before the shapes under it are known.
+- **≥ 80% of pans with no proxies:** 100%. ✓
+- **Pixel identity unchanged:** the stream test still finds streamed views
+  equal to in-core. ✓
+
+The ring costs about 19% more bytes per pan (the strip ahead and its
+neighbours above and below).
+
+**Found on the way.** Under a GPU budget smaller than the ring (the stream
+test's 16 MB), prefetch and eviction looped. The ring fetched chunks,
+eviction dropped them (they were off screen), and the next pass fetched
+them again; the stream test never settled. Now:
+- a chunk or placement list the ring fetched is not fetched again for the
+  same view;
+- the ring stops at half the GPU budget, by an estimate of three times the
+  record bytes.
+
+Under the 16 MB budget the residency check holds over 25 views (0
+violations).
+
+Placement chunks are still fetched one request each on the main thread;
+the pad ring needs few. Batching them the same way is left for a later
+slice.
+
+Correctness: 3 app tests (new: nearby records share a request, a wide gap
+or a full request starts the next). The browser suites pass: stream 11
+(pixel identity at eight views, residency under 16 MB and 0.25 MB
+budgets), streamed edit 11, sync 33, sync STREAMED 34.

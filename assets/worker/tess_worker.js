@@ -16,9 +16,12 @@
 //
 // Phase 6 SLICE 3 — streaming: the chunk's geometry is not on the main thread
 // at all. The worker fetches the chunk's record, one byte range of the design
-// pack's immutable geometry blob, and tessellates that:
-//   in : { type:'tess_fetch', cell, chunk, gen, url, start, end }
-//   out: tess_done (as above) + fetch_bytes, fetch_ms
+// pack's immutable geometry blob, and tessellates that. Phase 7.1c: one
+// request carries every chunk whose record lies close to the others in the
+// blob — one byte range, split here by the chunks' own offsets:
+//   in : { type:'tess_fetch', gen, url, start, end, items: [{ cell, chunk, start, end }] }
+//   out: one tess_done (as above) per item, + fetch_bytes and fetch_ms (the
+//        request's: its bytes on the first item, 0 on the others)
 // Record layout (crates/core/src/pack.rs), little-endian, 4-byte aligned:
 //   [n u32][nc u32][starts (n+1) u32][layers n u32][kinds n u8, padded to 4]
 //   [coords nc i32] — `kinds` (Phase 7.7): a rectangle is stored as its two
@@ -67,19 +70,45 @@ async function fetchRecord(msg) {
 
 self.onmessage = async (e) => {
   const msg = e.data || {};
-  if (msg.type !== 'tess' && msg.type !== 'tess_fetch') return;
-  try {
-    let coords, starts, layers, kinds, fetched = null;
-    if (msg.type === 'tess_fetch') {
+  if (msg.type === 'tess') {
+    // coords/starts/layers are transferred ArrayBuffers (moved from main).
+    await job(msg, {
+      coords: new Int32Array(msg.coords),
+      starts: new Uint32Array(msg.starts),
+      layers: new Uint32Array(msg.layers),
+      kinds: new Uint8Array(msg.kinds),
+    }, null);
+  } else if (msg.type === 'tess_fetch') {
+    let fetched;
+    try {
       fetched = await fetchRecord(msg);
-      ({ coords, starts, layers, kinds } = recordColumns(fetched.buf));
-    } else {
-      // coords/starts/layers are transferred ArrayBuffers (moved from main).
-      coords = new Int32Array(msg.coords);
-      starts = new Uint32Array(msg.starts);
-      layers = new Uint32Array(msg.layers);
-      kinds = new Uint8Array(msg.kinds);
+    } catch (err) {
+      for (const it of msg.items) fail(it, msg.gen, err);
+      return;
     }
+    for (const [i, it] of msg.items.entries()) {
+      // Each record gets a buffer of its own (typed views need it aligned).
+      const buf = fetched.buf.slice(it.start - msg.start, it.end - msg.start);
+      const info = { bytes: i === 0 ? fetched.buf.byteLength : 0, ms: fetched.fetch_ms };
+      let cols;
+      try {
+        cols = recordColumns(buf);
+      } catch (err) {
+        fail(it, msg.gen, err);
+        continue;
+      }
+      await job({ cell: it.cell, chunk: it.chunk, gen: msg.gen }, cols, info);
+    }
+  }
+};
+
+function fail(it, gen, err) {
+  self.postMessage({ type: 'tess_error', cell: it.cell, chunk: it.chunk, gen, message: String((err && err.message) || err) });
+}
+
+// Tessellate one chunk's columns and send the meshes back.
+async function job(msg, { coords, starts, layers, kinds }, fetched) {
+  try {
     await ready;
     const r = wasm_bindgen.tessellate(coords, starts, layers, kinds); // the heavy work, off-main
 
@@ -99,19 +128,13 @@ self.onmessage = async (e) => {
         index_counts: index_counts.buffer,
         verts: verts.buffer,
         indices: indices.buffer,
-        fetch_bytes: fetched ? fetched.buf.byteLength : 0,
-        fetch_ms: fetched ? fetched.fetch_ms : 0,
+        fetch_bytes: fetched ? fetched.bytes : 0,
+        fetch_ms: fetched ? fetched.ms : 0,
       },
       [mesh_layers.buffer, vert_counts.buffer, index_counts.buffer, verts.buffer, indices.buffer]
     );
     r.free();
   } catch (err) {
-    self.postMessage({
-      type: 'tess_error',
-      cell: msg.cell,
-      chunk: msg.chunk,
-      gen: msg.gen,
-      message: String((err && err.message) || err),
-    });
+    fail(msg, msg.gen, err);
   }
-};
+}

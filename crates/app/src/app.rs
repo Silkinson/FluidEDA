@@ -35,8 +35,24 @@ const REJOIN_MAX_S: f64 = 8.0;
 /// A cell projecting smaller than this many pixels becomes an LOD proxy.
 const MIN_PIXEL: f64 = 4.0;
 
-/// Streaming: chunk fetches in flight at once.
-const STREAM_MAX_IN_FLIGHT: usize = 32;
+/// Streaming: chunk fetches in flight at once (chunks, not requests: since
+/// Phase 7.1c a request carries several).
+const STREAM_MAX_IN_FLIGHT: usize = 128;
+/// Phase 7.1c: chunk fetches dispatched per frame. Posting one is a small
+/// message; the per-frame upload limit bounds what a frame really costs.
+const STREAM_FETCHES_PER_FRAME: usize = 64;
+/// Phase 7.1c: chunk records at most this far apart in the geometry blob go
+/// out as one range request, the gap downloaded and dropped. At an 80 ms
+/// round trip, 128 KiB more costs less than another request.
+const STREAM_MERGE_GAP: u64 = 128 << 10;
+/// Phase 7.1c: the most one request fetches.
+const STREAM_BATCH_BYTES: u64 = 8 << 20;
+/// Phase 7.1c: chunks the prefetch ring asks for per pass.
+const STREAM_PREFETCH_MAX: usize = 128;
+/// Phase 7.1c: a chunk's GPU geometry is about this many times its record's
+/// size (a rectangle's 25-byte record becomes 56 bytes of mesh). The ring
+/// stops at half the GPU budget by this estimate.
+const STREAM_GPU_PER_RECORD_BYTE: u64 = 3;
 /// Streaming: GPU geometry kept before the least recently drawn chunks are
 /// evicted (they are fetched again — from the HTTP cache — when needed).
 /// `?stream_budget=<MB>` overrides it.
@@ -76,6 +92,35 @@ fn budget_param(name: &str, default: usize) -> usize {
         .and_then(|mb| mb.parse::<f64>().ok())
         .filter(|mb| *mb >= 0.0)
         .map_or(default, |mb| (mb * 1048576.0) as usize)
+}
+
+/// Phase 7.1c: split `items` (cell, chunk, start, end), sorted by offset,
+/// into runs that can share one range request: records at most
+/// [`STREAM_MERGE_GAP`] apart, at most [`STREAM_BATCH_BYTES`] per run.
+fn batches(items: &[(usize, u32, u64, u64)]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut from = 0;
+    for i in 1..=items.len() {
+        let joins = i < items.len()
+            && items[i].2 <= items[i - 1].3 + STREAM_MERGE_GAP
+            && items[i].3 - items[from].2 <= STREAM_BATCH_BYTES;
+        if !joins {
+            runs.push(from..i);
+            from = i;
+        }
+    }
+    runs
+}
+
+/// Phase 7.1c: post `items` to the tessellation worker as few range
+/// requests as their offsets allow ([`batches`]). Returns the requests sent.
+fn post_batched(w: &webio::TessWorker, gen: u32, url: &str, mut items: Vec<(usize, u32, u64, u64)>) -> usize {
+    items.sort_unstable_by_key(|it| it.2);
+    let runs = batches(&items);
+    for r in &runs {
+        w.post_fetch(gen, url, &items[r.clone()]);
+    }
+    runs.len()
 }
 
 /// Snap a world coordinate (nm, f32 out of the camera) onto the drawing grid.
@@ -157,6 +202,18 @@ struct Stream {
     retess: HashSet<(CellId, u32)>,
     /// The suppressed shapes each drawn edited chunk was tessellated without.
     drawn_suppressed: HashMap<(CellId, u32), Vec<u32>>,
+
+    // Phase 7.1c: batched requests and the prefetch ring.
+    /// Geometry range requests sent (each carries one or more chunks).
+    requests: usize,
+    /// On-screen chunks not drawn yet this frame (their proxies show).
+    unfilled: usize,
+    /// Chunks fetched ahead of the view.
+    prefetched: usize,
+    /// The prefetch ring of the current view.
+    ring: Ring,
+    /// The ring is on (`?noprefetch` turns it off: the same-build A/B).
+    prefetch: bool,
 }
 
 impl Stream {
@@ -208,6 +265,11 @@ impl Stream {
             edit_wants: HashSet::new(),
             retess: HashSet::new(),
             drawn_suppressed: HashMap::new(),
+            requests: 0,
+            unfilled: 0,
+            prefetched: 0,
+            ring: Ring::default(),
+            prefetch: !webio::query_flag("noprefetch"),
         }
     }
 
@@ -243,6 +305,21 @@ impl Stream {
         webio::fetch_shape_chunk(self.info.geometry_url.clone(), start, end, key.0, key.1, self.gen, self.shapes.clone());
         self.s_inflight.insert(key);
     }
+}
+
+/// Phase 7.1c: what the prefetch ring has done for one view. A chunk it
+/// fetched is never fetched again for the same view, even if evicted: under
+/// a budget smaller than the ring that would loop.
+#[derive(Default)]
+struct Ring {
+    /// The view (center and scale, as bits).
+    view: Option<(u32, u32, u32)>,
+    fetched: HashSet<(CellId, u32)>,
+    /// Placement chunks it asked for.
+    placements: HashSet<(CellId, u32)>,
+    /// Estimated GPU bytes fetched for this view.
+    bytes: u64,
+    done: bool,
 }
 
 /// A pick on a streamed design waiting for the chunks under its point
@@ -1917,6 +1994,7 @@ impl FluidApp {
             }
             self.gpu_bytes = renderer.uploaded_bytes();
             self.draw_calls = renderer.draw_calls();
+            self.stream_prefetch();
             return;
         }
 
@@ -2271,9 +2349,12 @@ impl FluidApp {
     ) -> usize {
         let Some(st) = self.stream.as_mut() else { return 0 };
         st.dense = 0;
+        st.unfilled = 0;
         let now = self.last_frame;
-        let mut dispatched = 0usize;
+        let (mut dispatched, mut posted) = (0usize, 0usize);
         let mut rebuilt = 0usize;
+        // This frame's fetches, sent as few range requests as they allow.
+        let mut batch: Vec<(usize, u32, u64, u64)> = Vec::new();
         // Edited chunks on the GPU (Phase 7.4): redraw one whose suppressed
         // shapes changed from its copy in memory. Until the copy arrives the
         // old drawing stays (no proxy flash).
@@ -2316,13 +2397,14 @@ impl FluidApp {
                 st.last_drawn.insert(key, st.frame);
                 continue;
             }
-            if self.tess_pending.contains(&key) || st.retry_at.get(&key).is_some_and(|&t| now < t) {
-                continue;
-            }
             // Density (the cull's call since 7.6): fetch only once every
             // shape gets a pixel or more.
             if d.dense {
                 st.dense += 1;
+                continue;
+            }
+            st.unfilled += 1;
+            if self.tess_pending.contains(&key) || st.retry_at.get(&key).is_some_and(|&t| now < t) {
                 continue;
             }
             // An edited chunk draws without its suppressed shapes, from its
@@ -2347,7 +2429,10 @@ impl FluidApp {
                     continue;
                 }
             }
-            if self.tess_pending.len() >= STREAM_MAX_IN_FLIGHT || dispatched >= TESS_JOBS_PER_FRAME {
+            if self.tess_pending.len() >= STREAM_MAX_IN_FLIGHT
+                || dispatched >= STREAM_FETCHES_PER_FRAME
+                || posted >= TESS_JOBS_PER_FRAME
+            {
                 self.backlog += 1;
                 continue; // stays a proxy this frame
             }
@@ -2368,12 +2453,18 @@ impl FluidApp {
                     Some((store, _)) => {
                         let (coords, starts, layers, kinds) = store.chunk_columns(0, store.len() as u32);
                         w.post(d.cell, d.chunk, self.tess_gen, coords, &starts, layers, kinds);
+                        posted += 1;
                     }
-                    None => w.post_fetch(d.cell, d.chunk, self.tess_gen, &st.info.geometry_url, start, end),
+                    None => {
+                        batch.push((d.cell, d.chunk, start, end));
+                        dispatched += 1;
+                    }
                 }
                 self.tess_pending.insert(key);
-                dispatched += 1;
             }
+        }
+        if let Some(w) = &self.tess {
+            st.requests += post_batched(w, self.tess_gen, &st.info.geometry_url, batch);
         }
         // Over budget: drop the least recently drawn chunks (never this frame's).
         if renderer.uploaded_bytes() > st.budget {
@@ -2393,6 +2484,82 @@ impl FluidApp {
         }
         st.stale = st.last_drawn.values().filter(|&&f| f < st.frame).count();
         rebuilt
+    }
+
+    /// Phase 7.1c: once everything on screen is drawn, fetch what lies one
+    /// screen around the view at this zoom, so a pan of up to a screen finds
+    /// it ready. It comes after the view: it waits until nothing is in
+    /// flight, and covers each view once. Over the GPU budget, eviction drops
+    /// the least recently drawn chunks (older views'), not these. Placement
+    /// chunks the ring needs come first; the shapes under them on a later
+    /// pass.
+    fn stream_prefetch(&mut self) {
+        let Some(st) = self.stream.as_mut() else { return };
+        if !st.prefetch || st.unfilled > 0 || !self.tess_pending.is_empty() || self.backlog > 0 {
+            return;
+        }
+        let Some(w) = &self.tess else { return };
+        let here = (self.camera.center.x.to_bits(), self.camera.center.y.to_bits(), self.camera.scale.to_bits());
+        if st.ring.view != Some(here) {
+            st.ring = Ring { view: Some(here), ..Ring::default() };
+        }
+        if st.ring.done {
+            return;
+        }
+        let cap = st.budget as u64 / 2;
+        let now = self.last_frame;
+        let scale = self.camera.scale as f64;
+        let (half_w, half_h) = (1.5 * self.camera.viewport.x as f64 / scale, 1.5 * self.camera.viewport.y as f64 / scale);
+        let (cx, cy) = (self.camera.center.x as f64, self.camera.center.y as f64);
+        let ring = cull(&self.db, &fluideda_core::Bboxf::new(cx - half_w, cy - half_h, cx + half_w, cy + half_h), scale, MIN_PIXEL);
+        let mut more = false;
+        for &key in &ring.placements_wanted {
+            let resident = self.db.cells[key.0].remote.as_ref().and_then(|r| r.chunks.get(key.1 as usize)).is_some_and(|c| c.is_some());
+            if resident || st.p_retry_at.get(&key).is_some_and(|&t| now < t) {
+                continue;
+            }
+            if st.p_inflight.contains(&key) {
+                more = true; // on its way: look again once it is here
+            } else if !st.ring.placements.contains(&key) {
+                more = true;
+                if st.p_inflight.len() < STREAM_PLACEMENTS_IN_FLIGHT {
+                    st.ring.placements.insert(key);
+                    st.fetch_placements(key, self.db.cells.len());
+                }
+            }
+        }
+        let mut items = Vec::new();
+        for d in &ring.draws {
+            let key = (d.cell, d.chunk);
+            if d.dense
+                || self.uploaded.contains(&key)
+                || self.tess_pending.contains(&key)
+                || st.ring.fetched.contains(&key)
+                || st.retry_at.get(&key).is_some_and(|&t| now < t)
+                || self.db.cells[d.cell].chunk_store(d.chunk as usize).is_some()
+            {
+                continue; // drawn, on its way, done for this view, or in memory
+            }
+            let (start, end) = st.range(d.cell, d.chunk);
+            let bytes = (end - start) * STREAM_GPU_PER_RECORD_BYTE;
+            if st.ring.bytes + bytes > cap {
+                more = false; // the ring is as big as the budget allows
+                break;
+            }
+            if items.len() == STREAM_PREFETCH_MAX {
+                more = true;
+                break;
+            }
+            st.ring.bytes += bytes;
+            st.ring.fetched.insert(key);
+            items.push((d.cell, d.chunk, start, end));
+        }
+        for it in &items {
+            self.tess_pending.insert((it.0, it.1));
+        }
+        st.prefetched += items.len();
+        st.requests += post_batched(w, self.tess_gen, &st.info.geometry_url, items);
+        st.ring.done = !more;
     }
 
     /// Consume any pending drag-drop / fetched / picked file.
@@ -2611,7 +2778,8 @@ impl FluidApp {
              \"p_evicted\":{},\"p_in_flight\":{},\"p_wanted\":{},\"p_failures\":{},\"dense_inst\":{},\"proxies\":{},\
              \"s_fetched\":{},\"s_fetched_bytes\":{},\"s_resident\":{},\"s_resident_bytes\":{},\"s_evicted\":{},\
              \"s_in_flight\":{},\"s_failures\":{},\"wants\":{},\"pick_pending\":{},\"pick_us\":{:.0},\
-             \"retess\":{},\"flatten_pending\":{},\"busy\":\"{}\",\"dense_chunks\":{}}}",
+             \"retess\":{},\"flatten_pending\":{},\"busy\":\"{}\",\"dense_chunks\":{},\
+             \"requests\":{},\"unfilled\":{},\"prefetched\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -2681,6 +2849,9 @@ impl FluidApp {
             self.pending_flatten.is_some(),
             self.busy_reason().unwrap_or(""),
             self.cull_stats.dense_chunks,
+            self.stream.as_ref().map_or(0, |s| s.requests),
+            self.stream.as_ref().map_or(0, |s| s.unfilled),
+            self.stream.as_ref().map_or(0, |s| s.prefetched),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }
@@ -4376,5 +4547,21 @@ mod tests {
         assert_eq!(encode_query("a b&c=d.gds"), "a%20b%26c%3Dd.gds");
         assert!(server_url("r1", "", "x").ends_with("/ws?room=r1"), "no design, no binding");
         assert!(valid_room("sync-17_x") && !valid_room("../x") && !valid_room(""));
+    }
+
+    /// Phase 7.1c: records close together share a request; a wide gap or a
+    /// full request starts the next one.
+    #[test]
+    fn nearby_records_share_a_request() {
+        let gap = STREAM_MERGE_GAP;
+        let items = [
+            (0, 0, 0, 100),
+            (0, 1, 100, 200),            // adjacent
+            (1, 0, 200 + gap, 300 + gap), // exactly the allowed gap
+            (2, 0, 301 + 2 * gap, 400 + 2 * gap), // one byte too far
+            (3, 0, 400 + 2 * gap, 400 + 2 * gap + STREAM_BATCH_BYTES), // would overfill the request
+        ];
+        assert_eq!(batches(&items), vec![0..3, 3..4, 4..5]);
+        assert!(batches(&[]).is_empty());
     }
 }

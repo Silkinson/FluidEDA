@@ -46,6 +46,15 @@ use tokio::sync::broadcast::error::RecvError;
 
 /// Largest blob `PUT /blobs` accepts.
 pub const MAX_BLOB: u64 = 16 << 30;
+
+/// Testing (Phase 7.1c): every `GET /blobs` waits this many ms before
+/// answering, standing in for a network round trip. 0 = off.
+static LATENCY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Delay every blob read by `ms` (`FLUIDEDA_LATENCY_MS`; testing only).
+pub fn set_latency_ms(ms: u64) {
+    LATENCY_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
 /// Read size when streaming a blob out.
 const CHUNK: u64 = 256 << 10;
 
@@ -241,6 +250,10 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
 async fn get_blob(State(hub): State<Arc<Hub>>, Path(hash): Path<String>, headers: HeaderMap) -> Response {
     if !store::is_hash(&hash) {
         return bad_request("not a sha256 hex digest");
+    }
+    let delay = LATENCY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     let Ok(mut file) = tokio::fs::File::open(hub.store.blob_path(&hash)).await else {
         return StatusCode::NOT_FOUND.into_response();

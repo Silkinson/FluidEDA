@@ -659,6 +659,8 @@ pub struct TessReply {
     pub gen: u32,
     pub meshes: Vec<fluideda_core::LayerMesh>,
     /// Streaming (Phase 6 SLICE 3): the chunk record's size and fetch time.
+    /// Phase 7.1c: a request fetches several records; its bytes count on its
+    /// first chunk (0 on the others).
     pub fetch_bytes: usize,
     pub fetch_ms: f64,
     /// The job failed (logged): nothing to upload; the app may retry it.
@@ -743,22 +745,33 @@ impl TessWorker {
         }
     }
 
-    /// Streaming (Phase 6 SLICE 3): have the worker fetch the chunk's record —
-    /// bytes `start..end` of the pack's geometry blob at `url` — and
-    /// tessellate it. The geometry never touches the main thread.
-    pub fn post_fetch(&self, cell: usize, chunk: u32, gen: u32, url: &str, start: u64, end: u64) {
+    /// Streaming (Phase 6 SLICE 3): have the worker fetch chunk records —
+    /// byte ranges of the pack's geometry blob at `url` — and tessellate
+    /// them. The geometry never touches the main thread. Phase 7.1c: `items`
+    /// (`cell, chunk, start, end`, by offset) go out as ONE range request
+    /// spanning them all; the worker splits it by their offsets.
+    pub fn post_fetch(&self, gen: u32, url: &str, items: &[(usize, u32, u64, u64)]) {
         use wasm_bindgen::JsValue;
+        let (Some(first), Some(last)) = (items.first(), items.last()) else { return };
+        let num = |v: f64| JsValue::from_f64(v);
+        let list = js_sys::Array::new();
+        for &(cell, chunk, start, end) in items {
+            let it = js_sys::Object::new();
+            for (k, v) in [("cell", cell as f64), ("chunk", chunk as f64), ("start", start as f64), ("end", end as f64)] {
+                let _ = js_sys::Reflect::set(&it, &k.into(), &num(v));
+            }
+            list.push(&it);
+        }
         let payload = js_sys::Object::new();
         let set = |k: &str, v: &JsValue| {
             let _ = js_sys::Reflect::set(&payload, &k.into(), v);
         };
         set("type", &"tess_fetch".into());
-        set("cell", &JsValue::from_f64(cell as f64));
-        set("chunk", &JsValue::from_f64(chunk as f64));
-        set("gen", &JsValue::from_f64(gen as f64));
+        set("gen", &num(gen as f64));
         set("url", &url.into());
-        set("start", &JsValue::from_f64(start as f64));
-        set("end", &JsValue::from_f64(end as f64));
+        set("start", &num(first.2 as f64));
+        set("end", &num(last.3 as f64));
+        set("items", &list);
         if let Err(e) = self.worker.post_message(&payload) {
             log::error!("tess post failed: {e:?}");
         }
@@ -831,7 +844,7 @@ impl TessWorker {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn post(&self, _cell: usize, _chunk: u32, _gen: u32, _coords: &[i32], _starts: &[u32], _layers: &[u32], _kinds: &[u8]) {}
-    pub fn post_fetch(&self, _cell: usize, _chunk: u32, _gen: u32, _url: &str, _start: u64, _end: u64) {}
+    pub fn post_fetch(&self, _gen: u32, _url: &str, _items: &[(usize, u32, u64, u64)]) {}
 }
 
 // --- Phase 5b SLICE 3: DRC worker pool ---------------------------------------

@@ -133,6 +133,13 @@ front, then 7.4, edit streamed designs. **Both are done.**
   when updates arrive in an arbitrary order. 0.19 drops a deletion that
   arrives early; 0.28 fixes that but still diverges. Our room always relays
   in causal order, so FluidEDA is not exposed.
+* **7.1c — batched and prefetched fetches.** A frame's chunk fetches that
+  lie close together in the pack go out as one range request, which the
+  worker splits. Once the view is drawn, the app fetches one screen around
+  it. Panning caravel's pad ring with 80 ms added latency (same-session A/B
+  against 7.9): 26.3 → 4.7 requests per pan, 353 → 20 ms until the view is
+  drawn, 5% → 100% of pans with no proxies, for 19% more bytes. Batching
+  alone gives 3.8 requests and 187 ms.
 
 **Phase 6 shipped: formats, backend, out-of-core** on `phase6-backend-oasis`
 (findings: `docs/phase6-findings.md`).
@@ -322,7 +329,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
-| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1a, 7.7, 7.8, 7.6, 7.9, 7.1b done | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). 7.9: files stream in and out (in-core save no longer grows the heap: caravel stays 122 MB, was 689; worker peak 548 → 364 MB; place_50M saves). 7.1b: randomized convergence — peers and a crashing room converge (256 + 64 property cases); yrs diverges under arbitrary reordering, which our relay never does. Next: 7.1c, finer streamed picks, 7.2, 7.5 |
+| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1, 7.7, 7.8, 7.6, 7.9 done | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). 7.9: files stream in and out (in-core save no longer grows the heap: caravel stays 122 MB, was 689; worker peak 548 → 364 MB; place_50M saves). 7.1b: randomized convergence — peers and a crashing room converge (256 + 64 property cases); yrs diverges under arbitrary reordering, which our relay never does. 7.1c: batched + prefetched fetches (80 ms latency: 26.3 → 4.7 requests per pan, 353 → 20 ms to draw, 100% of pans with no proxies). Next: finer streamed picks, 7.2, 7.5 |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 

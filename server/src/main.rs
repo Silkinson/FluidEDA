@@ -5,6 +5,8 @@
 //! * `FLUIDEDA_ADDR` — listen address (default `127.0.0.1:9000`; the dev app
 //!   reaches it through Trunk's proxy, so nothing needs a wider bind).
 //! * `RUST_LOG` — log filter (default `info`).
+//! * `FLUIDEDA_LATENCY_MS` — testing: every blob read waits this long first,
+//!   standing in for network latency (Phase 7.1c; default 0).
 
 use fluideda_server::room::{Hub, SnapshotPolicy};
 use fluideda_server::store::Store;
@@ -15,6 +17,10 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let dir = std::env::var("FLUIDEDA_STORE").unwrap_or_else(|_| "store".to_string());
     let addr = std::env::var("FLUIDEDA_ADDR").unwrap_or_else(|_| "127.0.0.1:9000".to_string());
+    if let Some(ms) = std::env::var("FLUIDEDA_LATENCY_MS").ok().and_then(|v| v.parse().ok()) {
+        fluideda_server::set_latency_ms(ms);
+        log::warn!("testing: every blob read waits {ms} ms");
+    }
     let store = Store::open(&dir).unwrap_or_else(|e| panic!("cannot open store {dir}: {e}"));
     let hub = Arc::new(Hub::new(store, SnapshotPolicy::default()));
     fluideda_server::spawn_snapshotter(hub.clone());
