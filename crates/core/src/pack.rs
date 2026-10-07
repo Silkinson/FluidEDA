@@ -152,21 +152,118 @@ pub fn write_geometry(db: &CellDb, out: &mut impl Write) -> io::Result<Vec<u64>>
     let mut rec: Vec<u8> = Vec::new();
     for cell in &db.cells {
         for ch in &cell.chunks {
-            let (coords, starts, layers, kinds) = cell.shapes.chunk_columns(ch.start, ch.end);
             rec.clear();
-            rec.extend_from_slice(&(layers.len() as u32).to_le_bytes());
-            rec.extend_from_slice(&(coords.len() as u32).to_le_bytes());
-            rec.extend_from_slice(cast_slice(&starts));
-            rec.extend_from_slice(cast_slice(layers));
-            rec.extend_from_slice(kinds);
-            rec.resize(rec.len().next_multiple_of(4), 0);
-            rec.extend_from_slice(cast_slice(coords));
+            push_record(&cell.shapes, ch.start, ch.end, &mut rec);
             out.write_all(&rec)?;
             pos += rec.len() as u64;
             offsets.push(pos);
         }
     }
     Ok(offsets)
+}
+
+/// Append the record of `store`'s shapes `start..end` to `rec`.
+fn push_record(store: &crate::store::ShapeStore, start: u32, end: u32, rec: &mut Vec<u8>) {
+    let (coords, starts, layers, kinds) = store.chunk_columns(start, end);
+    rec.extend_from_slice(&(layers.len() as u32).to_le_bytes());
+    rec.extend_from_slice(&(coords.len() as u32).to_le_bytes());
+    rec.extend_from_slice(cast_slice(&starts));
+    rec.extend_from_slice(cast_slice(layers));
+    rec.extend_from_slice(kinds);
+    rec.resize(rec.len().next_multiple_of(4), 0);
+    rec.extend_from_slice(cast_slice(coords));
+}
+
+/// Finer streamed picks, the server's side: the shapes of chunk record `rec`
+/// that hold `p` (bbox, then point-in-polygon), as
+/// `[n u32][their indices in the chunk, n × u32][their record]`. A pick
+/// fetches this, a few hundred bytes, instead of the whole chunk.
+pub fn pick_answer(rec: &[u8], p: crate::types::Point) -> Result<Vec<u8>> {
+    Ok(pick_answer_in(&decode_store(rec)?, p))
+}
+
+/// [`pick_answer`] from a chunk already decoded (a batch asks about several
+/// points of one chunk).
+pub fn pick_answer_in(store: &crate::store::ShapeStore, p: crate::types::Point) -> Vec<u8> {
+    let hits: Vec<u32> = (0..store.len() as u32)
+        .filter(|&i| {
+            let b = store.bbox_of(i as usize);
+            b.min.x <= p.x && p.x <= b.max.x && b.min.y <= p.y && p.y <= b.max.y
+                && crate::pick::point_in_polygon(&store.points(i as usize), p)
+        })
+        .collect();
+    let mut out = Vec::with_capacity(4 + 4 * hits.len() + 64 * hits.len());
+    out.extend_from_slice(&(hits.len() as u32).to_le_bytes());
+    out.extend_from_slice(cast_slice(&hits));
+    let sub = store.reordered(&hits);
+    push_record(&sub, 0, sub.len() as u32, &mut out);
+    out
+}
+
+/// A batch of pick questions, `(chunk, x, y)` each, as the client sends them:
+/// `[n u32][(chunk u32, x i32, y i32) × n]`.
+pub fn encode_pick_questions(qs: &[(u32, i32, i32)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 12 * qs.len());
+    out.extend_from_slice(&(qs.len() as u32).to_le_bytes());
+    for &(c, x, y) in qs {
+        out.extend_from_slice(&c.to_le_bytes());
+        out.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(&y.to_le_bytes());
+    }
+    out
+}
+
+pub fn decode_pick_questions(bytes: &[u8]) -> Result<Vec<(u32, i32, i32)>> {
+    let word = |i: usize| bytes.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let Some(n) = word(0) else { bail!("pick questions truncated") };
+    if bytes.len() != 4 + 12 * n as usize {
+        bail!("pick questions: {} bytes for {n}", bytes.len());
+    }
+    Ok((0..n as usize).map(|k| (word(1 + 3 * k).unwrap(), word(2 + 3 * k).unwrap() as i32, word(3 + 3 * k).unwrap() as i32)).collect())
+}
+
+/// Answers to a batch, in its order: `[n u32][byte length × n][answers]`.
+pub fn encode_pick_answers(answers: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 4 * answers.len() + answers.iter().map(Vec::len).sum::<usize>());
+    out.extend_from_slice(&(answers.len() as u32).to_le_bytes());
+    for a in answers {
+        out.extend_from_slice(&(a.len() as u32).to_le_bytes());
+    }
+    for a in answers {
+        out.extend_from_slice(a);
+    }
+    out
+}
+
+/// Split a batch's answers (each still encoded as [`pick_answer`] writes it).
+pub fn split_pick_answers(bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    let word = |i: usize| bytes.get(4 * i..4 * i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    let Some(n) = word(0) else { bail!("pick answers truncated") };
+    let mut at = 4 + 4 * n;
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let Some(len) = word(1 + k) else { bail!("pick answers truncated") };
+        let Some(a) = bytes.get(at..at + len) else { bail!("pick answers truncated") };
+        out.push(a);
+        at += len;
+    }
+    Ok(out)
+}
+
+/// The client's side of [`pick_answer`], for a chunk whose first shape is
+/// shape `base` of its cell.
+pub fn decode_pick_answer(bytes: &[u8], base: u32) -> Result<crate::db::PickAnswer> {
+    let n = match bytes.get(..4) {
+        Some(b) => u32::from_le_bytes(b.try_into().unwrap()) as usize,
+        None => bail!("pick answer truncated"),
+    };
+    let Some(ids) = bytes.get(4..4 + 4 * n) else { bail!("pick answer truncated") };
+    let ids: Vec<u32> = ids.chunks_exact(4).map(|b| base + u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let store = decode_store(&bytes[4 + 4 * n..])?;
+    if store.len() != n {
+        bail!("pick answer: {n} ids, {} shapes", store.len());
+    }
+    Ok(crate::db::PickAnswer { ids, store })
 }
 
 /// The index blob for `offsets`.
@@ -425,6 +522,9 @@ mod tests {
 
         let none = EditOverlay::new();
         let points = [(250, 450), (9_850, 7_150), (200_000 + 1_000, 1_000), (200_000 + 60_250, 30_250), (-5, -5), (50_150, 99_100)];
+        // What the picks fetched: the server's answers, against the whole
+        // chunks they were about.
+        let (mut answered, mut whole) = (0usize, 0usize);
         for (x, y) in points {
             let at = Point::new(x, y);
             let mut rounds = 0;
@@ -442,6 +542,15 @@ mod tests {
                             let store = decode_store(&geometry[offsets[k] as usize..offsets[k + 1] as usize]).unwrap();
                             streamed.cells[c].remote_shapes.as_mut().unwrap().chunks[ci as usize] = Some(store);
                         }
+                        ChunkNeed::ShapesAt(c, ci, x, y) => {
+                            let k = (base[c] + ci) as usize;
+                            let rec = &geometry[offsets[k] as usize..offsets[k + 1] as usize];
+                            let answer = pick_answer(rec, Point::new(x, y)).unwrap();
+                            (answered, whole) = (answered + answer.len(), whole + rec.len());
+                            let first = streamed.cells[c].chunks[ci as usize].start;
+                            let a = decode_pick_answer(&answer, first).unwrap();
+                            streamed.cells[c].remote_shapes.as_mut().unwrap().answers.insert((ci, x, y), a);
+                        }
                         ChunkNeed::Placements(c, ci) => {
                             let k = (p_base[c] + ci) as usize;
                             let rec = &placements[p_offsets[k] as usize..p_offsets[k + 1] as usize];
@@ -454,9 +563,20 @@ mod tests {
             let local = crate::pick_composite(&db, &none, at);
             assert_eq!(hit.as_ref().map(|h| (h.target, h.path.clone())), local.as_ref().map(|h| (h.target, h.path.clone())), "pick at {at:?}");
         }
-        // Only what the picks touched is resident: far from all of MESH.
+        // Picks hold no whole chunk, only the server's answers: a sliver of
+        // the chunks they were about.
         let resident = streamed.cell(mesh).remote_shapes.as_ref().unwrap().chunks.iter().filter(|c| c.is_some()).count();
-        assert!(resident < db.cell(mesh).chunks.len());
+        assert_eq!(resident, 0);
+        assert!(answered > 0 && answered * 50 < whole, "answers {answered} B for chunks of {whole} B");
+        // A picked shape's ring is there for the selection and its edits.
+        if let Some(hit) = crate::pick_composite(&db, &none, Point::new(9_850, 7_150)) {
+            if let crate::pick::PickTarget::Base((c, i)) = hit.target {
+                assert_eq!(
+                    streamed.cell(c).shape_points(i as usize).map(|r| r.to_vec()),
+                    db.cell(c).shape_points(i as usize).map(|r| r.to_vec())
+                );
+            }
+        }
 
         // "Edit this placement only" on remote placements of CORE: once its
         // needs are fetched, a streamed flatten copies exactly what in-core
@@ -490,6 +610,7 @@ mod tests {
                             let insts = crate::serialize::decode_instances(rec, db.cells.len()).unwrap();
                             streamed.cells[c].remote.as_mut().unwrap().chunks[ci as usize] = Some(insts);
                         }
+                        ChunkNeed::ShapesAt(..) => panic!("a flatten copies whole chunks"),
                     }
                 }
             }

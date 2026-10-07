@@ -32,6 +32,9 @@ use crate::types::{Bbox, Point};
 pub enum ChunkNeed {
     Shapes(CellId, u32),
     Placements(CellId, u32),
+    /// Finer streamed picks: only the shapes of chunk `(cell, i)` that hold
+    /// local point `(x, y)` — what a pick needs, answered by the server.
+    ShapesAt(CellId, u32, i32, i32),
 }
 
 /// A hierarchy hit: the base shape (cell master + index) plus the world transform
@@ -70,7 +73,24 @@ fn pick_in_cell_except(
             continue; // point outside this chunk's (loose) bbox
         }
         let Some((store, base)) = cell.chunk_store(ci) else {
-            needs.push(ChunkNeed::Shapes(id, ci as u32));
+            // Not in memory: the server's answer for this point will do.
+            match cell.pick_answer(ci, p) {
+                Some(a) => {
+                    for (j, &i) in a.ids.iter().enumerate() {
+                        if skip.is_some_and(|s| s.contains(&i)) {
+                            continue;
+                        }
+                        let pts = a.store.points(j);
+                        if shape_bbox_contains(&pts, p) && point_in_polygon(&pts, p) {
+                            let area = bbox_area(&pts);
+                            if best.map_or(true, |(_, a)| area < a) {
+                                best = Some((i, area));
+                            }
+                        }
+                    }
+                }
+                None => needs.push(ChunkNeed::ShapesAt(id, ci as u32, p.x, p.y)),
+            }
             continue;
         };
         for i in chunk.start..chunk.end {

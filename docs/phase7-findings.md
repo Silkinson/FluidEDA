@@ -956,3 +956,69 @@ unusable beyond it.
   new joins and requests.
 - Quotas are per token and kept in memory, so they reset on restart.
 - There are no accounts: whoever holds a link has its role.
+
+## 7.10 — finer streamed picks
+
+**Problem.** A streamed pick fetched every shape chunk under its point in
+full, though it needs only the few shapes that contain the point. Over the
+stream edit test's 128 picks on caravel that came to 143 chunks and
+38.6 MB, about 300 KB per chunk.
+
+**Sizing.** I first measured the plan's idea: split chunks into runs with
+their own bboxes at pack time.
+- Runs of 128 shapes in stored order (shape ids unchanged) would cut the
+  bytes per pick 7.9×, re-sorted runs 11.4×.
+- But a pick would hit about 10 runs, so about 10 range requests.
+
+**Design: the server answers the pick's question.**
+- `POST /packs/<d>/pick` takes `(chunk, local x, local y)` questions. For
+  each, it returns only the shapes of that chunk holding the point (bbox,
+  then point-in-polygon, the client's own test), with their indices.
+  - The pack format is unchanged.
+  - Each chunk is read by range and decoded once per request.
+  - Links and the latency harness apply as for every pack request.
+- **Core.**
+  - A pick on a streamed cell whose chunk is not in memory asks for
+    `ChunkNeed::ShapesAt(cell, chunk, x, y)` instead of the chunk.
+  - `RemoteShapes::answers` keeps what comes back.
+  - `shape_points` and `shape_layer` read answers too, so the selection
+    highlight, moves and vertex edits work from them. The whole chunk is
+    still fetched when an edit has to redraw it.
+- **App.**
+  - A frame's questions go out as one request.
+  - Answers are kept LRU, 4,096 of them (a few hundred bytes each).
+  - `?wholepicks` restores whole-chunk picks, for a same-build A/B.
+
+**Measured** (`pick_ab.mjs`: the same 128 picks on streamed caravel, same
+build, whole chunks vs answers):
+
+| | whole chunks (before) | answers |
+|---|--:|--:|
+| fetched | 38.78 MB | **0.29 MB** (134× less; incl. 7 placement chunks) |
+| requests | 150 | 141 (2,137 before a frame's questions were batched) |
+| picks matching the other mode | | 128 of 128 |
+| pick time, no added latency (median · max) | 15 · 96 ms | 21 · 53 ms |
+| pick time, 80 ms added latency (median · max) | 15 · 1,649 ms | 104 · 301 ms |
+
+Answers trade bandwidth for a round trip.
+- With whole chunks, picks are free once an area's chunks are in memory,
+  but the first pick there downloads megabytes: 1.6 s at 80 ms.
+- With answers, every pick costs one round trip and a few hundred bytes.
+- A chunk that is in memory anyway (drawn edited, or fetched for an edit)
+  is still used directly.
+
+**Tests.**
+- **Core:** streamed picks answered this way equal in-core picks. No whole
+  chunk becomes resident, the answers come to under 1/50 of the chunks'
+  bytes, and a picked shape's ring is there for the selection.
+- **Server:**
+  - for every chunk tried, the answer is exactly the in-core
+    point-in-polygon set;
+  - a batch answers in order;
+  - unknown chunks give 404 and malformed bodies 400;
+  - the auth matrix covers the endpoint.
+- **Browser:** the stream edit test's 128 picks equal in-core, fetching
+  2,130 answers (107 KB) and no chunk. Its edits, save and flatten checks
+  are unchanged. Its 1 MB-budget section now opens with `?wholepicks`, so
+  picks still fill and evict that budget.
+- Suites: stream 11, streamed edit 11, sync 33, sync STREAMED 34; 3 server pack tests and the auth matrix.

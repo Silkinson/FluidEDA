@@ -87,3 +87,56 @@ async fn unknown_and_malformed_designs() {
     let (s, _) = get(&hub, &format!("/packs/{junk}"), None).await;
     assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+/// Finer streamed picks: `GET /packs/<d>/pick/<k>?x=&y=` answers with exactly
+/// the shapes of chunk `k` that hold the point, as an in-core pick sees them.
+#[tokio::test]
+async fn a_pick_answer_holds_exactly_the_shapes_under_the_point() {
+    let hub = hub();
+    let bytes = include_bytes!("../../assets/hier.gds");
+    let design = hub.store.put_blob(bytes).unwrap();
+    let (status, _) = get(&hub, &format!("/packs/{design}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let db = fluideda_core::load_layout_db(bytes).unwrap();
+    let base = fluideda_core::pack::chunk_base(&db);
+    let mut checked = 0;
+    for (c, cell) in db.cells.iter().enumerate() {
+        for (ci, ch) in cell.chunks.iter().enumerate().take(3) {
+            // A point inside the chunk's first shape (its bbox centre, then
+            // the first vertex nudged in if that misses).
+            let b = cell.shapes.bbox_of(ch.start as usize);
+            let p = fluideda_core::Point::new((b.min.x + b.max.x) / 2, (b.min.y + b.max.y) / 2);
+            let want: Vec<u32> = (ch.start..ch.end)
+                .filter(|&i| fluideda_core::point_in_polygon(&cell.shapes.points(i as usize), p))
+                .collect();
+            let k = base[c] + ci as u32;
+            let (status, body) = post(&hub, &format!("/packs/{design}/pick"), fluideda_core::pack::encode_pick_questions(&[(k, p.x, p.y)])).await;
+            assert_eq!(status, StatusCode::OK);
+            let answers = fluideda_core::pack::split_pick_answers(&body).unwrap();
+            assert_eq!(answers.len(), 1);
+            let answer = fluideda_core::pack::decode_pick_answer(answers[0], ch.start).unwrap();
+            assert_eq!(answer.ids, want, "cell {c} chunk {ci} at {p:?}");
+            for (j, &i) in answer.ids.iter().enumerate() {
+                assert_eq!(answer.store.points(j).to_vec(), cell.shapes.points(i as usize).to_vec());
+            }
+            checked += !want.is_empty() as usize;
+        }
+    }
+    assert!(checked > 0, "no point hit a shape");
+    // A batch answers in order, and decodes each chunk once.
+    let qs = [(0, 0, 0), (0, 10, 10), (0, 5, 5)];
+    let (status, body) = post(&hub, &format!("/packs/{design}/pick"), fluideda_core::pack::encode_pick_questions(&qs)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fluideda_core::pack::split_pick_answers(&body).unwrap().len(), 3);
+    let (status, _) = post(&hub, &format!("/packs/{design}/pick"), fluideda_core::pack::encode_pick_questions(&[(999_999, 0, 0)])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = post(&hub, &format!("/packs/{design}/pick"), vec![1, 2, 3]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+async fn post(hub: &Arc<Hub>, uri: &str, body: Vec<u8>) -> (StatusCode, Vec<u8>) {
+    let req = Request::builder().method("POST").uri(uri).body(Body::from(body)).unwrap();
+    let resp = fluideda_server::app(hub.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, resp.into_body().collect().await.unwrap().to_bytes().to_vec())
+}

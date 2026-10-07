@@ -39,6 +39,9 @@ pub struct Design {
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))] // the stats are published on the web
 pub struct StreamInfo {
     pub geometry_url: String,
+    /// Finer streamed picks: `POST <pick_url>` answers which shapes of each
+    /// asked chunk hold its point (`/packs/<design>/pick`).
+    pub pick_url: String,
     pub offsets: Vec<u64>,
     /// Pack v3 (Phase 7.3 SLICE B): the remote placement lists' records —
     /// placement chunk `k` is bytes `placement_offsets[k]..[k+1]`, `k`

@@ -1424,6 +1424,7 @@ pub fn fetch_pack(hash: String, name: String, slot: DesignSlot) {
                 source: crate::design::DesignSource::Url(format!("/blobs/{hash}")),
                 stream: Some(crate::design::StreamInfo {
                     geometry_url: format!("/blobs/{geo}"),
+                    pick_url: format!("/packs/{hash}/pick"),
                     offsets,
                     placements_url: format!("/blobs/{pl}"),
                     placement_offsets,
@@ -1519,6 +1520,60 @@ pub fn fetch_shape_chunk(url: String, start: u64, end: u64, cell: usize, chunk: 
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn fetch_shape_chunk(_url: String, _start: u64, _end: u64, _cell: usize, _chunk: u32, _gen: u32, _slot: ShapeSlot) {}
+
+/// The server's answer for chunk `chunk` of `cell` at local point `(x, y)`:
+/// which of its shapes hold the point (finer streamed picks).
+pub struct AnswerReply {
+    pub key: (usize, u32, i32, i32),
+    pub gen: u32,
+    pub result: Result<Vec<u8>, String>,
+}
+
+pub type AnswerSlot = Rc<RefCell<Vec<AnswerReply>>>;
+
+/// Ask the server, in one request, which shapes of each chunk hold its point:
+/// `questions[k]` (pack chunk number, local x, y) answers `keys[k]`. The main
+/// thread decodes the answers.
+#[cfg(target_arch = "wasm32")]
+pub fn fetch_pick_answers(url: String, keys: Vec<(usize, u32, i32, i32)>, questions: Vec<(u32, i32, i32)>, gen: u32, slot: AnswerSlot) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = async {
+            let body = js_sys::Uint8Array::from(&fluideda_core::pack::encode_pick_questions(&questions)[..]);
+            let resp = http(&url, "POST", Some(&body.into())).await?;
+            if !resp.ok() {
+                return Err(format!("POST {url}: HTTP {}", resp.status()));
+            }
+            let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(|e| format!("{e:?}"))?)
+                .await
+                .map_err(|e| format!("POST {url}: {e:?}"))?;
+            let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+            let answers = fluideda_core::pack::split_pick_answers(&bytes).map_err(|e| e.to_string())?;
+            if answers.len() != keys.len() {
+                return Err(format!("{} answers to {} questions", answers.len(), keys.len()));
+            }
+            Ok(answers.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>())
+        }
+        .await;
+        let mut s = slot.borrow_mut();
+        match result {
+            Ok(answers) => {
+                for (key, a) in keys.into_iter().zip(answers) {
+                    s.push(AnswerReply { key, gen, result: Ok(a) });
+                }
+            }
+            Err(e) => {
+                for key in keys {
+                    s.push(AnswerReply { key, gen, result: Err(e.clone()) });
+                }
+            }
+        }
+        drop(s);
+        wake();
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_pick_answers(_url: String, _keys: Vec<(usize, u32, i32, i32)>, _q: Vec<(u32, i32, i32)>, _gen: u32, _slot: AnswerSlot) {}
 
 /// Bytes `start..end` of `url` by HTTP range (a server ignoring Range is
 /// handled by cutting the range out of the whole body).

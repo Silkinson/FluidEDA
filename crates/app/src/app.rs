@@ -77,6 +77,8 @@ const ACTIVE_LINGER_S: f64 = 0.5;
 const STREAM_SHAPE_BUDGET: usize = 128 << 20;
 /// Streaming: shape-chunk fetches in flight on the main thread at once.
 const STREAM_SHAPES_IN_FLIGHT: usize = 8;
+/// Finer streamed picks: pick answers kept (a few hundred bytes each).
+const STREAM_ANSWERS_KEPT: usize = 4096;
 /// Streaming: a pick still waiting for chunks after this long gives up (s).
 const STREAM_PICK_TIMEOUT_S: f64 = 15.0;
 
@@ -200,6 +202,22 @@ struct Stream {
     edit_wants: HashSet<(CellId, u32)>,
     /// Drawn chunks whose suppressed shapes may have changed (edits).
     retess: HashSet<(CellId, u32)>,
+
+    // Finer streamed picks: a pick asks the server which shapes of a chunk
+    // hold its point, instead of fetching the chunk.
+    answers: webio::AnswerSlot,
+    a_inflight: HashSet<(CellId, u32, i32, i32)>,
+    a_retry_at: HashMap<(CellId, u32, i32, i32), f64>,
+    /// Answers held, oldest first (a few hundred bytes each; the oldest go
+    /// past [`STREAM_ANSWERS_KEPT`]).
+    a_order: std::collections::VecDeque<(CellId, u32, i32, i32)>,
+    a_fetched: usize,
+    a_fetched_bytes: usize,
+    a_failures: usize,
+    /// Requests the answers came in (a frame's questions go together).
+    a_requests: usize,
+    /// `?wholepicks`: picks fetch whole chunks, as before (the same-build A/B).
+    whole_picks: bool,
     /// The suppressed shapes each drawn edited chunk was tessellated without.
     drawn_suppressed: HashMap<(CellId, u32), Vec<u32>>,
 
@@ -264,6 +282,15 @@ impl Stream {
             s_failures: 0,
             edit_wants: HashSet::new(),
             retess: HashSet::new(),
+            answers: Rc::new(RefCell::new(Vec::new())),
+            a_inflight: HashSet::new(),
+            a_retry_at: HashMap::new(),
+            a_order: std::collections::VecDeque::new(),
+            a_fetched: 0,
+            a_fetched_bytes: 0,
+            a_failures: 0,
+            a_requests: 0,
+            whole_picks: webio::query_flag("wholepicks"),
             drawn_suppressed: HashMap::new(),
             requests: 0,
             unfilled: 0,
@@ -281,7 +308,20 @@ impl Stream {
 
     /// Fetches or redraws still under way (Phase 7.1a).
     fn busy(&self) -> bool {
-        !self.p_inflight.is_empty() || !self.s_inflight.is_empty() || !self.wants.is_empty() || !self.retess.is_empty()
+        !self.p_inflight.is_empty()
+            || !self.s_inflight.is_empty()
+            || !self.a_inflight.is_empty()
+            || !self.wants.is_empty()
+            || !self.retess.is_empty()
+    }
+
+    /// Ask, in one request, which shapes of chunk `(cell, chunk)` hold local
+    /// point `(x, y)`, for every key.
+    fn fetch_answers(&mut self, keys: Vec<(CellId, u32, i32, i32)>) {
+        let questions = keys.iter().map(|&(c, ci, x, y)| (self.base[c] + ci, x, y)).collect();
+        self.a_inflight.extend(keys.iter().copied());
+        self.a_requests += 1;
+        webio::fetch_pick_answers(self.info.pick_url.clone(), keys, questions, self.gen, self.answers.clone());
     }
 
     /// Fetch placement chunk `key` on the main thread (by byte range).
@@ -2190,9 +2230,65 @@ impl FluidApp {
                 }
             }
         }
+        // Pick answers that arrived: install them where the pick looks.
+        let answers: Vec<webio::AnswerReply> = std::mem::take(&mut *st.answers.borrow_mut());
+        for r in answers {
+            if r.gen != st.gen {
+                continue;
+            }
+            st.a_inflight.remove(&r.key);
+            let (cell, ci, x, y) = r.key;
+            let decoded = r.result.and_then(|bytes| {
+                let first = self.db.cells[cell].chunks.get(ci as usize).map_or(0, |c| c.start);
+                fluideda_core::pack::decode_pick_answer(&bytes, first).map(|a| (a, bytes.len())).map_err(|e| e.to_string())
+            });
+            match decoded {
+                Ok((a, bytes)) => {
+                    if let Some(rs) = self.db.cells[cell].remote_shapes.as_mut() {
+                        rs.answers.insert((ci, x, y), a);
+                        st.a_order.push_back(r.key);
+                        st.a_fetched += 1;
+                        st.a_fetched_bytes += bytes;
+                        st.a_retry_at.remove(&r.key);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("pick answer {:?}: {e}", r.key);
+                    st.a_failures += 1;
+                    st.a_retry_at.insert(r.key, now + STREAM_RETRY_S);
+                }
+            }
+        }
+        while st.a_order.len() > STREAM_ANSWERS_KEPT && !hold {
+            let Some((cell, ci, x, y)) = st.a_order.pop_front() else { break };
+            if let Some(rs) = self.db.cells[cell].remote_shapes.as_mut() {
+                rs.answers.remove(&(ci, x, y));
+            }
+        }
         let wants: Vec<fluideda_core::ChunkNeed> = st.wants.iter().copied().collect();
+        // This frame's pick questions, asked together.
+        let mut questions: Vec<(CellId, u32, i32, i32)> = Vec::new();
         for need in wants {
+            let need = match need {
+                // `?wholepicks`: the chunk itself, as before.
+                fluideda_core::ChunkNeed::ShapesAt(cell, ci, ..) if st.whole_picks => {
+                    st.wants.remove(&need);
+                    let whole = fluideda_core::ChunkNeed::Shapes(cell, ci);
+                    st.wants.insert(whole);
+                    whole
+                }
+                n => n,
+            };
             match need {
+                fluideda_core::ChunkNeed::ShapesAt(cell, ci, x, y) => {
+                    let key = (cell, ci, x, y);
+                    let c = &self.db.cells[cell];
+                    if c.chunk_resident(ci as usize) || c.pick_answer(ci as usize, fluideda_core::Point::new(x, y)).is_some() {
+                        st.wants.remove(&need);
+                    } else if !st.a_inflight.contains(&key) && !st.a_retry_at.get(&key).is_some_and(|&t| now < t) {
+                        questions.push(key);
+                    }
+                }
                 fluideda_core::ChunkNeed::Shapes(cell, ci) => {
                     let key = (cell, ci);
                     if self.db.cells[cell].chunk_resident(ci as usize) {
@@ -2223,6 +2319,9 @@ impl FluidApp {
                     }
                 }
             }
+        }
+        if !questions.is_empty() {
+            st.fetch_answers(questions);
         }
         // Over budget: drop the least recently needed unpinned chunks (never
         // one that arrived or was asked for this frame).
@@ -2774,7 +2873,7 @@ impl FluidApp {
              \"s_fetched\":{},\"s_fetched_bytes\":{},\"s_resident\":{},\"s_resident_bytes\":{},\"s_evicted\":{},\
              \"s_in_flight\":{},\"s_failures\":{},\"wants\":{},\"pick_pending\":{},\"pick_us\":{:.0},\
              \"retess\":{},\"flatten_pending\":{},\"busy\":\"{}\",\"dense_chunks\":{},\
-             \"requests\":{},\"unfilled\":{},\"prefetched\":{}}}",
+             \"requests\":{},\"unfilled\":{},\"prefetched\":{},\"a_fetched\":{},\"a_fetched_bytes\":{},\"a_failures\":{},\"a_requests\":{}}}",
             self.max_frame_ms,
             self.perf_frames,
             self.tess_worker_chunks,
@@ -2847,6 +2946,10 @@ impl FluidApp {
             self.stream.as_ref().map_or(0, |s| s.requests),
             self.stream.as_ref().map_or(0, |s| s.unfilled),
             self.stream.as_ref().map_or(0, |s| s.prefetched),
+            self.stream.as_ref().map_or(0, |s| s.a_fetched),
+            self.stream.as_ref().map_or(0, |s| s.a_fetched_bytes),
+            self.stream.as_ref().map_or(0, |s| s.a_failures),
+            self.stream.as_ref().map_or(0, |s| s.a_requests),
         );
         let _ = js_sys::Reflect::set(&w, &"__fluideda_perf".into(), &json.into());
     }

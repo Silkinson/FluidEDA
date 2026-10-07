@@ -230,6 +230,24 @@ pub struct Cell {
 #[derive(Default)]
 pub struct RemoteShapes {
     pub chunks: Vec<Option<ShapeStore>>,
+    /// Finer streamed picks: the server's answers to "which shapes of chunk
+    /// `c` hold local point `(x, y)`", keyed `(c, x, y)`. A pick needs only
+    /// those, not the whole chunk.
+    pub answers: std::collections::HashMap<(u32, i32, i32), PickAnswer>,
+}
+
+/// The shapes of one chunk that hold one point, as the server answered:
+/// shape `ids[j]` of the cell is shape `j` of `store`.
+pub struct PickAnswer {
+    pub ids: Vec<u32>,
+    pub store: ShapeStore,
+}
+
+impl PickAnswer {
+    /// Shape `i` of the cell, if the answer holds it: its store and index there.
+    fn find(&self, i: u32) -> Option<usize> {
+        self.ids.iter().position(|&x| x == i)
+    }
 }
 
 /// The resident placement chunks of a remote cell. Chunk `i` holds the
@@ -264,7 +282,7 @@ impl Cell {
     /// Mark this cell's shapes as fetched by chunk, none resident yet (a
     /// streamed design, Phase 7.4).
     pub fn make_remote_shapes(&mut self) {
-        self.remote_shapes = Some(RemoteShapes { chunks: (0..self.chunks.len()).map(|_| None).collect() });
+        self.remote_shapes = Some(RemoteShapes { chunks: (0..self.chunks.len()).map(|_| None).collect(), ..Default::default() });
     }
 
     /// How many shapes the cell has, in memory or not.
@@ -284,14 +302,28 @@ impl Cell {
         }
     }
 
+    /// The server's answer for chunk `ci` at local point `p`, if it was asked.
+    pub fn pick_answer(&self, ci: usize, p: Point) -> Option<&PickAnswer> {
+        self.remote_shapes.as_ref()?.answers.get(&(ci as u32, p.x, p.y))
+    }
+
+    /// Shape `i` in an answer of its chunk (a streamed cell whose chunk is
+    /// not in memory but was picked into).
+    fn answered(&self, ci: usize, i: u32) -> Option<(&ShapeStore, usize)> {
+        let r = self.remote_shapes.as_ref()?;
+        r.answers.iter().filter(|(k, _)| k.0 == ci as u32).find_map(|(_, a)| a.find(i).map(|j| (&a.store, j)))
+    }
+
     /// Shape `i`'s ring, if it is in memory (always, in-core).
     pub fn shape_points(&self, i: usize) -> Option<crate::store::Ring<'_>> {
         match &self.remote_shapes {
             None => (i < self.shapes.len()).then(|| self.shapes.points(i)),
             Some(_) => {
                 let ci = self.chunk_of(i as u32)? as usize;
-                let (store, base) = self.chunk_store(ci)?;
-                Some(store.points(i - base as usize))
+                match self.chunk_store(ci) {
+                    Some((store, base)) => Some(store.points(i - base as usize)),
+                    None => self.answered(ci, i as u32).map(|(s, j)| s.points(j)),
+                }
             }
         }
     }
@@ -302,8 +334,10 @@ impl Cell {
             None => (i < self.shapes.len()).then(|| self.shapes.layer(i)),
             Some(_) => {
                 let ci = self.chunk_of(i as u32)? as usize;
-                let (store, base) = self.chunk_store(ci)?;
-                Some(store.layer(i - base as usize))
+                match self.chunk_store(ci) {
+                    Some((store, base)) => Some(store.layer(i - base as usize)),
+                    None => self.answered(ci, i as u32).map(|(s, j)| s.layer(j)),
+                }
             }
         }
     }

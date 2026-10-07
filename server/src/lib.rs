@@ -12,6 +12,9 @@
 //! * `GET /rooms/<name>` — the room's design binding and version history.
 //! * `GET /packs/<sha256>` — a stored design's streaming pack manifest, built
 //!   on first request ([`packs`]); its blobs are served from `/blobs/`.
+//!   `POST /packs/<sha256>/pick` — for a batch of `(chunk, x, y)`, the shapes
+//!   of each chunk that hold its point (finer streamed picks): what a pick
+//!   needs, instead of the whole chunks.
 //! * `POST /export/<sha256>?format=gds|oas&ids=<n>` — the design with the
 //!   edits of the document state in the body, written into the blob store
 //!   ([`export`], Phase 7.4); `POST /rooms/<name>/export?format=` does the
@@ -85,6 +88,7 @@ pub fn app(hub: Arc<Hub>) -> Router {
         .route("/rooms/:room/share", post(share_room))
         .route("/rooms/:room/rotate", post(rotate_room))
         .route("/packs/:design", get(pack_manifest))
+        .route("/packs/:design/pick", post(pack_pick))
         .route("/export/:design", post(export_design))
         .route("/health", get(|| async { "ok" }))
         .with_state(hub)
@@ -503,6 +507,45 @@ async fn pack_manifest(
     match built {
         Ok(Some(m)) => ([(header::CACHE_CONTROL, "no-cache")], Json(m)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such design blob").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// A pick batch asks at most this many questions.
+const MAX_PICK_QUESTIONS: usize = 4096;
+
+/// `POST /packs/<d>/pick`: for each `(chunk, x, y)` in the body (see
+/// [`fluideda_core::pack::encode_pick_questions`]), the shapes of that chunk
+/// holding the point, in one answer.
+async fn pack_pick(
+    State(hub): State<Arc<Hub>>,
+    Path(design): Path<String>,
+    Query(tq): Query<TokenQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !store::is_hash(&design) {
+        return bad_request("not a sha256 hex digest");
+    }
+    if let Err(d) = allow_design(&hub, auth::token_of(&headers, tq.t.as_deref()).as_deref(), &design, Role::Viewer).await {
+        return denied(d);
+    }
+    let questions = match fluideda_core::pack::decode_pick_questions(&body) {
+        Ok(q) if q.len() <= MAX_PICK_QUESTIONS => q,
+        Ok(_) => return bad_request(format!("at most {MAX_PICK_QUESTIONS} questions")),
+        Err(e) => return bad_request(e.to_string()),
+    };
+    let delay = LATENCY_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+    let store = hub.store.clone();
+    let answers = tokio::task::spawn_blocking(move || packs::pick(&store, &design, &questions))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)));
+    match answers {
+        Ok(Some(a)) => ([(header::CONTENT_TYPE, "application/octet-stream")], fluideda_core::pack::encode_pick_answers(&a)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such pack or chunk").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

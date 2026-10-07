@@ -185,7 +185,8 @@ async function main() {
     check(same === pts.length && hits > pts.length / 2,
       `picks: ${same} of ${pts.length} points pick the same shape in-core and streamed (${hits} hit a shape); ` +
       `streamed pick latency median ${lat[lat.length >> 1]} ms, max ${lat[lat.length - 1]} ms; ` +
-      `fetched ${p1.s_fetched - p0.s_fetched} shape chunks (${((p1.s_fetched_bytes - p0.s_fetched_bytes) / 1e6).toFixed(1)} MB) ` +
+      `fetched ${p1.s_fetched - p0.s_fetched} shape chunks (${((p1.s_fetched_bytes - p0.s_fetched_bytes) / 1e6).toFixed(1)} MB), ` +
+      `${(p1.a_fetched ?? 0) - (p0.a_fetched ?? 0)} pick answers (${(((p1.a_fetched_bytes ?? 0) - (p0.a_fetched_bytes ?? 0)) / 1e3).toFixed(1)} KB) ` +
       `+ ${p1.p_fetched - p0.p_fetched} placement chunks`);
 
     // --- 2. edits -------------------------------------------------------------
@@ -280,7 +281,9 @@ async function main() {
     check(df.px === 0, `in-core, edited at the fit view then zoomed in: = edited in view (${df.px} pixels differ)`);
     await fit.context().close();
 
-    const tight = await open(browser, `${BASE}/?stream=${H}&shape_budget=1`, streamedReady);
+    // (`wholepicks`: picks fetch whole chunks here, as before finer picks, so
+    // they still fill — and evict from — the shape budget this checks.)
+    const tight = await open(browser, `${BASE}/?stream=${H}&shape_budget=1&wholepicks`, streamedReady);
     await edit(tight, targets);
     for (const p of pts) await pick(tight, p); // fetches (and evicts) all over the die
     await cmd(tight, 'pick 0 0'); // nothing there: the selection's pin goes

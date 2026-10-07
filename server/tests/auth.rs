@@ -91,6 +91,7 @@ async fn every_endpoint_checks_its_link() {
     let cases: Vec<Case> = vec![
         ("room info", Method::GET, "/rooms/r1".into(), vec![], [U, U, U, OK, OK, OK, F]),
         ("pack", Method::GET, format!("/packs/{design}"), vec![], [U, U, U, OK, OK, OK, F]),
+        ("pick", Method::POST, format!("/packs/{design}/pick"), fluideda_core::pack::encode_pick_questions(&[(0, 0, 0)]), [U, U, U, OK, OK, OK, F]),
         ("room export", Method::POST, "/rooms/r1/export".into(), vec![], [U, U, U, OK, OK, OK, F]),
         ("export", Method::POST, format!("/export/{design}"), state.clone(), [U, U, U, F, OK, OK, F]),
         ("upload (stored)", Method::PUT, format!("/blobs/{design}"), HIER.to_vec(), [U, U, U, F, OK, OK, OK]),

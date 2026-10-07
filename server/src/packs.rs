@@ -59,6 +59,39 @@ pub struct Manifest {
     pub build_ms: f64,
 }
 
+/// Finer streamed picks: for each question `(chunk, x, y)` (pack chunk
+/// numbering, the chunk's local frame), the shapes of that chunk holding the
+/// point, as [`fluideda_core::pack::pick_answer`] encodes them, in order.
+/// Each chunk's record is read by range and decoded once. `None` if the pack
+/// has not been built or a chunk does not exist.
+pub fn pick(store: &Store, design: &str, questions: &[(u32, i32, i32)]) -> io::Result<Option<Vec<Vec<u8>>>> {
+    use fluideda_core::ByteSource;
+    let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+    let Ok(text) = fs::read_to_string(manifest_path(store, design)) else { return Ok(None) };
+    let Ok(m) = serde_json::from_str::<Manifest>(&text) else { return Ok(None) };
+    if questions.iter().any(|q| q.0 as usize >= m.chunks) {
+        return Ok(None);
+    }
+    let (mut index, mut geometry) = (store.open_blob(&m.index.hash)?, store.open_blob(&m.geometry.hash)?);
+    let mut decoded: std::collections::HashMap<u32, fluideda_core::ShapeStore> = std::collections::HashMap::new();
+    let mut out = Vec::with_capacity(questions.len());
+    for &(chunk, x, y) in questions {
+        if let std::collections::hash_map::Entry::Vacant(v) = decoded.entry(chunk) {
+            let mut ends = [0u8; 16];
+            index.read_at(8 * chunk as u64, &mut ends)?;
+            let (start, end) = (u64::from_le_bytes(ends[..8].try_into().unwrap()), u64::from_le_bytes(ends[8..].try_into().unwrap()));
+            if end < start || end - start > 1 << 30 {
+                return Err(bad("pack index out of order".into()));
+            }
+            let mut rec = vec![0u8; (end - start) as usize];
+            geometry.read_at(start, &mut rec)?;
+            v.insert(fluideda_core::pack::decode_store(&rec).map_err(|e| bad(e.to_string()))?);
+        }
+        out.push(fluideda_core::pack::pick_answer_in(&decoded[&chunk], fluideda_core::Point::new(x, y)));
+    }
+    Ok(Some(out))
+}
+
 fn manifest_path(store: &Store, design: &str) -> PathBuf {
     store.root().join("packs").join(format!("{design}.v{PACK_VERSION}.json"))
 }
