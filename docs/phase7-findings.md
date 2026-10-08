@@ -1,12 +1,12 @@
 # Phase 7: findings
 
-**Status: in progress on `phase7`.** The owner moved 7.3 (stream the
-hierarchy) to the front. **7.3 is done** in three slices: **A** placement
-chunks in the core, **B** streaming the hierarchy (pack v3), **C** coloured
-proxies (pack v4). **7.4 is done** (edit streamed designs): **A** picking and editing, **B**
-rooms and "edit this placement only", **C** server-side export. The owner
-then asked to finish all of Phase 7: **7.1a** (idle repaint), **7.7**
-(compact rectangles) and **7.8** (compact placements) are done.
+**Status: shipped on `phase7`** (2026-10-07; pushed 2026-10-08, not
+merged). The owner moved 7.3 (stream the hierarchy) and 7.4 (edit streamed
+designs) to the front, then asked to finish all of Phase 7. The sections
+follow the order the slices were done: 7.3 A–C, 7.4 A–C, 7.1a, 7.7, 7.8,
+7.6, 7.9, 7.1b, 7.1c, 7.2, 7.10, 7.5. 7.7–7.10 were not in the plan; each
+came out of an earlier slice's measurements. A summary closes the document;
+the per-slice results table is in `phase7-plan.md`.
 
 ## 7.3 SLICE A — placement chunks
 
@@ -1154,3 +1154,42 @@ in-core and streamed designs alike: a whole chip in about 9 s, a view in
 milliseconds. The browser keeps its intra-cell worker-pool checks, which
 work offline. Moving world tiles into the worker pool is the remaining
 step.
+
+## Phase 7 — summary
+
+Sixteen commits. Every slice was measured against the build before it, in
+the same session, and every slice kept the browser suites green. Results per
+slice, with commits, are in `phase7-plan.md` ("Outcome"). What the phase
+taught:
+
+- **Measure the simple version before building the planned one.** Three
+  times the plan's machinery lost to something simpler, once measured:
+  - 7.3 C: colouring a proxy by its dominant layer was worse than grey;
+    the coverage-weighted average cut the visibly wrong pixels from 71%
+    to 18%.
+  - 7.10: splitting chunks into finer runs would still cost ~10 requests
+    a pick; the server answering the pick costs one round trip and 134×
+    fewer bytes.
+  - 7.5: interaction regions and pair dedup were not needed; exact world
+    tiles check caravel in 8.4 s on 10 cores.
+- **Byte-identical is a usable bar.**
+  - Compact rectangles and placements (7.7, 7.8) re-expand to the exact
+    original records, so exports did not change.
+  - Holding server export to the in-core save, byte for byte (7.4 C), found
+    two nondeterminisms: hash-map order, and wasm vs native `atan2` in the
+    last bit.
+- **Oracles find what tests cannot.** KLayout checked formats (Phase 6),
+  then DRC: it agrees with the in-context check marker for marker (7.5).
+  Property tests found that yrs does not converge under arbitrary
+  reordering (7.1b); our relay delivers in causal order, which is now an
+  invariant.
+- **Browsers have their own bugs.**
+  - Chrome's HTTP cache can return short bodies for concurrent range reads
+    (7.4 A).
+  - wasm memory never shrinks, so any whole-file buffer is a permanent peak
+    (7.9).
+- **The bench machine matters.** With the lid closed, the Mac slept on a
+  ~15-minute cycle (`pmset -g log`), and samples stalled for as long. Those
+  samples were excluded, and the runs kept the lid open.
+
+Open after Phase 7: STATUS.md, "Next step".

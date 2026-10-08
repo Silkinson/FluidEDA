@@ -1,10 +1,11 @@
 # FluidEDA — Project Status
 
-_Last updated: 2026-10-07 · current branch: `phase7` (off `phase6-backend-oasis`)_
+_Last updated: 2026-10-08 · current branch: `phase7` (off `phase6-backend-oasis`), pushed to `origin`, not merged_
 
 > The trunk line: `phase4` (integration trunk — parse worker + real editing +
-> fit-view tessellation offload) → `phase5-authoring-drc` (this branch).
-> `main` is untouched (owner's choice).
+> fit-view tessellation offload) → `phase5-authoring-drc` → `phase5b-drc-hardening`
+> → `phase5c-load-perf` → `phase5d-editing` → `phase6-backend-oasis` → `phase7`
+> (this branch). `main` is untouched (owner's choice).
 >
 > **Ledger reshape (2026-08-21):** Phase 5 is now **authoring + DRC** (this
 > branch's three slices); the backend/CAS/tile-CDN/OASIS work formerly labelled
@@ -16,9 +17,18 @@ Browser-based IC layout viewer + live multiplayer. Rust everywhere, `wgpu`
 
 ## Where we are
 
-**Phase 7 in progress** on `phase7` (plan: `docs/phase7-plan.md`; findings:
-`docs/phase7-findings.md`). The owner moved 7.3, stream the hierarchy, to the
-front, then 7.4, edit streamed designs. **Both are done.**
+**Phase 7 shipped: scale + collaboration** on `phase7` (plan and outcome:
+`docs/phase7-plan.md`; findings: `docs/phase7-findings.md`). 16 commits, each
+slice measured against the build before it:
+- Streamed designs scale to tens of millions of placements. They can be
+  picked, edited, shared in rooms, exported and DRC-checked in context, the
+  last two on the server.
+- In-core designs use about half the memory, and the fit view draws at the
+  display rate.
+- Rooms have capability links, and randomized tests show the CRDT converges.
+
+The owner moved 7.3 and 7.4 to the front, then asked to finish all of
+Phase 7; 7.7–7.10 were added on the way. Per slice:
 
 * **7.3 SLICE A — placement chunks.** Cells with many placements get a
   spatial placement grid, like shape chunks: contiguous runs with footprints,
@@ -359,7 +369,7 @@ still byte-identical).
 | 5c — load perf + stack | `phase5c-load-perf` | ✅ done | SLICE 1: worker-side fetch, single-copy budgeted rebuild (main heap 434 → 254 MB). SLICE 2: skeleton-first progressive load (longest load frame 76–176 → ~50 ms; fit first frame 2.7 → 1.7 s). SLICE 3: wgpu 30 / egui 0.36 — real WebGPU: sky130 fit 22 → 60 fps, caravel fit 51 → 44 |
 | 5d — editing follow-ons | `phase5d-editing` | ✅ done | SLICE 1: insert/delete vertex. SLICE 2: booleans (union/subtract/intersect/xor, keyholed holes) + multi-select, one-transaction batches. SLICE 3: draw into an instanced master + overlay-aware composite pick. SLICE 4: "edit this placement only" (flatten at the unique-parent hop; hidden placements in the CRDT, cull, pick and export — AREFs split around them) |
 | 6 — backend/OASIS | `phase6-backend-oasis` | ✅ done | SLICE 1: OASIS reader + writer (KLayout-verified on caravel: 3,925,013 polygons identical both ways), GDS paths → outlines (1,334 missing shapes restored). SLICE 2: server-authoritative rooms — late joiners converge, rooms survive crash (WAL) and restart (snapshot), design-bound rooms refuse mismatched peers, immutable content-addressed blob store serves designs (caravel room link → design + edits in 1.41 s). SLICE 3: out-of-core streaming from server-built packs — a 2 GB / 32 M-polygon design that fails in-core opens streamed (8 MB main heap); caravel first frame 873 → 79 ms, pixel-identical |
-| 7 — scale + collaboration | `phase7` | ◑ 7.3, 7.4, 7.1, 7.7, 7.8, 7.6, 7.9, 7.2, 7.10, 7.5 done (closing docs pending) | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). 7.9: files stream in and out (in-core save no longer grows the heap: caravel stays 122 MB, was 689; worker peak 548 → 364 MB; place_50M saves). 7.1b: randomized convergence — peers and a crashing room converge (256 + 64 property cases); yrs diverges under arbitrary reordering, which our relay never does. 7.1c: batched + prefetched fetches (80 ms latency: 26.3 → 4.7 requests per pan, 353 → 20 ms to draw, 100% of pans with no proxies). 7.2: capability links — signed room/role/expiry tokens, viewers read-only by the server, share and revoke in the app. 7.10: finer streamed picks — the server answers which shapes hold the point (128 picks: 38.8 → 0.29 MB). 7.5: in-context DRC — whole caravel 0 violations in 8.4 s on 10 threads, KLayout agrees on injected violations |
+| 7 — scale + collaboration | `phase7` | ✅ done (pushed, not merged) | 7.3: placement chunks (cull at mid 10.0 → 0.73 ms), streamed hierarchy (streamed caravel heap 180 → 16 MB; 50 M placements open streamed), coloured proxies. 7.4: streamed designs pick, edit, join rooms and export on the server (byte-identical to in-core). 7.1a: idle 120 → 4 frames/s. 7.7: compact rectangles (shape memory 209 → 104 MB, tessellation 35× faster). 7.8: compact placements (48 → 9 MB). 7.6: the density rule in-core (caravel fit 76 → 120 frames/s, 742 uncapped; GPU 202 → 14 MB; place_50M opens in-core). 7.9: files stream in and out (in-core save no longer grows the heap: caravel stays 122 MB, was 689; worker peak 548 → 364 MB; place_50M saves). 7.1b: randomized convergence — peers and a crashing room converge (256 + 64 property cases); yrs diverges under arbitrary reordering, which our relay never does. 7.1c: batched + prefetched fetches (80 ms latency: 26.3 → 4.7 requests per pan, 353 → 20 ms to draw, 100% of pans with no proxies). 7.2: capability links — signed room/role/expiry tokens, viewers read-only by the server, share and revoke in the app. 7.10: finer streamed picks — the server answers which shapes hold the point (128 picks: 38.8 → 0.29 MB). 7.5: in-context DRC — whole caravel 0 violations in 8.4 s on 10 threads, KLayout agrees on injected violations |
 
 ## Current performance (caravel, 278 MB, 3.9 M polys)
 
@@ -380,7 +390,8 @@ still byte-identical).
 | DRC: re-check after one edit | **1.1 ms** (wasm) | tiles within reach of the edit (1 tile for a typical shape); was a 9.6 s whole-cell re-check |
 | DRC: background pass | **1.7 s** wall (8 workers), longest frame **15.3 ms** | "check visible" at leaf on caravel (caravel_core + visible cells); inline fallback (`?drcinline=1`) 10.6 s / 17.2 ms, same totals |
 | DRC: flags on caravel_core | **0** (sky130 and blanket) | was 611,680 (per-shape, blanket). SLICE 1's merge-first left 61 staircase-bend diagonals; SLICE 2's projection width (sky130 signoff semantics) clears them |
-| DRC: whole caravel, every cell (sky130) | 3,305 flags / 252 of 1,014 cells, 3.6 s native | intra-cell sweep (`drc_bench … sky130 --all`); dominated by `sky130_fd_io` pad cells (45° corner-fill triangles and stubs that merge only in hierarchical context). Stdcell library: 4 flags / 2 of 440 cells |
+| DRC: whole caravel, each cell on its own (sky130) | 3,303 flags / 251 of 1,014 cells, 4.4 s native | intra-cell sweep (`drc_bench … sky130 --all`); dominated by `sky130_fd_io` pad cells (45° corner-fill triangles and stubs that merge only in hierarchical context). All are context-only (next row). Phase 5b counted 3,305 / 252, before Phase 6 read GDS paths. Stdcell library: 4 flags / 2 of 440 cells |
+| DRC: whole caravel in context (sky130) | **0 violations in 8.4 s** (native, 10 threads) | Phase 7.5: world tiles with their geometry gathered through the hierarchy, checked exactly. Injected violations are found, and KLayout agrees marker for marker. From the app, on the server: 9.8 s in-core (parse included), 8.4 s streamed; after an edit the view re-checks in 1 ms |
 | DRC: drawn-sliver feedback | ~130 ms (harness poll) | a 40 nm-wide drawn rect flags via the edit-local tiles (in-browser verified) |
 | memory ceiling | ~3.4 GB | 4 GB opt-in (real OOM ~11 M polys) |
 | room link → design + edits (late joiner) | **1.41 s** | Phase 6 SLICE 2: `?room=` only — room lookup, caravel (291 MB) from the blob store, the room state from the server (first frame 998 ms; WebGPU, headless) |
@@ -516,6 +527,8 @@ still byte-identical).
 - Coordinates are **i32 nm** end-to-end; cast to f32 only at upload (origin-rebased).
 - Never block a frame on geometry work.
 - Golden match: hier/sky130/caravel render byte-identical across changes.
+- The room relays updates in causal order. yrs (0.19, and 0.28 too) does not
+  converge under arbitrary reordering (Phase 7.1b).
 
 ## Open risks / debts
 
@@ -574,8 +587,8 @@ still byte-identical).
   - ~~the skeleton is the new floor~~ **RESOLVED** (Phase 7.3 SLICE B):
     big placement lists stream by chunk — caravel's streamed heap 180 → 16 MB,
     and a 50 M-placement design opens in 9 MB;
-  - streamed designs are **view-only** (no pick/edit/DRC/export/rooms);
-    editing out of core needs chunk-level residency in the `ShapeStore`;
+  - ~~streamed designs are view-only~~ **RESOLVED** (Phase 7.4: pick,
+    edit, rooms and server-side export; 7.5: in-context DRC on the server);
   - ~~dense chunks draw as neutral proxies~~ **RESOLVED** (Phase 7.3
     SLICE C): they draw in the colour their layers average to.
 - ~~Phase 3: editing is TOP-cell-only~~ **RESOLVED** (`phase3-real-editing` SLICE 2):
@@ -593,27 +606,27 @@ still byte-identical).
   first; rooms persist (WAL + snapshots). The join push that was silently
   dropped on the web (sent before the socket opened) now goes on open.
 - **Server limits (Phase 6 SLICE 2):**
-  - No auth: any client that reaches the server can join any room and `PUT`
-    blobs (≤ 16 GiB). Binds 127.0.0.1 by default.
+  - ~~No auth~~ **RESOLVED** (Phase 7.2): capability links on every
+    endpoint, required unless the server listens only on loopback. Still
+    open: rotating a room's key does not close sockets already open, upload
+    quotas reset on restart, and there are no accounts.
   - No blob GC: every snapshot version is kept, and a room stays in memory
     once touched.
   - The join exchanges whole states both ways, with no state-vector
     handshake. Fine at ~33 B/edit; revisit if rooms reach MBs.
   - WAL durability is process-crash level (no fsync); snapshots are fsynced.
-- **The app repaints every frame even when idle** (`request_repaint` each
-  frame), so an untouched tab keeps a core busy. Found via the harness: three
-  such pages on headless SwiftShader starve a new page's WebGL context
-  creation. The browser tests keep ≤ 2 live pages.
+- ~~The app repaints every frame even when idle~~ **RESOLVED** (Phase 7.1a):
+  an idle tab drops to a 4 frames/s heartbeat (120 → 4.2 frames/s); async
+  results, socket messages and harness commands wake it.
 - **DRC deferrals, updated by Phase 5b SLICE 1:** merge-first width is DONE
   (the 593 k fracture flags are gone); the atomic index build is DONE (grid,
-  budgeted); non-rect width is exact now (edge pairs). Still open below:
-  cross-instance context (measured: on the whole chip it is what remains —
-  pad-cell corner fills and stubs). The rule table is DONE (SLICE 2: sky130
+  budgeted); non-rect width is exact now (edge pairs). Cross-instance
+  context is DONE too (Phase 7.5, on the server). The rule table is DONE (SLICE 2: sky130
   subset; wide-metal / EOL / enclosure / density rules are not modeled);
   DRC-in-worker is DONE (SLICE 3).
 - **DRC deferrals (phase5 SLICE 3 — scoped honestly, in the code too):**
-  - **Cross-instance / hierarchical spacing is NOT checked.** Checks are
-    intra-cell; a shape in cell A near an instance of cell B is invisible to
+  - ~~**Cross-instance / hierarchical spacing is NOT checked.**~~
+    **RESOLVED** (Phase 7.5). Checks were intra-cell; a shape in cell A near an instance of cell B is invisible to
     them. Flattened-context interaction regions along instance boundaries are
     the hard real-DRC problem — deferred deliberately.
   - **Width is per-shape, PRE-merge — over-flags fractured production GDS.**
@@ -639,37 +652,43 @@ still byte-identical).
   commit". The real trunk is now **`phase4`**, which merges the full stacked chain
   (`phase0 → 1 → 1.5 → 2a → 2b`) plus both finished feature branches
   (`phase2b-worker`, `phase3-real-editing`). All Phase 4 work continues on `phase4`.
-- `origin` is still missing several local branches (`phase2b-chunk-worker`,
-  `phase2b-*`, the phase3 line, `phase4`). Push when ready to share.
+- **`phase7` is pushed to `origin`** (2026-10-08, the owner's call), not
+  merged. It carries its whole ancestry, so every commit from Phase 2b on is
+  on GitHub. The other local branch names (`phase2b-*`, the phase3 line,
+  `phase4` … `phase6-backend-oasis`) are not pushed; each is an ancestor of
+  `phase7`.
 - ~~`.claude/` untracked~~ **RESOLVED** — gitignored in `b619532`.
 
 ## Next step
 
-**Phase 5b shipped** — FluidEDA's DRC now merges before it measures, carries a
-real (sky130) deck, re-checks an edit in ~1 ms, and fans a full check out over a
-worker pool. Its own measurements name what is next for DRC: **in-context
-(flattened-window) checking** — the whole-chip residue is pad-cell geometry that
-only merges across the hierarchy.
+**Phase 7 shipped** and `phase7` is pushed (not merged). What its
+measurements leave open, as candidates for Phase 8:
 
-The Phase 4 performance queue is done (`phase5c-load-perf`: single-copy
-budgeted design swap, progressive skeleton-first load, wgpu 30 with real
-WebGPU). The renderer's next measured question: why the GPU-bound caravel fit is
-~14% slower on Dawn-Metal than on ANGLE-Metal.
+- **A server ready for real users.** Everything so far is measured on
+  localhost. Open items:
+  - no blob GC, and rooms stay in memory once touched;
+  - joins exchange whole states, with no state-vector handshake;
+  - the WAL is not fsynced;
+  - upload quotas live in memory;
+  - rotating a key does not close open sockets.
 
-The editing follow-ons are done (Phase 5d). Known edges, documented in code: a
-shape drawn past a cell's original extent grows that cell's cull/pick bbox but
-not its ancestors' precomputed ones; picking a flattened placement's copy
-needs a fresh click after the flatten (the app re-picks at the same point).
+  Then a hosted deployment behind TLS.
+- **DRC toward signoff.**
+  - The sky130 deck models width and space only: enclosure, wide-metal,
+    end-of-line and density rules are missing.
+  - In-context checks run on the server; in the browser's worker pool they
+    would also work offline.
+  - A second oracle (Magic or Netgen) next to KLayout.
+- **Smaller measured items:**
+  - rectangles as GPU instances (WebGPU only);
+  - batched placement-chunk fetches;
+  - finer splits for edited chunks of streamed cells.
+- **Owner's calls:**
+  - merging the chain (into `main` or a trunk);
+  - CI: `cargo test`, the wasm build, and the browser suites in headless
+    Chromium.
 
-**Phase 6 shipped** (`phase6-backend-oasis`):
-- SLICE 1: OASIS in/out and GDS paths.
-- SLICE 2: server-kept rooms on a content-addressed store.
-- SLICE 3: out-of-core streaming.
-
-Its measurements name the next steps:
-- **Stream the hierarchy itself.** The skeleton is the new memory floor.
-- **Edit out of core.** Chunk-level residency in the `ShapeStore`, picking
-  and the overlay.
-- **Coalesce chunk range requests** for real network latency.
-- **In-context DRC.** Still the DRC frontier from Phase 5b.
-- ~~**The Dawn-vs-ANGLE fit-view gap.**~~ Resolved in Phase 7.6.
+Known edges, documented in code: a shape drawn past a cell's original extent
+grows that cell's cull/pick bbox but not its ancestors' precomputed ones
+(Phase 5d); in-context DRC re-checks the view after an edit, not just the
+edit's reach (7.5).

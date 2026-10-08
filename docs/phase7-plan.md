@@ -1,7 +1,7 @@
 # Phase 7 — plan
 
-_Proposed 2026-10-03 · awaiting the owner's go-ahead · branch `phase7-*` off
-`phase6-backend-oasis`_
+_Proposed 2026-10-03 · **shipped 2026-10-07** on `phase7` (off
+`phase6-backend-oasis`) · pushed 2026-10-08, not merged_
 
 Phases 0–6 delivered the original implementation plan
 (`AtomicStudio_Implementation_Plan.md`). Phase 7 takes the work its
@@ -19,6 +19,49 @@ Conventions as before: a commit per slice with measurements in the message;
 STATUS.md updated per slice; `docs/phase7-findings.md`; every performance
 claim a same-session A/B; nothing pushed without the owner.
 
+## Outcome
+
+**Phase 7 is done.** 16 commits on `phase7`. Each slice was measured
+against the build before it, in the same session, and kept every browser
+suite green. Details and tests per slice: `phase7-findings.md`. In the
+order done:
+
+| # | Slice | Commit | Result (acceptance) |
+|---|---|---|---|
+| 7.3 A | Placement chunks | `3f43e3f` | cull at mid 10.0 → 0.73 ms, leaf 9.7 → 0.37 ms; output identical |
+| 7.3 B | Stream the hierarchy (pack v3) | `6a57744` | streamed caravel heap 180 → **16 MB** at fit (≤ 40 ✓); 50 M placements open streamed in 92 ms with 9 MB (≤ 100 ✓); 0 pixels off in-core ✓ |
+| 7.3 C | Coloured proxies (pack v4) | `df92c93` | flat_11M at fit: pixels visibly off 71% → 18% (halved ✓); the dominant-layer idea measured worse and was dropped |
+| 7.4 A | Pick and edit streamed designs | `4e50c18` | 128 of 128 picks match in-core; edits pixel-identical, undo clean |
+| 7.4 B | Rooms and "edit this placement only", streamed | `7c4d2a8` | two-peer test with a streamed peer: 33 of 33, pixel-identical ✓ |
+| 7.4 C | Server-side export | `35ee164` | the same 276 MB file, byte for byte, as the in-core save ✓; streamed page stays at 128 MB ✓ |
+| 7.1a | Stop repainting when idle | `44021bc` | idle 120 → 4.2 frames/s, main thread 22% → 2.4%; interactive timings unchanged |
+| 7.7 | Compact rectangles *(added)* | `8f8ed10` | shape memory 209 → 104 MB, tessellation 35× faster; exports byte-identical |
+| 7.8 | Compact placements *(added)* | `84f55d9` | placements in memory 48 → 9 MB; pack placements 24.2 → 3.1 MB |
+| 7.6 | Fit-view GPU gap | `7c014e3` | caravel fit 76 → 120 frames/s (the display rate); uncapped WebGPU 742 vs WebGL 227 (≥ 60 and ≥ ANGLE ✓); place_50M opens in-core |
+| 7.9 | No permanent peaks *(added)* | `cd45390` | saving no longer grows the heap (caravel 122 MB, was 689); worker peak 548 → 364 MB; place_50M saves |
+| 7.1b | Randomized convergence | `9cd376d` | 256 cases in 8.9 s (< 30 s ✓) plus 64 with a crashing server room; found yrs diverging under arbitrary reordering (our relay is causal) |
+| 7.1c | Batched + prefetched fetches | `0c67f72` | at 80 ms latency: 26.3 → 4.7 requests per pan (≤ 1/5 ✓), 353 → 20 ms to draw, 100% of pans without proxies (≥ 80% ✓) |
+| 7.2 | Auth: capability links | `96e18b2` | every endpoint × 7 kinds of token ✓; a browser viewer follows live and cannot edit (9 of 9) ✓ |
+| 7.10 | Finer streamed picks *(added)* | `80cd41e` | 128 picks: 38.8 → 0.29 MB fetched, the same results; one round trip per pick |
+| 7.5 | In-context DRC | `5bd6318` | whole caravel: 0 violations in 8.4 s on 10 threads (< 15 s ✓); KLayout agrees on injected violations ✓ |
+
+**Where the work departed from this plan:**
+- **7.5:** exact world tiles instead of interaction regions and
+  pair-transform dedup. Measured first, the simple engine was fast enough;
+  tiles with identical content are still checked once. It runs on the
+  server, not in the browser's worker pool (still open). After an edit it
+  re-checks the view, not just the edit's reach.
+- **7.4 A → 7.10:** a pick fetched whole chunks under the cursor (74 MB
+  for 128 picks). 7.10 has the server answer the pick instead; the plan's
+  idea of finer runs was measured and dropped.
+- **7.1c:** the latency harness is a server delay (`FLUIDEDA_LATENCY_MS`)
+  rather than CDP network emulation. Placement-chunk fetches are not yet
+  batched.
+- **7.2 (not done):** rotating a key does not close sockets already open,
+  and upload quotas live in memory.
+- **7.7–7.10** were not in the plan; each came out of an earlier slice's
+  measurements.
+
 ## Overview
 
 | # | Slice | Why (measured) | Size | Needs |
@@ -31,11 +74,7 @@ claim a same-session A/B; nothing pushed without the owner.
 | 7.6 | Fit-view GPU gap | caravel fit is 14% slower on WebGPU (Dawn) than WebGL (ANGLE) | S–M | (7.3's LOD) |
 
 **Order (revised 2026-10-03): the owner moved 7.3 to the front, then 7.4.**
-**7.3 is done** in three slices: placement chunks, streaming the hierarchy
-(pack v3), coloured proxies (pack v4). **7.4 is done** in three slices:
-picking and editing, rooms and "edit this placement only" (pack v5), and
-server-side export. See `phase7-findings.md`. The rest follow in the
-original order: 7.1, 7.2, 7.5, 7.6.
+The order actually run is the Outcome table above.
 
 The original reasoning for the rest still holds: 7.1 is small and makes
 everything after it cheaper to test; 7.2 gates using the server beyond one
@@ -265,19 +304,22 @@ that explains the residue. Leaf / mid views and goldens unchanged.
 
 ## Housekeeping (owner's calls)
 
-- **Push / merge.** Nothing is pushed; the stacked chain ends at
-  `phase6-backend-oasis`. Proposal: merge the chain into the `phase4` trunk
-  (or a new `trunk`) and push it before 7.2 opens the server to others.
-- **CI.** GitHub Actions: `cargo test` (incl. the property tests), the wasm
-  build, and the browser suites in headless Chromium (SwiftShader, ≤ 2 live
-  pages — or after 7.1a, no limit).
+- **Push / merge.** `phase7` is pushed to `origin` (2026-10-08) with its
+  whole ancestry. Not merged into `main`, at the owner's request; merging
+  the chain stays the owner's call.
+- **CI.** Not set up. Proposal unchanged: GitHub Actions running
+  `cargo test` (incl. the property tests), the wasm build, and the browser
+  suites in headless Chromium (no page limit since 7.1a).
 
-## Open decisions for the owner
+## Decisions
 
-1. Confirm the order (7.1 → 7.6) or reorder / drop slices.
-2. Auth model: capability links (proposed) or accounts / OAuth.
-3. Server-side compute (export, whole-chip DRC on the server): acceptable?
-4. Push and merge before 7.2? CI?
+1. **Order:** the owner moved 7.3 and 7.4 to the front, then asked to
+   finish all of Phase 7, including the added 7.7–7.10.
+2. **Auth model:** capability links, as proposed (7.2). No accounts.
+3. **Server-side compute:** used for export (7.4 C), streamed picks
+   (7.10) and in-context DRC (7.5). The browser keeps its offline paths:
+   in-core save and intra-cell DRC.
+4. **Push / merge / CI:** `phase7` pushed, not merged; CI open (above).
 
 ## Verification, every slice
 
